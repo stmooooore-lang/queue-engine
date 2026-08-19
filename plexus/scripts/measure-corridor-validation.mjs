@@ -73,7 +73,10 @@ async function fetchBybit(symbol, interval, cap) {
       `https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}` +
       `&interval=${interval}&limit=${lim}`;
     if (end) u += `&end=${end}`;
-    const j = await (await fetch(u, { cache: "no-store" })).json();
+    const j = await (await fetch(u, {
+      cache: "no-store",
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; PlexusResearch/1.0)" },
+    })).json();
     if (j.retCode && j.retCode !== 0) {
       throw new Error(`bybit ${symbol} ${interval}: ${j.retMsg || j.retCode}`);
     }
