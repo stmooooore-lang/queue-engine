@@ -1,0 +1,12 @@
+name: bybit-diag
+on: {workflow_dispatch: {}}
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: what does bybit say to this runner
+        run: |
+          echo "== runner IP country =="
+          curl -s https://ipinfo.io/json | head -c 300; echo
+          echo "== bybit, raw =="
+          curl -s -i "https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=60&limit=2" | head -c 900; echo
