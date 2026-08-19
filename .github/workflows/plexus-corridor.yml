@@ -1,0 +1,65 @@
+name: plexus-corridor
+
+# The measurement that has no model in it anywhere: node over price data the
+# script fetches itself. That is why it can live here at all - this runner has
+# no path to the founder's proxy and never will.
+#
+# Results come back as an artifact. Nothing is committed to plexus-doc from
+# here: the cloud is a worker, not a git client, and the commit is made on the
+# Mac by the founder with his own key.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_days:
+        description: 'MAX_DAYS for the run'
+        required: false
+        default: '180'
+  schedule:
+    - cron: '0 2 * * *'
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: run the corridor validation
+        working-directory: plexus
+        env:
+          MAX_DAYS: ${{ inputs.max_days || '180' }}
+          PROGRESS_LOG: progress.log
+        run: |
+          mkdir -p notes
+          node scripts/measure-corridor-validation.mjs > result.json 2> console.txt || true
+          echo "--- exit: $? ---"
+          ls -la result.json progress.log console.txt 2>/dev/null || true
+
+      - name: show the verdict
+        working-directory: plexus
+        run: |
+          python3 - <<'PY'
+          import json
+          raw = open('result.json').read()
+          i = raw.find('\n{\n')
+          d, _ = json.JSONDecoder().raw_decode(raw[i+1:] if i >= 0 else raw)
+          print('verdict:', json.dumps(d.get('verdict')))
+          cells = d.get('cells', [])
+          adq = [c for c in cells if c['unfiltered']['oos']['adequate']]
+          yes = sum(1 for c in adq if c['unfiltered']['oos']['worstNoRopeWorse'])
+          print('cells:', len(cells), '| adequate OOS:', len(adq), '| direction holds:', yes)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: corridor-result
+          path: |
+            plexus/result.json
+            plexus/progress.log
+            plexus/console.txt
