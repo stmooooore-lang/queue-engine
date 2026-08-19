@@ -1,0 +1,23 @@
+name: Probe workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      message:
+        description: 'Text to print and store'
+        required: true
+        type: string
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print input message
+        run: |
+          echo "Input message: ${{ github.event.inputs.message }}"
+      - name: Upload message as artifact
+        uses: actions/upload-artifact@0
+        with:
+          name: input-message
+          path: |
+            <<< "${{ github.event.inputs.message }}" >>>
