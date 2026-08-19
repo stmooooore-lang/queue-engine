@@ -1,0 +1,865 @@
+/**
+ * Plexus rope engine — pure: candles in, ropes and events out.
+ *
+ * S10-C8 / canon §9.9x: periods are TIME (days), converted to bars per
+ * timeframe. Closeness defaults to percent of price; ATR path remains
+ * behind tolMode:'atr'. Decision boundary is the rope edge (no zone pad).
+ *
+ * No I/O, no rendering, no network. No function returns a probability
+ * or a forecast — the engine reports structure and what price did at it.
+ */
+
+// ---------------------------------------------------------------------------
+// Timeframe → bar duration
+// ---------------------------------------------------------------------------
+
+/** Bar length in ms for instrument TF keys (Bybit-style: "60", "D", …). */
+export const BAR_MS = {
+  "1": 60e3,
+  "3": 180e3,
+  "5": 300e3,
+  "15": 900e3,
+  "30": 1800e3,
+  "60": 3600e3,
+  "120": 7200e3,
+  "240": 14400e3,
+  "360": 21600e3,
+  "720": 43200e3,
+  D: 864e5,
+  W: 6048e5,
+};
+
+export function barMsOf(tf) {
+  const ms = BAR_MS[tf];
+  if (ms == null) throw new Error(`unknown timeframe: ${tf}`);
+  return ms;
+}
+
+// ---------------------------------------------------------------------------
+// Period family — progressive spacing in DAYS, then → bars per TF (§9.9x)
+// ---------------------------------------------------------------------------
+
+/**
+ * Progressive period list in abstract units (same shape as the old bar family).
+ * Historically genPeriods(500) → 2…494 with 54 members; that shape is kept.
+ */
+export function genProgressive(maxP) {
+  const out = [];
+  let p = 2, step = 3;
+  while (p <= maxP) {
+    out.push(Math.round(p));
+    p += step;
+    step = Math.min(step * 1.04, 3 + Math.log(Math.max(p, 2)) * 2.2);
+  }
+  return [...new Set(out)];
+}
+
+/** @deprecated bar-space family — use genPeriodDays + periodsToBars (S10-C8). */
+export function genPeriods(maxP) {
+  return genProgressive(maxP);
+}
+
+/** Period family in days (real time). Default max 500 ≈ old 2…494 daily bars. */
+export function genPeriodDays(maxDays) {
+  return genProgressive(maxDays);
+}
+
+/**
+ * Convert a duration in days to whole bars for a bar length.
+ * Positive durations honour `min` so life-cycle params never round to 0 on
+ * coarse timeframes (forgiveHours=4 → 0 on daily was killing daily ropes).
+ */
+export function daysToBars(days, barMs, { min = 0 } = {}) {
+  if (!(days > 0)) return 0;
+  return Math.max(min, Math.round((days * 864e5) / barMs));
+}
+
+/** Hours → bars (UI mirror of day durations). */
+export function hoursToBars(hours, barMs, { min = 0 } = {}) {
+  if (!(hours > 0)) return 0;
+  return Math.max(min, Math.round((hours * 3600e3) / barMs));
+}
+
+/**
+ * Time-based family → unique bar periods for this timeframe.
+ * Dedupes after rounding (short TFs keep more members; daily collapses).
+ */
+export function periodsToBars(dayList, barMs) {
+  return [...new Set(dayList.map((d) => daysToBars(d, barMs, { min: 2 })))]
+    .sort((a, b) => a - b);
+}
+
+export function genPeriodsForTimeframe(maxDays, barMs) {
+  return periodsToBars(genPeriodDays(maxDays), barMs);
+}
+
+/**
+ * Effective depth and bar periods given loaded history.
+ * Cap: longest MA ≤ half the loaded span (same honesty rule as before).
+ */
+export function resolvePeriods(candles, { maxDays, barMs } = {}) {
+  if (!barMs) throw new Error("resolvePeriods: barMs required");
+  const want = maxDays != null ? maxDays : DEFAULT_CFG.maxDays;
+  const spanDays = (candles.length * barMs) / 864e5;
+  const effMaxDays = Math.min(want, spanDays * 0.5);
+  const periods = genPeriodsForTimeframe(Math.max(2, effMaxDays), barMs);
+  return { periods, effMaxDays, spanDays, wantDays: want };
+}
+
+/**
+ * computeFabric(candles, { maxDays, barMs } | { periods }) -> MA series
+ * Each series is SMA of (h+l)/2 over its period (in bars).
+ */
+export function computeFabric(candles, opts = {}) {
+  let periods = opts.periods;
+  if (!periods) {
+    if (opts.barMs != null) {
+      periods = resolvePeriods(candles, opts).periods;
+    } else {
+      // Legacy: maxPeriod in bars (pre-S10-C8 call sites / smoke).
+      const n = candles.length;
+      const maxP = opts.maxPeriod != null
+        ? opts.maxPeriod
+        : Math.min(500, Math.floor(n * 0.5));
+      periods = genPeriods(maxP);
+    }
+  }
+  const med = candles.map((b) => (b.h + b.l) / 2);
+  return periods.map((p) => {
+    const arr = new Array(med.length).fill(null);
+    let sum = 0;
+    for (let i = 0; i < med.length; i++) {
+      sum += med[i];
+      if (i >= p) sum -= med[i - p];
+      if (i >= p - 1) arr[i] = sum / p;
+    }
+    return arr;
+  });
+}
+
+/** ATR series (Wilder-style simple window average of true range). */
+export function computeATR(candles, window = 14) {
+  const out = new Array(candles.length).fill(null);
+  const tr = new Array(candles.length);
+  let acc = 0;
+  for (let i = 0; i < candles.length; i++) {
+    const pc = i > 0 ? candles[i - 1].c : candles[i].o;
+    const t = Math.max(
+      candles[i].h - candles[i].l,
+      Math.abs(candles[i].h - pc),
+      Math.abs(candles[i].l - pc),
+    );
+    tr[i] = t;
+    acc += t;
+    if (i >= window) acc -= tr[i - window];
+    out[i] = i >= window - 1 ? acc / Math.min(i + 1, window) : null;
+  }
+  return out;
+}
+
+export const DEFAULT_CFG = {
+  // Closeness as % of price (tolMode 'pct'). ATR path: tolMode 'atr' + kTol.
+  tolMode: "pct",
+  kTolPct: 0.25, // percent of price — rope width
+  kTol: 0.25, // × ATR when tolMode === 'atr'
+  density: 1.0,
+  // Life-cycle as % of the series length (bars), not calendar days.
+  // Trading: % of history available at the judgment bar's environment.
+  // Viz: % of the loaded series on the current TF (same numbers → same ratios).
+  winPct: 10,
+  forgivePct: 1,
+  // Construction fabric depth (bars) — always the full progressive family,
+  // capped by half the loaded span. Not a visibility knob.
+  maxPeriod: 500,
+  // Eye-check visibility: which MA periods to draw (does not change rope math).
+  viewDepth: 500,
+  // Legacy day/hour fields — only if win/forgive bars unset and winPct unset.
+  winDays: 47,
+  forgiveDays: 4,
+  winHours: 47 * 24,
+  forgiveHours: 4 * 24,
+  win: null,
+  forgive: null,
+  minShare: 0.0,
+  mode: "lookback",
+  maxDays: 500, // legacy alias; prefer maxPeriod
+  barMs: null,
+  nBars: null, // optional override for %→bars
+  // Retained for `site/instrument.html` only, which has its OWN angle logic
+  // (`directionFamilies` / `strandAligned`, clamped to 40°) and reads this key.
+  // The ENGINE's own angle bound was removed 2026-08-10 — §9.9af: 0 rejections
+  // in 17934 candidates and structurally unreachable in (bar × ATR) space.
+  // instrument.html's version is different code at a different threshold and
+  // has NOT been measured; do not assume it is dead too.
+  maxPairAngleDeg: 55,
+  useAlignmentGate: true,
+  // §9.9aa E / phase 1b: Gaussian-kernel rope detection over strand prices at
+  // each bar (see densityPeaks). Inert by default — the density construction is
+  // a candidate being measured, never the live path. When disabled, groupOver /
+  // bandOf / detectRopes are byte-identical to the current construction.
+  useDensityConstruction: false
+};
+
+/** Absolute closeness tolerance at a price (and optional ATR). */
+export function tolAbs(price, atr, cfg) {
+  if (cfg.tolMode === "atr") {
+    if (atr == null || !(atr > 0)) return null;
+    return cfg.kTol * atr;
+  }
+  if (!(price > 0)) return null;
+  return (cfg.kTolPct / 100) * price;
+}
+
+/** Resolve life-cycle days from cfg (days are canonical; hours are UI mirror). */
+function lifeDays(cfg, hoursKey, daysKey, fallbackDays) {
+  if (cfg[daysKey] != null) return cfg[daysKey];
+  if (cfg[hoursKey] != null) return cfg[hoursKey] / 24;
+  return fallbackDays;
+}
+
+/**
+ * Win / forgive → bars.
+ * Preferred: winPct / forgivePct of series length (nBars | cfg.nBars).
+ * Legacy: calendar days via barMs. Absolute win/forgive win if both set.
+ */
+export function resolveWinForgive(cfg, nBars = null) {
+  let win = cfg.win;
+  let forgive = cfg.forgive;
+  if (win != null && forgive != null) return { win, forgive };
+
+  const n = nBars != null ? nBars : cfg.nBars;
+  if (cfg.winPct != null && n != null && n > 0) {
+    const wp = cfg.winPct;
+    const fp = cfg.forgivePct != null ? cfg.forgivePct : 0;
+    if (win == null) win = Math.max(2, Math.round((n * wp) / 100));
+    if (forgive == null) {
+      forgive = fp <= 0 ? 0 : Math.max(1, Math.round((n * fp) / 100));
+    }
+    return { win, forgive };
+  }
+
+  if (cfg.barMs == null) {
+    throw new Error("detectRopes: barMs or winPct+nBars required when win/forgive unset");
+  }
+  const winDays = lifeDays(cfg, "winHours", "winDays", DEFAULT_CFG.winDays);
+  const forgiveDays = lifeDays(cfg, "forgiveHours", "forgiveDays", DEFAULT_CFG.forgiveDays);
+  if (win == null) win = daysToBars(winDays, cfg.barMs, { min: 2 });
+  if (forgive == null) {
+    forgive = forgiveDays <= 0
+      ? 0
+      : daysToBars(forgiveDays, cfg.barMs, { min: 1 });
+  }
+  return { win, forgive };
+}
+
+// ---------------------------------------------------------------------------
+// §1 construction — ported from rope-prototype.html; tol unit per S10-C8
+// ---------------------------------------------------------------------------
+
+/** Pairwise co-travel at bar i: close, same direction, similar speed. */
+export function together(ma, a, b, i, atr, cfgOrKTol) {
+  const cfg = typeof cfgOrKTol === "number"
+    ? { ...DEFAULT_CFG, tolMode: "atr", kTol: cfgOrKTol }
+    : cfgOrKTol;
+  const va = ma[a][i], vb = ma[b][i];
+  if (va == null || vb == null) return false;
+  const mid = (va + vb) / 2;
+  const tol = tolAbs(mid, atr && atr[i], cfg);
+  if (tol == null || !(tol > 0)) return false;
+  if (Math.abs(va - vb) > tol) return false;
+  const pa = ma[a][i - 1], pb = ma[b][i - 1];
+  if (pa == null || pb == null) return false;
+  const da = va - pa, db = vb - pb;
+  if (da * db < 0) return false;
+  // Longitudinal only: crossing ≠ co-travel. Enforced by the sign test above
+  // plus this slope-difference bound — both in price units against the same
+  // tolerance, so they scale with the instrument. An angle bound in
+  // (bar × ATR) space used to sit here as well and was removed 2026-08-10:
+  // measured at 0 rejections in 17934 candidates and shown structurally
+  // unreachable (§9.9af) — MA slopes never exceed ~0.4 ATR/bar where ~1.43
+  // would be needed, so it could not fire on any symbol or timeframe.
+  if (Math.abs(da - db) > tol * 0.5) return false;
+  return true;
+}
+
+/** Pure single-pair alignment check (shared by gate and diagnostic).
+ * Sign agreement only. The angle bound that used to live here was removed
+ * 2026-08-10 (§9.9af): 0 rejections in 17934 candidates, and structurally
+ * unreachable — it compared an angle in (bar × ATR) space, where a smoothed
+ * MA's slope never approaches the ~1.43 ATR/bar needed to trigger it. */
+function checkPair(ya, yb) {
+  return ya * yb >= 0;
+}
+
+/** All strand pairs in g co-directed at bar i.
+ * Gate returns boolean, aborting at the first failing pair.
+ * Disabled when cfg.useAlignmentGate is false (measurement only; the default
+ * keeps the gate live, so production behaviour is unchanged). */
+export function groupAligned(ma, g, i, atr, cfg) {
+  if (cfg && cfg.useAlignmentGate === false) return true;
+  if (i < 1 || g.length < 2) return false;
+  const atrv = atr && atr[i];
+  if (!(atrv > 0)) return true;
+  const slopes = [];
+  for (const s of g) {
+    const v = ma[s][i], p = ma[s][i - 1];
+    if (v == null || p == null) return false;
+    slopes.push((v - p) / atrv);
+  }
+  for (let a = 0; a < slopes.length; a++)
+    for (let b = a + 1; b < slopes.length; b++)
+      if (checkPair(slopes[a], slopes[b]) === false) return false;
+  return true;
+}
+
+/** Alignment diagnostic for measurement (S10-10 1a). Every pair is checked, so
+ * the split is complete and independent of pair order. Categories are mutually
+ * exclusive and must sum to the number of candidates fed in:
+ *   degenerate = early exit (first bar / single strand / no ATR / missing value)
+ *   sign       = at least one pair has opposite-sign slopes
+ *   passed     = all pairs agree in sign
+ * The 'angle' category was removed with the angle bound itself (§9.9af) — it
+ * had reported 0 across every candidate measured, and keeping a category that
+ * can never fire is the same lie as a control that does nothing.
+ * The diagnostic ALWAYS reports the split of raw candidates, regardless of
+ * whether the live boolean gate is enabled. Uses the SAME checkPair as the live
+ * gate, so the numbers cannot diverge from what runs. */
+export function groupAlignedDiagnostic(ma, g, i, atr, cfg) {
+  if (i < 1 || g.length < 2)
+    return { category: "degenerate", reason: "firstBarOrSingleton" };
+  const atrv = atr && atr[i];
+  if (!(atrv > 0))
+    return { category: "degenerate", reason: "noATR" };
+  const slopes = [];
+  for (const s of g) {
+    const v = ma[s][i], p = ma[s][i - 1];
+    if (v == null || p == null)
+      return { category: "degenerate", reason: "missingValue" };
+    slopes.push((v - p) / atrv);
+  }
+  for (let a = 0; a < slopes.length; a++)
+    for (let b = a + 1; b < slopes.length; b++)
+      if (checkPair(slopes[a], slopes[b]) === false)
+        return { category: "sign", reason: "oppositeSign" };
+  return { category: "passed", reason: "aligned" };
+}
+/**
+ * §9.9aa E Gaussian-kernel density construction — per bar, over the whole
+ * strand family. This is the detection proposal, measured alongside (never
+ * replacing) groupOver.
+ *
+ * At each bar the family's strand prices are points on the price axis; their
+ * density is estimated with a Gaussian kernel of bandwidth h = price ×
+ * kTolPct/100, and ropes are the local maxima of that density after
+ * non-maximum suppression (§9.9aa E).
+ *
+ * points: [{price, weight}] — the whole family at one bar. weight defaults to
+ *   1 (uniform). The progressive family places adjacent long periods closer
+ *   together in price than adjacent short ones, so WITHOUT a period-spacing
+ *   weight the long end manufactures peaks that are sampling artefacts (§9.9aa
+ *   E "known risk"). The caller picks the weighting; phase 1b compares uniform,
+ *   period-interval, and inverse-local-count in price space.
+ * h: kernel bandwidth in price units (§9.9aa E: price × kTolPct / 100).
+ *
+ * Returns each local maximum of the density after NMS, as
+ *   { centre, halfWidth, height }
+ *   centre    — peak position, interpolated between grid bins
+ *   halfWidth — half-width at half maximum (HWHM), the real strand spread
+ *   height    — peak density normalised by the family's mean density (>1)
+ *
+ * Two peaks closer together than one bandwidth are treated as one support
+ * (NMS keeps the higher), not separate ropes.
+ */
+export function densityPeaks(points, h) {
+  if (!(h > 0) || !points || points.length < 2) return [];
+  let lo = Infinity, hi = -Infinity;
+  for (const p of points) {
+    if (!Number.isFinite(p.price)) continue;
+    if (p.price < lo) lo = p.price;
+    if (p.price > hi) hi = p.price;
+  }
+  if (!(hi > lo)) return [];
+  // Grid: ~4 bins per bandwidth (fine enough to interpolate the peak centre and
+  // measure HWHM), capped so a wide family does not explode the bin count.
+  const span = hi - lo;
+  const perBin = Math.max(h / 4, span / 512);
+  const n = Math.max(8, Math.ceil(span / perBin));
+  const step = span / n;
+  const D = new Array(n).fill(0);
+  const rad = Math.max(1, Math.ceil((3 * h) / step)); // kernel tail ~0 past 3h
+  let wsum = 0;
+  for (const p of points) {
+    if (!Number.isFinite(p.price)) continue;
+    const w = p.weight == null ? 1 : Math.max(0, p.weight);
+    if (!(w > 0)) continue;
+    const jc = (p.price - lo) / step;
+    const j0 = Math.max(0, Math.floor(jc) - rad);
+    const j1 = Math.min(n - 1, Math.ceil(jc) + rad);
+    for (let j = j0; j <= j1; j++) {
+      const u = Math.abs((p.price - lo) - j * step) / h;
+      D[j] += w * Math.exp(-0.5 * u * u);
+    }
+    wsum += w;
+  }
+  if (!(wsum > 0)) return [];
+  const mean = wsum / span; // density averaged over the family's price range
+  const peaks = [];
+  for (let j = 1; j < n - 1; j++) {
+    if (D[j] > D[j - 1] && D[j] >= D[j + 1]) peaks.push(j);
+  }
+  // NMS by height desc. A peak survives unless:
+  //   (1) a kept peak lies within one bandwidth — within-one-bandwidth supports
+  //         are one rope (doc above), keep the higher; or
+  //   (2) no genuine valley separates it from a kept peak — a single flat crest
+  //         of near-equal maxima is ONE support, not several peaks (§9.9aa E).
+  //       A genuine valley dips below (1 - promFrac) of the lower peak's height.
+  //       promFrac small => real supports (deep dips) survive, flat tops merge.
+  const promFrac = 0.05;
+  const order = peaks.slice().sort((a, b) => D[b] - D[a] || a - b);
+  const kept = [];
+  for (const j of order) {
+    const jx = j * step;
+    // (1) distinct supports are at least a full bandwidth apart.
+    if (kept.some((k) => Math.abs(k.x - jx) < h)) continue;
+    // (2) reject a crest-mate not carved out by a genuine valley: scan the
+    //     density trough against every kept peak.
+    let distinct = true;
+    for (const k of kept) {
+      const a = Math.min(j, k.j);
+      const b = Math.max(j, k.j);
+      if (a >= b) continue;
+      let trough = Infinity;
+      for (let m = a; m <= b; m++) if (D[m] < trough) trough = D[m];
+      const lower = Math.min(D[j], D[k.j]);
+      if (trough >= lower * (1 - promFrac)) {
+        // Density between j and k never drops meaningfully => same flat crest.
+        distinct = false;
+        break;
+      }
+    }
+    if (!distinct) continue;
+    kept.push({ j, x: jx });
+  }
+  const out = [];
+  for (const { j } of kept) {
+    const Dl = j > 0 ? D[j - 1] : D[j];
+    const Dr = j < n - 1 ? D[j + 1] : D[j];
+    const denom = Math.max(1e-12, Dl - 2 * D[j] + Dr);
+    // Quadratic vertex interpolation for the peak centre (scale-independent).
+    const off = 0.5 * (Dl - Dr) / denom;
+    const centre = lo + (j + Math.max(-0.5, Math.min(0.5, off))) * step;
+    const peakD = D[j];
+    const half = peakD / 2;
+    let leftX = lo, rightX = hi;
+    for (let q = j; q > 0; q--) {
+      if (D[q] > half) continue;
+      const a = D[q], b = D[q + 1], den = b - a;
+      leftX = Math.max(lo, lo + (q + (den === 0 ? 0 : (half - a) / den)) * step);
+      break;
+    }
+    for (let q = j; q < n - 1; q++) {
+      if (D[q] > half) continue;
+      const a = D[q], b = D[q + 1], den = b - a;
+      rightX = Math.min(hi, lo + (q + (den === 0 ? 0 : (half - a) / den)) * step);
+      break;
+    }
+    out.push({
+      centre: centre,
+      halfWidth: Math.max(0, (rightX - leftX) / 2),
+      height: peakD / mean,
+    });
+  }
+  out.sort((a, b) => a.centre - b.centre);
+  return out;
+}
+
+/**
+ * Density-based grouping with non-maximum suppression over [from..to].
+ * Not union-find: A~B and B~C must not chain into one rope (§9.2).
+ */
+export function groupOver(ma, from, to, atr, cfg) {
+  const L = ma.length, span = to - from + 1, share = new Array(L * L).fill(0);
+  for (let i = Math.max(from, 1); i <= to; i++) {
+    for (let a = 0; a < L; a++) {
+      if (ma[a][i] == null) continue;
+      for (let b = a + 1; b < L; b++) {
+        if (ma[b][i] == null) continue;
+        if (together(ma, a, b, i, atr, cfg)) share[a * L + b]++;
+      }
+    }
+  }
+  const need = Math.max(2, Math.floor(span * cfg.minShare));
+  const priceRef = (() => {
+    for (let a = 0; a < L; a++) {
+      if (ma[a][to] != null) return ma[a][to];
+    }
+    return null;
+  })();
+  const tol = tolAbs(priceRef, atr && atr[to], cfg);
+  if (!(tol > 0)) return [];
+
+  const idx = [];
+  for (let a = 0; a < L; a++) if (ma[a][to] != null) idx.push(a);
+  idx.sort((x, y) => ma[x][to] - ma[y][to]);
+  if (idx.length < 4) return [];
+
+  const gaps = [];
+  for (let k = 1; k < idx.length; k++) gaps.push(ma[idx[k]][to] - ma[idx[k - 1]][to]);
+  gaps.sort((a, b) => a - b);
+  const medGap = gaps[Math.floor(gaps.length / 2)] || 0;
+  if (!(medGap > 0)) return [];
+
+  const MIN_LINES = 3;
+  const cands = [];
+  for (let a = 0; a < idx.length; a++) {
+    const anchor = idx[a], g = [anchor];
+    for (let b = a + 1; b < idx.length && (ma[idx[b]][to] - ma[anchor][to]) <= tol; b++) {
+      const lo = Math.min(anchor, idx[b]), hi = Math.max(anchor, idx[b]);
+      if (share[lo * L + hi] >= need) g.push(idx[b]);
+    }
+    if(g.length < MIN_LINES) continue;
+    // Group must share a longitudinal direction at the judgment bar —
+    // a price pile-up of crossing strands is not a rope.
+    if (!groupAligned(ma, g, to, atr, cfg)) continue;
+    const width = ma[g[g.length - 1]][to] - ma[g[0]][to];
+    const ownGap = width / (g.length - 1);
+    if (ownGap * cfg.density > medGap) continue;
+    cands.push({ g, score: g.length * (medGap / (ownGap || 1e-9)) });
+  }
+
+  cands.sort((x, y) => y.score - x.score);
+  const out = [], taken = new Set();
+  for (const c of cands) {
+    const shared = c.g.filter((s) => taken.has(s)).length;
+    if (shared / c.g.length >= 0.5) continue;
+    c.g.forEach((s) => taken.add(s));
+    out.push(c.g);
+  }
+  return out;
+}
+
+function bandOf(ma, strands, i) {
+  let lo = Infinity, hi = -Infinity, ok = 0;
+  for (const s of strands) {
+    const v = ma[s][i];
+    if (v == null) continue;
+    ok++;
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  return ok >= 2 ? [lo, hi] : null;
+}
+
+function coreOverlap(a, b) {
+  const sa = new Set(a);
+  let hit = 0;
+  for (const x of b) if (sa.has(x)) hit++;
+  return hit / Math.max(a.length, b.length);
+}
+
+function nextId(state) {
+  return state.id++;
+}
+
+function buildStreaming(ma, candles, atr, cfg, state) {
+  const N = candles.length, ropes = [];
+  let live = [];
+  for (let i = cfg.win; i < N; i++) {
+    const groups = groupOver(ma, i - cfg.win, i, atr, cfg);
+    const used = new Set();
+    for (const g of groups) {
+      let best = null, bestOv = 0.34;
+      for (const r of live) {
+        if (used.has(r)) continue;
+        const ov = coreOverlap(r.strands, g);
+        if (ov > bestOv) { bestOv = ov; best = r; }
+      }
+      if (best) {
+        used.add(best);
+        best.strands = g;
+        best.to = i;
+        best.miss = 0;
+        const bd = bandOf(ma, g, i);
+        if (bd) best.bands.push([i, bd]);
+      } else {
+        const bd = bandOf(ma, g, i);
+        const r = {
+          id: nextId(state),
+          strands: g,
+          from: i,
+          to: i,
+          miss: 0,
+          bands: bd ? [[i, bd]] : [],
+          roles: new Map(),
+          dead: false,
+          deathBar: null,
+        };
+        live.push(r);
+        ropes.push(r);
+        used.add(r);
+      }
+    }
+    live = live.filter((r) => {
+      if (used.has(r)) return true;
+      r.miss = (r.miss || 0) + 1;
+      if (r.miss > cfg.forgive) {
+        r.dead = true;
+        r.deathBar = i;
+        return false;
+      }
+      return true;
+    });
+  }
+  return ropes;
+}
+
+function buildLookback(ma, candles, atr, cfg, state) {
+  const N = candles.length, ropes = [];
+  let live = [];
+  for (let i = cfg.win; i < N; i++) {
+    const groups = groupOver(ma, i - cfg.win, i, atr, cfg);
+    const used = new Set();
+    for (const g of groups) {
+      let best = null, bestOv = 0.34;
+      for (const r of live) {
+        if (used.has(r)) continue;
+        const ov = coreOverlap(r.strands, g);
+        if (ov > bestOv) { bestOv = ov; best = r; }
+      }
+      if (best) {
+        used.add(best);
+        best.strands = g;
+        best.to = i;
+        best.miss = 0;
+        const bd = bandOf(ma, g, i);
+        if (bd) best.bands.push([i, bd]);
+      } else {
+        let start = i;
+        while (start > 1) {
+          const bd = bandOf(ma, g, start);
+          if (!bd) break;
+          const mid = (bd[0] + bd[1]) / 2;
+          const tol = tolAbs(mid, atr && atr[start], cfg);
+          if (tol == null || (bd[1] - bd[0]) > tol) break;
+          let ok = 0, tot = 0;
+          for (let a = 0; a < g.length; a++) {
+            for (let b = a + 1; b < g.length; b++) {
+              tot++;
+              if (together(ma, g[a], g[b], start, atr, cfg)) ok++;
+            }
+          }
+          if (tot === 0 || ok / tot < cfg.minShare) break;
+          start--;
+        }
+        const r = {
+          id: nextId(state),
+          strands: g,
+          from: start + 1,
+          to: i,
+          miss: 0,
+          bands: [],
+          roles: new Map(),
+          dead: false,
+          deathBar: null,
+        };
+        for (let b = r.from; b <= i; b++) {
+          const bd = bandOf(ma, g, b);
+          if (bd) r.bands.push([b, bd]);
+        }
+        live.push(r);
+        ropes.push(r);
+        used.add(r);
+      }
+    }
+    live = live.filter((r) => {
+      if (used.has(r)) return true;
+      r.miss = (r.miss || 0) + 1;
+      if (r.miss > cfg.forgive) {
+        r.dead = true;
+        r.deathBar = i;
+        return false;
+      }
+      return true;
+    });
+  }
+  return ropes;
+}
+
+/**
+ * Role from band EDGES, carried while price is inside.
+ * Fully above → support (1); fully below → resistance (−1).
+ */
+export function assignRoles(rope, candles) {
+  rope.roles = new Map();
+  let prev = null;
+  for (const [i, band] of rope.bands) {
+    if (!band) continue;
+    const p = candles[i].c;
+    let role;
+    if (p > band[1]) role = 1;
+    else if (p < band[0]) role = -1;
+    else if (prev !== null) role = prev;
+    else role = p > (band[0] + band[1]) / 2 ? 1 : -1;
+    rope.roles.set(i, role);
+    prev = role;
+  }
+}
+
+/**
+ * detectRopes(fabric, candles, atr, cfg) -> Rope[]
+ * cfg: DEFAULT_CFG fields + barMs (required unless win/forgive set in bars)
+ */
+export function detectRopes(fabric, candles, atr, cfg = {}) {
+  const c = { ...DEFAULT_CFG, ...cfg };
+  const { win, forgive } = resolveWinForgive(c, candles.length);
+  c.win = win;
+  c.forgive = forgive;
+  const state = { id: 1 };
+  const ropes = c.mode === "stream"
+    ? buildStreaming(fabric, candles, atr, c, state)
+    : buildLookback(fabric, candles, atr, c, state);
+  const kept = ropes.filter((r) => r.bands.length > 0);
+  for (const r of kept) assignRoles(r, candles);
+  return kept;
+}
+
+// ---------------------------------------------------------------------------
+// contactEvents — geometric enter / bounce / break (PRD-TRADER §1)
+// S10-C8: decision boundary is the rope edge; pad defaults to 0.
+// ---------------------------------------------------------------------------
+
+function zoneSide(price, zLo, zHi) {
+  if (price > zHi) return "above";
+  if (price < zLo) return "below";
+  return null;
+}
+
+/**
+ * contactEvents(ropes, candles, opts?) -> Event[]
+ * Event: { bar, ropeId, kind: 'enter'|'bounce'|'break', side, price }
+ * opts.zone / zoneAtr kept only for legacy measurement; default pad = 0.
+ */
+export function contactEvents(ropes, candles, {
+  zone = 0,
+  zoneAtr = null,
+  atr = null,
+} = {}) {
+  const events = [];
+  for (const rope of ropes) {
+    const bandAt = new Map();
+    for (const [i, band] of rope.bands) {
+      if (band) bandAt.set(i, band);
+    }
+    if (!bandAt.size) continue;
+
+    const bars = [...bandAt.keys()].sort((a, b) => a - b);
+    let inside = false;
+    let enterSide = null;
+
+    for (const i of bars) {
+      const [lo, hi] = bandAt.get(i);
+      const pad = (zoneAtr != null && atr && atr[i] != null)
+        ? zoneAtr * atr[i]
+        : zone;
+      const zLo = lo - pad;
+      const zHi = hi + pad;
+      const price = candles[i].c;
+      const sideNow = zoneSide(price, zLo, zHi);
+      const isIn = sideNow === null;
+
+      if (!inside && isIn) {
+        const prevPrice = i > 0 ? candles[i - 1].c : price;
+        const from = zoneSide(prevPrice, zLo, zHi);
+        enterSide = from || (prevPrice > (zLo + zHi) / 2 ? "above" : "below");
+        events.push({
+          bar: i,
+          ropeId: rope.id,
+          kind: "enter",
+          side: enterSide,
+          price,
+        });
+        inside = true;
+      } else if (inside && !isIn) {
+        const exitSide = sideNow;
+        const kind = exitSide === enterSide ? "bounce" : "break";
+        events.push({
+          bar: i,
+          ropeId: rope.id,
+          kind,
+          side: exitSide,
+          price,
+        });
+        inside = false;
+        enterSide = null;
+      }
+    }
+  }
+  events.sort((a, b) => a.bar - b.bar || a.ropeId - b.ropeId);
+  return events;
+}
+
+// ---------------------------------------------------------------------------
+// Cord geometry — Gaussian spine (rope is a smooth object, not polyline corners)
+// ---------------------------------------------------------------------------
+
+/** 1-D Gaussian kernel, odd length, normalised. */
+export function gaussianKernel(sigma) {
+  const s = Math.max(0.35, sigma);
+  const r = Math.max(1, Math.ceil(s * 3));
+  const w = [];
+  let sum = 0;
+  for (let i = -r; i <= r; i++) {
+    const v = Math.exp(-(i * i) / (2 * s * s));
+    w.push(v);
+    sum += v;
+  }
+  return w.map((x) => x / sum);
+}
+
+/** Convolve a series with a Gaussian (nulls skipped; edges renormalised). */
+export function gaussianSmooth1d(values, sigma) {
+  const k = gaussianKernel(sigma);
+  const r = (k.length - 1) / 2;
+  const out = new Array(values.length);
+  for (let i = 0; i < values.length; i++) {
+    if (values[i] == null || !Number.isFinite(values[i])) {
+      out[i] = values[i];
+      continue;
+    }
+    let acc = 0, wsum = 0;
+    for (let j = -r; j <= r; j++) {
+      const idx = i + j;
+      if (idx < 0 || idx >= values.length) continue;
+      const v = values[idx];
+      if (v == null || !Number.isFinite(v)) continue;
+      const w = k[j + r];
+      acc += v * w;
+      wsum += w;
+    }
+    out[i] = wsum > 0 ? acc / wsum : values[i];
+  }
+  return out;
+}
+
+/**
+ * Max |Δ²| of a series (corner energy). Lower after Gaussian smoothing.
+ * Skips nulls; needs ≥3 finite samples.
+ */
+export function maxSecondDiff(values) {
+  let max = 0;
+  let prev = null, prev2 = null;
+  for (const v of values) {
+    if (v == null || !Number.isFinite(v)) {
+      prev = null;
+      prev2 = null;
+      continue;
+    }
+    if (prev != null && prev2 != null) {
+      const d2 = Math.abs(v - 2 * prev + prev2);
+      if (d2 > max) max = d2;
+    }
+    prev2 = prev;
+    prev = v;
+  }
+  return max;
+}
