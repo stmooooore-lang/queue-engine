@@ -1,0 +1,10 @@
+name = "plexus-queue-worker"
+main = "index.js"
+compatibility_date = "2026-08-20"
+
+[vars]
+TURSO_DATABASE_URL = "@turso-database-url"
+TURSO_AUTH_TOKEN = "@turso-auth-token"
+TELEGRAM_BOT_TOKEN = "@telegram-bot-token"
+TELEGRAM_ALLOWED_USER_ID = "@telegram-allowed-user-id"
+GITHUB_TOKEN = "@github-token"

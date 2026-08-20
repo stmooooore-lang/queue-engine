@@ -1,0 +1,78 @@
+name: Task Executor
+
+on:
+  workflow_dispatch:
+    inputs:
+      taskId:
+        description: 'Task ID to execute'
+        required: true
+
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install dependencies
+        run: npm install @libsql/client
+      - name: Fetch and execute task
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: node -e "
+          const { Client } = require('@libsql/client');
+          const client = new Client({ url: process.env.TURSO_DATABASE_URL, authToken: process.env.TURSO_AUTH_TOKEN });
+          
+          async function run() {
+            const taskId = ${{ github.event.inputs.taskId }};
+            const startTime = Date.now();
+            
+            // Fetch task
+            const taskRes = await client.execute({ sql: 'SELECT * FROM tasks WHERE id = ? AND status = ?', args: [taskId, 'ожидает'] });
+            const task = taskRes.rows[0];
+            if (!task) { console.log('No pending task found'); return; }
+            
+            // Mark as running
+            await client.execute({ sql: 'UPDATE tasks SET status = ?, actions_run_id = ? WHERE id = ?', args: ['выполняется', process.env.GITHUB_RUN_ID, taskId] });
+            
+            // Simulate work (replace with real logic)
+            const workStart = Date.now();
+            const result = await doWork(task.text);
+            const workEnd = Date.now();
+            
+            // Update task
+            const status = result.success ? 'готова' : 'провал';
+            const minutesUsed = Math.ceil((workEnd - workStart) / 60000);
+            const secondsToFirstWork = Math.floor((workStart - startTime) / 1000);
+            
+            await client.execute({ 
+              sql: 'UPDATE tasks SET status = ?, result = ?, actions_run_id = ?, seconds_to_first_work = ?, minutes_used = ? WHERE id = ?',
+              args: [status, result.message, process.env.GITHUB_RUN_ID, secondsToFirstWork, minutesUsed, taskId]
+            });
+            
+            // Notify via Telegram
+            await notifyTelegram(task.creator_id, `Задача ${taskId} ${status}: ${result.message}`);
+          }
+          
+          async function doWork(text) {
+            // Placeholder: simulate work
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            return { success: true, message: 'Работа выполнена' };
+          }
+          
+          async function notifyTelegram(chatId, message) {
+            const url = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+            await fetch(url, { 
+              method: 'POST', 
+              headers: { 'Content-Type': 'application/json' }, 
+              body: JSON.stringify({ chat_id: chatId, text: message })
+            });
+          }
+          
+          run().catch(console.error);
+        "
