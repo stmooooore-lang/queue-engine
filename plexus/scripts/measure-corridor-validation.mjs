@@ -17,6 +17,7 @@ import {
   DEFAULT_CFG,
 } from "../site/engine/rope.js";
 import { runInstrument, DEFAULT_TRADE } from "../site/engine/trader.js";
+import { fetchCryptoCompare } from "./lib/cryptocompare.mjs";
 
 const MAX_DAYS = Number(process.env.MAX_DAYS || 180);
 const PROG = process.env.PROGRESS_LOG || "notes/2026-08-03-corridor-validation.progress.log";
@@ -26,35 +27,44 @@ function log(msg) {
   process.stderr.write(line);
 }
 
+// `source` is the venue the candles belong to; `route` is how they are reached.
+// Crypto keeps source "bybit" — it is the same exchange as in August — and
+// travels by CryptoCompare, because api.bybit.com refuses US addresses and the
+// nightly run is a US runner. See scripts/lib/cryptocompare.mjs.
 const INSTRUMENTS = [
-  { id: "BTCUSDT", cls: "crypto", source: "bybit", symbol: "BTCUSDT" },
-  { id: "ETHUSDT", cls: "crypto", source: "bybit", symbol: "ETHUSDT" },
-  { id: "SOLUSDT", cls: "crypto", source: "bybit", symbol: "SOLUSDT" },
-  { id: "XRPUSDT", cls: "crypto", source: "bybit", symbol: "XRPUSDT" },
-  { id: "BNBUSDT", cls: "crypto", source: "bybit", symbol: "BNBUSDT" },
-  { id: "EURUSD", cls: "forex", source: "yahoo", symbol: "EURUSD=X" },
-  { id: "GBPUSD", cls: "forex", source: "yahoo", symbol: "GBPUSD=X" },
-  { id: "NDX", cls: "index", source: "yahoo", symbol: "^NDX" },
-  { id: "SPX", cls: "index", source: "yahoo", symbol: "^GSPC" },
+  { id: "BTCUSDT", cls: "crypto", source: "bybit", route: "cryptocompare", symbol: "BTCUSDT", fsym: "BTC", tsym: "USDT" },
+  { id: "ETHUSDT", cls: "crypto", source: "bybit", route: "cryptocompare", symbol: "ETHUSDT", fsym: "ETH", tsym: "USDT" },
+  { id: "SOLUSDT", cls: "crypto", source: "bybit", route: "cryptocompare", symbol: "SOLUSDT", fsym: "SOL", tsym: "USDT" },
+  { id: "XRPUSDT", cls: "crypto", source: "bybit", route: "cryptocompare", symbol: "XRPUSDT", fsym: "XRP", tsym: "USDT" },
+  { id: "BNBUSDT", cls: "crypto", source: "bybit", route: "cryptocompare", symbol: "BNBUSDT", fsym: "BNB", tsym: "USDT" },
+  { id: "EURUSD", cls: "forex", source: "yahoo", route: "yahoo", symbol: "EURUSD=X" },
+  { id: "GBPUSD", cls: "forex", source: "yahoo", route: "yahoo", symbol: "GBPUSD=X" },
+  { id: "NDX", cls: "index", source: "yahoo", route: "yahoo", symbol: "^NDX" },
+  { id: "SPX", cls: "index", source: "yahoo", route: "yahoo", symbol: "^GSPC" },
 ];
 
 // Caps = practical source limits (Yahoo 60m ≈ 2y; Bybit matched to that for parity).
-// Daily: Yahoo range=max; Bybit paginate to cap.
+// Daily: Yahoo range=max; crypto paginates to cap. The cap names and the
+// BYBIT_* overrides are unchanged from August — the venue is still Bybit, only
+// the road changed — and `cc` names the endpoint that road uses. CryptoCompare
+// has no 4h endpoint, so 4h is built from hourly by the same aggregateHours()
+// that builds it for Yahoo; both bucket on absolute UTC boundaries, which is
+// where Bybit's own 240 bars start.
 const TFS = [
   {
-    key: "1h", barKey: "60", yahoo: "60m", bybit: "60", yahooRange: "2y",
+    key: "1h", barKey: "60", yahoo: "60m", cc: "hour", yahooRange: "2y",
     // ~2y hourly when feasible; override BYBIT_1H. Default 10000 (~14 months):
     // detectRopes cost grows steeply; Yahoo 60m max is ~2y — stated per cell.
     bybitCap: Number(process.env.BYBIT_1H || 10000),
   },
   {
-    key: "4h", barKey: "240", yahoo: "60m", bybit: "240", yahooRange: "2y",
+    key: "4h", barKey: "240", yahoo: "60m", cc: "hour", yahooRange: "2y",
     aggregateHours: 4,
     bybitCap: Number(process.env.BYBIT_4H || 4400),
   },
   {
     // Yahoo range=max returns ~160–270 pts for indices/FX; 10y is usable daily.
-    key: "1D", barKey: "D", yahoo: "1d", bybit: "D", yahooRange: "10y",
+    key: "1D", barKey: "D", yahoo: "1d", cc: "day", yahooRange: "10y",
     bybitCap: Number(process.env.BYBIT_1D || 3000),
   },
 ];
@@ -64,35 +74,6 @@ const MIN_BOTH = 5; // min trades per group to count toward pass/fail
 
 fs.writeFileSync(PROG, "");
 log(`start command=${command}`);
-
-async function fetchBybit(symbol, interval, cap) {
-  let rows = [], end = "";
-  while (rows.length < cap) {
-    const lim = Math.min(1000, cap - rows.length);
-    let u =
-      `https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}` +
-      `&interval=${interval}&limit=${lim}`;
-    if (end) u += `&end=${end}`;
-    const j = await (await fetch(u, {
-      cache: "no-store",
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; PlexusResearch/1.0)" },
-    })).json();
-    if (j.retCode && j.retCode !== 0) {
-      throw new Error(`bybit ${symbol} ${interval}: ${j.retMsg || j.retCode}`);
-    }
-    const list = j.result?.list || [];
-    if (!list.length) break;
-    const chunk = list.map((x) => ({
-      t: +x[0], o: +x[1], h: +x[2], l: +x[3], c: +x[4],
-    }));
-    rows = rows.concat(chunk);
-    end = String(Math.min(...chunk.map((x) => x.t)) - 1);
-    if (list.length < lim) break;
-  }
-  const byT = new Map();
-  for (const r of rows) byT.set(r.t, r);
-  return [...byT.values()].sort((a, b) => a.t - b.t);
-}
 
 async function fetchYahoo(symbol, interval, range) {
   const u =
@@ -133,8 +114,18 @@ function aggregateHours(candles, hours) {
 }
 
 async function loadSeries(inst, tf) {
-  if (inst.source === "bybit") {
-    return fetchBybit(inst.symbol, tf.bybit, tf.bybitCap);
+  if (inst.route === "cryptocompare") {
+    // 4h is aggregated here rather than asked for: CryptoCompare offers only
+    // hourly and daily, so fetch aggregateHours× the bars and fold them.
+    const hours = tf.aggregateHours || 1;
+    const series = await fetchCryptoCompare({
+      fsym: inst.fsym,
+      tsym: inst.tsym,
+      unit: tf.cc,
+      cap: tf.bybitCap * (tf.cc === "hour" ? hours : 1),
+      log,
+    });
+    return tf.aggregateHours ? aggregateHours(series, tf.aggregateHours) : series;
   }
   if (tf.aggregateHours) {
     const hourly = await fetchYahoo(inst.symbol, "60m", tf.yahooRange);
@@ -270,6 +261,7 @@ for (const inst of INSTRUMENTS) {
       id: inst.id,
       cls: inst.cls,
       source: inst.source,
+      route: inst.route,
       symbol: inst.symbol,
       tf: tf.key,
       nCandles: candles.length,
