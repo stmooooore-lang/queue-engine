@@ -31,7 +31,7 @@ jobs:
 
       - name: verdict
         working-directory: plexus
-        run: grep -E "^median delta|^VERDICT" console.txt || tail -30 console.txt
+        run: grep -aE "median delta|VERDICT" s12-13.json console.txt || tail -30 console.txt
 
       - uses: actions/upload-artifact@v4
         if: always()

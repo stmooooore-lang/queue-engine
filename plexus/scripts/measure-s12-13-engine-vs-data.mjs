@@ -116,6 +116,12 @@ console.log(`\n${"cell".padEnd(14)} ${"now".padStart(5)} ${"old".padStart(5)} ${
 for (const c of cells) {
   console.log(`${(c.id + "/" + c.tf).padEnd(14)} ${String(c.ropesNow).padStart(5)} ${String(c.ropesOld).padStart(5)} ${(c.deltaPct === null ? "n/a" : c.deltaPct + "%").padStart(8)}`);
 }
-console.log(`\nmedian delta ${median}% over ${withBoth.length} cells, fewer now in ${fewer}`);
-console.log(`VERDICT: ${verdict}\n`);
+const summary =
+  `median delta ${median}% over ${withBoth.length} cells, fewer now in ${fewer}\n` +
+  `VERDICT: ${verdict}`;
+console.log(`\n${summary}\n`);
+// Also to stderr: stdout is redirected into the JSON file by every caller, and
+// a verdict nobody can see without downloading an artifact is a verdict nobody
+// reads. The run log is where it belongs.
+log(summary.replace(/\n/g, " | "));
 console.log(JSON.stringify(out, null, 2));
