@@ -17,7 +17,7 @@ import {
   DEFAULT_CFG,
 } from "../site/engine/rope.js";
 import { runInstrument, DEFAULT_TRADE } from "../site/engine/trader.js";
-import { fetchCryptoCompare } from "./lib/cryptocompare.mjs";
+import { fetchArchive } from "./lib/binance-archive.mjs";
 
 const MAX_DAYS = Number(process.env.MAX_DAYS || 180);
 const PROG = process.env.PROGRESS_LOG || "notes/2026-08-03-corridor-validation.progress.log";
@@ -28,15 +28,24 @@ function log(msg) {
 }
 
 // `source` is the venue the candles belong to; `route` is how they are reached.
-// Crypto keeps source "bybit" — it is the same exchange as in August — and
-// travels by CryptoCompare, because api.bybit.com refuses US addresses and the
-// nightly run is a US runner. See scripts/lib/cryptocompare.mjs.
+//
+// Crypto changed venue on 2026-08-20 and the record says so rather than hiding
+// it. August measured Bybit linear perpetuals over their live API. That API is
+// rate-limited and mutable, and every attempt to reach it from a scheduled
+// runner ended somewhere worse - the last one at a hundred calls a month. The
+// candles now come from the Binance static archive: no key, no quota, and the
+// files do not change, so two runs read the same bytes.
+//
+// The venues are not the same and the number says how far apart: 0.57 bp median
+// over 200 shared hourly bars, worst 2.85. For comparison, Bybit's own spot
+// book sits 5.44 bp from Bybit's perpetual. Closer to August than the road that
+// still carried Bybit's name.
 const INSTRUMENTS = [
-  { id: "BTCUSDT", cls: "crypto", source: "bybit", route: "cryptocompare", symbol: "BTCUSDT", fsym: "BTC", tsym: "USDT" },
-  { id: "ETHUSDT", cls: "crypto", source: "bybit", route: "cryptocompare", symbol: "ETHUSDT", fsym: "ETH", tsym: "USDT" },
-  { id: "SOLUSDT", cls: "crypto", source: "bybit", route: "cryptocompare", symbol: "SOLUSDT", fsym: "SOL", tsym: "USDT" },
-  { id: "XRPUSDT", cls: "crypto", source: "bybit", route: "cryptocompare", symbol: "XRPUSDT", fsym: "XRP", tsym: "USDT" },
-  { id: "BNBUSDT", cls: "crypto", source: "bybit", route: "cryptocompare", symbol: "BNBUSDT", fsym: "BNB", tsym: "USDT" },
+  { id: "BTCUSDT", cls: "crypto", source: "binance-perp", route: "archive", symbol: "BTCUSDT" },
+  { id: "ETHUSDT", cls: "crypto", source: "binance-perp", route: "archive", symbol: "ETHUSDT" },
+  { id: "SOLUSDT", cls: "crypto", source: "binance-perp", route: "archive", symbol: "SOLUSDT" },
+  { id: "XRPUSDT", cls: "crypto", source: "binance-perp", route: "archive", symbol: "XRPUSDT" },
+  { id: "BNBUSDT", cls: "crypto", source: "binance-perp", route: "archive", symbol: "BNBUSDT" },
   { id: "EURUSD", cls: "forex", source: "yahoo", route: "yahoo", symbol: "EURUSD=X" },
   { id: "GBPUSD", cls: "forex", source: "yahoo", route: "yahoo", symbol: "GBPUSD=X" },
   { id: "NDX", cls: "index", source: "yahoo", route: "yahoo", symbol: "^NDX" },
@@ -46,25 +55,25 @@ const INSTRUMENTS = [
 // Caps = practical source limits (Yahoo 60m ≈ 2y; Bybit matched to that for parity).
 // Daily: Yahoo range=max; crypto paginates to cap. The cap names and the
 // BYBIT_* overrides are unchanged from August — the venue is still Bybit, only
-// the road changed — and `cc` names the endpoint that road uses. CryptoCompare
-// has no 4h endpoint, so 4h is built from hourly by the same aggregateHours()
+// the road changed — and `arch` names the archive interval. There is no 4h
+// archive, so 4h is built from hourly by the same aggregateHours()
 // that builds it for Yahoo; both bucket on absolute UTC boundaries, which is
 // where Bybit's own 240 bars start.
 const TFS = [
   {
-    key: "1h", barKey: "60", yahoo: "60m", cc: "hour", yahooRange: "2y",
+    key: "1h", barKey: "60", yahoo: "60m", arch: "1h", yahooRange: "2y",
     // ~2y hourly when feasible; override BYBIT_1H. Default 10000 (~14 months):
     // detectRopes cost grows steeply; Yahoo 60m max is ~2y — stated per cell.
     bybitCap: Number(process.env.BYBIT_1H || 10000),
   },
   {
-    key: "4h", barKey: "240", yahoo: "60m", cc: "hour", yahooRange: "2y",
+    key: "4h", barKey: "240", yahoo: "60m", arch: "1h", yahooRange: "2y",
     aggregateHours: 4,
     bybitCap: Number(process.env.BYBIT_4H || 4400),
   },
   {
     // Yahoo range=max returns ~160–270 pts for indices/FX; 10y is usable daily.
-    key: "1D", barKey: "D", yahoo: "1d", cc: "day", yahooRange: "10y",
+    key: "1D", barKey: "D", yahoo: "1d", arch: "1d", yahooRange: "10y",
     bybitCap: Number(process.env.BYBIT_1D || 3000),
   },
 ];
@@ -114,15 +123,16 @@ function aggregateHours(candles, hours) {
 }
 
 async function loadSeries(inst, tf) {
-  if (inst.route === "cryptocompare") {
-    // 4h is aggregated here rather than asked for: CryptoCompare offers only
-    // hourly and daily, so fetch aggregateHours× the bars and fold them.
+  if (inst.route === "archive") {
+    // 4h is folded here rather than downloaded: the archive publishes hourly
+    // and daily only. Checked against Bybit's own 240 bars on all five pairs -
+    // 495 shared bars, every OHLC value identical - because both bucket on
+    // absolute UTC boundaries.
     const hours = tf.aggregateHours || 1;
-    const series = await fetchCryptoCompare({
-      fsym: inst.fsym,
-      tsym: inst.tsym,
-      unit: tf.cc,
-      cap: tf.bybitCap * (tf.cc === "hour" ? hours : 1),
+    const series = await fetchArchive({
+      symbol: inst.symbol,
+      tf: tf.arch,
+      cap: tf.bybitCap * (tf.arch === "1h" ? hours : 1),
       log,
     });
     return tf.aggregateHours ? aggregateHours(series, tf.aggregateHours) : series;

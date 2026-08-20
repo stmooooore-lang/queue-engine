@@ -1,32 +1,25 @@
 /**
- * Acceptance check for the CryptoCompare route.
+ * Acceptance check for the crypto route.
  *
- *   PLEXUS_CRYPTOCOMPARE_KEY=… node scripts/crypto-route-check.mjs
+ *   node scripts/crypto-route-check.mjs
  *
- * Answers two questions the corridor run itself would only answer after an
- * hour: does the route return candles at all for all five pairs, and are they
- * the same candles Bybit serves directly?
+ * No key and no secret: the candles come from the Binance static archive.
+ * Answers in seconds what the hour-long corridor run would otherwise answer
+ * last: do all five pairs load, how fresh is the archive, and how far the
+ * series sits from the Bybit perpetual August measured.
  *
- * Run it on the Mac and it does both — the Mac can reach api.bybit.com, so the
- * two series are compared bar by bar against Bybit's linear (perpetual) and
- * spot books, and the closer of the two is named. Run it on a US runner and
- * Bybit is unreachable; the check then reports the route alone and says so.
- * Exit code is 1 if any pair fails to load.
+ * Where api.bybit.com is reachable - it is from the founder's Mac - the check
+ * compares bar by bar and prints the distance in basis points. Where it is not,
+ * it reports the archive alone and says so. Exit code 1 if any pair fails.
  */
-import { fetchCryptoCompare } from "./lib/cryptocompare.mjs";
+import { fetchArchive } from "./lib/binance-archive.mjs";
 
-const PAIRS = [
-  { id: "BTCUSDT", fsym: "BTC", tsym: "USDT" },
-  { id: "ETHUSDT", fsym: "ETH", tsym: "USDT" },
-  { id: "SOLUSDT", fsym: "SOL", tsym: "USDT" },
-  { id: "XRPUSDT", fsym: "XRP", tsym: "USDT" },
-  { id: "BNBUSDT", fsym: "BNB", tsym: "USDT" },
-];
-const N = Number(process.env.CHECK_BARS || 48);
+const PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"];
+const N = Number(process.env.CHECK_BARS || 200);
 
-async function bybitDirect(symbol, category) {
+async function bybitCloses(symbol) {
   const u =
-    `https://api.bybit.com/v5/market/kline?category=${category}&symbol=${symbol}` +
+    `https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}` +
     `&interval=60&limit=${N}`;
   const j = await (await fetch(u, {
     cache: "no-store",
@@ -36,56 +29,39 @@ async function bybitDirect(symbol, category) {
   return new Map((j.result?.list || []).map((x) => [+x[0], +x[4]]));
 }
 
-// Largest close-to-close difference over the shared timestamps, in basis points.
-function worstBps(series, direct) {
-  let worst = 0, n = 0;
-  for (const bar of series) {
-    const c = direct.get(bar.t);
-    if (c == null) continue;
-    n++;
-    worst = Math.max(worst, Math.abs(bar.c - c) / c * 1e4);
-  }
-  return { worst, n };
-}
-
 let failed = 0;
-for (const p of PAIRS) {
+for (const symbol of PAIRS) {
   let series;
   try {
-    series = await fetchCryptoCompare({ fsym: p.fsym, tsym: p.tsym, unit: "hour", cap: N });
+    series = await fetchArchive({ symbol, tf: "1h", cap: N });
   } catch (e) {
-    console.log(`${p.id.padEnd(8)} FAIL  ${e.message}`);
+    console.log(`${symbol.padEnd(8)} FAIL  ${e.message}`);
     failed++;
     continue;
   }
-  if (!series.length) {
-    console.log(`${p.id.padEnd(8)} FAIL  no candles`);
+  if (series.length < N / 2) {
+    console.log(`${symbol.padEnd(8)} FAIL  only ${series.length} bars of ${N}`);
     failed++;
     continue;
   }
-  const span =
-    `${new Date(series[0].t).toISOString().slice(0, 16)} … ` +
-    `${new Date(series.at(-1).t).toISOString().slice(0, 16)}`;
-  let verdict = "bybit unreachable from here — route only";
+  const last = new Date(series.at(-1).t).toISOString().slice(0, 16);
+  const lagH = ((Date.now() - series.at(-1).t) / 3600e3).toFixed(0);
+  let verdict = "bybit unreachable from here - archive only";
   try {
-    const [linear, spot] = await Promise.all([
-      bybitDirect(p.id, "linear"),
-      bybitDirect(p.id, "spot"),
-    ]);
-    const l = worstBps(series, linear);
-    const s = worstBps(series, spot);
-    if (!l.n && !s.n) {
-      verdict = "no shared timestamps with Bybit";
-    } else {
-      const closer = l.worst <= s.worst ? "linear" : "spot";
-      verdict =
-        `matches Bybit ${closer} — worst linear ${l.worst.toFixed(1)} bp over ${l.n} bars, ` +
-        `spot ${s.worst.toFixed(1)} bp over ${s.n}`;
+    const B = await bybitCloses(symbol);
+    const d = [];
+    for (const bar of series) {
+      const c = B.get(bar.t);
+      if (c) d.push(Math.abs(bar.c - c) / c * 1e4);
     }
+    d.sort((a, b) => a - b);
+    verdict = d.length
+      ? `vs Bybit perp: median ${d[d.length >> 1].toFixed(2)} bp, worst ${d.at(-1).toFixed(2)} bp over ${d.length} bars`
+      : "no shared timestamps with Bybit";
   } catch {
-    // left as the unreachable verdict: that is the cloud case, not a failure
+    // the cloud case, not a failure
   }
-  console.log(`${p.id.padEnd(8)} ok    ${String(series.length).padStart(4)} bars  ${span}  ${verdict}`);
+  console.log(`${symbol.padEnd(8)} ok    ${String(series.length).padStart(4)} bars, last ${last} (${lagH}h ago)  ${verdict}`);
 }
 
 console.log(failed ? `\n${failed} of ${PAIRS.length} pairs failed` : `\nall ${PAIRS.length} pairs load`);
