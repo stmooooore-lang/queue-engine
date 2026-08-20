@@ -1,0 +1,19 @@
+name: providers-diag
+on: {workflow_dispatch: {}}
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: which model providers answer a US runner
+        run: |
+          for N in groq nvidia mistral gemini openrouter; do
+            case $N in
+              groq)       U="https://api.groq.com/openai/v1/models" ;;
+              nvidia)     U="https://integrate.api.nvidia.com/v1/models" ;;
+              mistral)    U="https://api.mistral.ai/v1/models" ;;
+              gemini)     U="https://generativelanguage.googleapis.com/v1beta/models" ;;
+              openrouter) U="https://openrouter.ai/api/v1/models" ;;
+            esac
+            C=$(curl -s -o /tmp/o.txt -w "%{http_code}" --max-time 15 -A "plexus/1.0" "$U")
+            printf "%-12s %s  %s\n" "$N" "$C" "$(head -c 70 /tmp/o.txt | tr -d '\n')"
+          done
