@@ -36,4 +36,5 @@ In repository Settings > Secrets and variables > Actions:
 | `TURSO_DATABASE_URL` | Same as worker |
 | `TURSO_AUTH_TOKEN` | Same as worker |
 | `TELEGRAM_BOT_TOKEN` | Same as worker |
-| `TELEGRAM_CHAT_ID` | Your numeric chat/user ID |
+
+Note: Notifications are sent to `creator_id` from the task row, no `TELEGRAM_CHAT_ID` secret needed.

@@ -23,13 +23,13 @@ jobs:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TASK_ID: ${{ inputs.taskId }}
         run: node -e "
-          const { Client } = require('@libsql/client');
-          const client = new Client({ url: process.env.TURSO_DATABASE_URL, authToken: process.env.TURSO_AUTH_TOKEN });
+          const { createClient } = require('@libsql/client');
+          const client = createClient({ url: process.env.TURSO_DATABASE_URL, authToken: process.env.TURSO_AUTH_TOKEN });
           
           async function run() {
-            const taskId = ${{ github.event.inputs.taskId }};
+            const taskId = process.env.TASK_ID;
             const startTime = Date.now();
             
             // Fetch task
@@ -40,7 +40,7 @@ jobs:
             // Mark as running
             await client.execute({ sql: 'UPDATE tasks SET status = ?, actions_run_id = ? WHERE id = ?', args: ['выполняется', process.env.GITHUB_RUN_ID, taskId] });
             
-            // Simulate work (replace with real logic)
+            // Execute work
             const workStart = Date.now();
             const result = await doWork(task.text);
             const workEnd = Date.now();
@@ -55,14 +55,13 @@ jobs:
               args: [status, result.message, process.env.GITHUB_RUN_ID, secondsToFirstWork, minutesUsed, taskId]
             });
             
-            // Notify via Telegram
+            // Notify via Telegram to creator
             await notifyTelegram(task.creator_id, `Задача ${taskId} ${status}: ${result.message}`);
           }
           
           async function doWork(text) {
-            // Placeholder: simulate work
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            return { success: true, message: 'Работа выполнена' };
+            // Execution not implemented yet
+            return { success: false, message: 'исполнение не реализовано' };
           }
           
           async function notifyTelegram(chatId, message) {
