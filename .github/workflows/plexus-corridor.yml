@@ -7,6 +7,10 @@ name: plexus-corridor
 # Results come back as an artifact. Nothing is committed to plexus-doc from
 # here: the cloud is a worker, not a git client, and the commit is made on the
 # Mac by the founder with his own key.
+#
+# Crypto reaches this runner by CryptoCompare (e=Bybit), not by api.bybit.com,
+# which refuses US addresses. Same venue, different road - see
+# plexus/scripts/lib/cryptocompare.mjs.
 
 on:
   workflow_dispatch:
@@ -29,11 +33,25 @@ jobs:
         with:
           node-version: '20'
 
+      # Ten seconds, and it says whether crypto will be in tonight's verdict.
+      - name: check the crypto route
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: plexus
+        continue-on-error: true
+        env:
+          PLEXUS_CRYPTOCOMPARE_KEY: ${{ secrets.PLEXUS_CRYPTOCOMPARE_KEY }}
+        run: node scripts/crypto-route-check.mjs
+
       - name: run the corridor validation
         working-directory: plexus
         env:
           MAX_DAYS: ${{ inputs.max_days || '180' }}
           PROGRESS_LOG: progress.log
+          # The key is passed on manual dispatch ONLY: this key's plan allows
+          # 100 calls a MONTH and one full run costs about 75, so a nightly
+          # schedule would spend the month in one night and fail every night
+          # after. The schedule therefore runs without crypto, as before.
+          PLEXUS_CRYPTOCOMPARE_KEY: ${{ github.event_name == 'workflow_dispatch' && secrets.PLEXUS_CRYPTOCOMPARE_KEY || '' }}
         run: |
           mkdir -p notes
           node scripts/measure-corridor-validation.mjs > result.json 2> console.txt || true
