@@ -1,14 +1,11 @@
 name: cloud-agent
 
-# No proxy: one provider, spoken natively. The proxy exists locally to route
-# fourteen providers and fall back; here it only added ModuleNotFoundError.
-#
-# Two defects fixed after the first green-but-failed run, 2026-08-20:
-#   * `| tee` returns tee's status, so the step exited 0 while cline had failed
-#     with "You didn't provide an API key" and the whole run was marked success.
-#     That is the exact substitution this project keeps catching in others.
-#   * the key is passed with -k rather than through providers.json, which cline
-#     did not read.
+# Third fix, 2026-08-20. The previous run passed the key with -k and cline sent
+# it to OPENAI - the error said "find your API key at platform.openai.com".
+# baseUrl is not settable by flag; it comes only from providers.json, and the
+# minimal file written earlier was rejected silently. This one copies the exact
+# shape of a working local file: lastUsedProvider at the top, and provider /
+# headers / updatedAt / tokenSource inside settings.
 
 on:
   workflow_dispatch:
@@ -30,24 +27,44 @@ jobs:
       - name: install cline
         run: npm i -g cline --silent
 
+      - name: provider config, exact shape of a working one
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+        run: |
+          mkdir -p ~/.cline/data/settings
+          python3 - <<'PY'
+          import json, os, datetime
+          cfg = {
+            "version": 1,
+            "lastUsedProvider": "openai-compatible",
+            "providers": {"openai-compatible": {
+                "settings": {
+                    "provider": "openai-compatible",
+                    "apiKey": os.environ["NVIDIA_API_KEY"],
+                    "model": "nvidia/nemotron-3-ultra-550b-a55b",
+                    "baseUrl": "https://integrate.api.nvidia.com/v1",
+                    "headers": {}},
+                "updatedAt": datetime.datetime.utcnow().isoformat() + "Z",
+                "tokenSource": "migration"}}}
+          p = os.path.expanduser("~/.cline/data/settings/providers.json")
+          open(p, "w").write(json.dumps(cfg))
+          os.chmod(p, 0o600)
+          PY
+          python3 -c "import json,os;d=json.load(open(os.path.expanduser('~/.cline/data/settings/providers.json')));print('baseUrl:',d['providers']['openai-compatible']['settings']['baseUrl'])"
+
       - name: run the agent
         shell: bash
         env:
           PROMPT: ${{ inputs.prompt }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
-          set -o pipefail   # without this, tee's zero hides cline's failure
-          cline --cwd "$GITHUB_WORKSPACE" \
-            -P openai-compatible \
-            -k "$NVIDIA_API_KEY" \
+          set -o pipefail
+          cline --cwd "$GITHUB_WORKSPACE" -P openai-compatible \
             -m nvidia/nemotron-3-ultra-550b-a55b \
             --compaction off --retries 3 "$PROMPT" 2>&1 | tee agent-output.txt
 
       - name: the work itself, not the exit code
         if: always()
         run: |
-          echo "--- files the agent left behind ---"
-          ls -la "$GITHUB_WORKSPACE" | head -20
           echo "--- hello.txt ---"
           cat hello.txt 2>/dev/null || echo "(hello.txt was never created)"
 
