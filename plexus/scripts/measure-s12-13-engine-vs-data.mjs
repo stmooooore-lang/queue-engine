@@ -1,23 +1,23 @@
 /**
- * S12-13 — что срезало канаты: код или данные.
+ * S12-13 — what cut the ropes: the code or the data.
  *
  *   node scripts/measure-s12-13-engine-vs-data.mjs > s12-13.json
  *
- * Ропов стало меньше на 19% против замера 2026-08-03. Между тем замером и
- * сегодняшним прогоном изменились ДВЕ вещи сразу: движок (четыре коммита
- * 3-10 августа) и данные (шестнадцать дней сдвига). Пока меняются обе,
- * причину назвать нельзя.
+ * Ropes fell about 19% against the 2026-08-03 measurement. Between that run and
+ * today TWO things changed at once: the engine (four commits, 3-10 August) and
+ * the data (sixteen days of shift). While both move, no cause can be named.
  *
- * Здесь они разделены: ОДИН И ТОТ ЖЕ ряд свечей прогоняется через ДВА движка -
- * нынешний и тот, что стоял до 3 августа (rope.js на 9b0bf65, 2026-08-03
- * 01:42, последний коммит перед d346561). Данные при этом тождественны, потому
- * что это буквально один массив в памяти.
+ * Here they are separated. THE SAME array of candles is run through TWO
+ * engines - the current one, and rope.js as it stood before 3 August
+ * (9b0bf65, 2026-08-03 01:42, the last commit before d346561). The data is not
+ * merely similar, it is one array in memory.
  *
- *   старый движок даёт заметно больше ропов  -> причина КОД
- *   оба движка дают примерно поровну         -> причина ДАННЫЕ, все четыре
- *                                               коммита оправданы
+ *   the old engine builds materially more ropes -> the cause is CODE
+ *   the two agree                               -> the cause is the DATA shift,
+ *                                                  and all four commits are
+ *                                                  exonerated
  *
- * Модели в задаче нет, квоты она не ест, ключей не требует.
+ * No model, no quota, no key.
  */
 import fs from "node:fs";
 import { INSTRUMENTS, TFS, loadSeries } from "./lib/series.mjs";
