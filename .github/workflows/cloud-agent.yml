@@ -1,11 +1,14 @@
 name: cloud-agent
 
-# No proxy on the runner. LiteLLM exists locally to route between fourteen
-# providers and to fall back when one dies; in the cloud there is exactly one
-# provider, and NVIDIA speaks the OpenAI protocol directly. Installing a proxy
-# to reach a single endpoint added a Python install, a port, a readiness wait
-# and a whole class of failure - it failed on the first run with
-# ModuleNotFoundError: No module named 'proxy_server'. Removed rather than fixed.
+# No proxy: one provider, spoken natively. The proxy exists locally to route
+# fourteen providers and fall back; here it only added ModuleNotFoundError.
+#
+# Two defects fixed after the first green-but-failed run, 2026-08-20:
+#   * `| tee` returns tee's status, so the step exited 0 while cline had failed
+#     with "You didn't provide an API key" and the whole run was marked success.
+#     That is the exact substitution this project keeps catching in others.
+#   * the key is passed with -k rather than through providers.json, which cline
+#     did not read.
 
 on:
   workflow_dispatch:
@@ -22,42 +25,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: {node-version: '20'}
+        with: {node-version: '22'}
 
       - name: install cline
         run: npm i -g cline --silent
 
-      - name: point cline straight at NVIDIA
-        env:
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-        run: |
-          mkdir -p ~/.cline/data/settings
-          python3 - <<'PY'
-          import json, os
-          cfg = {"version": 1, "providers": {"openai-compatible": {"settings": {
-              "apiKey": os.environ["NVIDIA_API_KEY"],
-              "baseUrl": "https://integrate.api.nvidia.com/v1",
-              "model": "nvidia/nemotron-3-ultra-550b-a55b"}}}}
-          p = os.path.expanduser("~/.cline/data/settings/providers.json")
-          open(p, "w").write(json.dumps(cfg))
-          os.chmod(p, 0o600)
-          PY
-          echo "provider config written, $(wc -c < ~/.cline/data/settings/providers.json) bytes"
-
       - name: run the agent
+        shell: bash
         env:
           PROMPT: ${{ inputs.prompt }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
-          cline --cwd "$GITHUB_WORKSPACE" -P openai-compatible \
+          set -o pipefail   # without this, tee's zero hides cline's failure
+          cline --cwd "$GITHUB_WORKSPACE" \
+            -P openai-compatible \
+            -k "$NVIDIA_API_KEY" \
             -m nvidia/nemotron-3-ultra-550b-a55b \
             --compaction off --retries 3 "$PROMPT" 2>&1 | tee agent-output.txt
+
+      - name: the work itself, not the exit code
+        if: always()
+        run: |
+          echo "--- files the agent left behind ---"
+          ls -la "$GITHUB_WORKSPACE" | head -20
+          echo "--- hello.txt ---"
+          cat hello.txt 2>/dev/null || echo "(hello.txt was never created)"
 
       - name: no key may leave in an artifact
         if: always()
         run: |
-          if grep -q 'nvapi-' agent-output.txt 2>/dev/null; then
-            echo "KEY LEAKED"; exit 1
-          fi
+          grep -q 'nvapi-' agent-output.txt 2>/dev/null && { echo "KEY LEAKED"; exit 1; }
           echo "no key in output"
 
       - uses: actions/upload-artifact@v4
