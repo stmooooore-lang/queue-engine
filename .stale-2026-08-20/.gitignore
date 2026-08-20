@@ -1,0 +1,14 @@
+.dev.vars
+.dev.keys.json
+.DS_Store
+node_modules/
+.wrangler/
+
+# Never commit anything that looks like a secret
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+secrets/
+config.yaml

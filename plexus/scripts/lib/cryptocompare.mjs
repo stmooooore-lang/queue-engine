@@ -73,10 +73,13 @@ export async function fetchCryptoCompare({ fsym, tsym, unit, cap, exchange = "By
     const page = j.Data.Data.filter((x) => x.close > 0 && x.high > 0);
     if (!page.length) break;
 
-    // With e= named there should be no conversion. If one happened anyway the
-    // prices are synthesised from another pair and are not Bybit's — fail
-    // rather than let them into a measurement that claims to be comparable.
-    const conv = page.find((x) => x.conversionType && x.conversionType !== "direct");
+    // A synthesised series is not the venue's own book. "direct" and
+    // "force_direct" both mean the pair was taken from the exchange as it is;
+    // "invert", "multiply" and "divide" mean the prices were computed from
+    // another pair, and those must not enter a measurement that claims to be
+    // comparable with August.
+    const HONEST = new Set(["direct", "force_direct"]);
+    const conv = page.find((x) => x.conversionType && !HONEST.has(x.conversionType));
     if (conv) {
       throw new Error(
         `cryptocompare ${label}: conversionType=${conv.conversionType} ` +

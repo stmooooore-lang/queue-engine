@@ -1,0 +1,83 @@
+name: Unattended Queue
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Daily at midnight UTC
+  workflow_dispatch:
+    inputs:
+      task:
+        description: 'Task to run (e.g., corridor, measurement)'
+        required: true
+        default: 'corridor'
+
+env:
+  TARGET_REPO: stmooooore-lang/plexus-doc
+  TARGET_BRANCH: cursor-build
+  TASK: ${{ github.event.inputs.task || 'corridor' }}
+
+jobs:
+  run-queue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout queue-engine
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run task
+        id: task
+        run: |
+          node scripts/run-${{ env.TASK }}.mjs
+          echo "result_path=output/result-${{ env.TASK }}.json" >> $GITHUB_OUTPUT
+
+      - name: Commit results to cursor-build
+        uses: actions-js/push@master
+        with:
+          github_token: ${{ secrets.PAT_PLEXUS_DOC }}
+          repository: ${{ env.TARGET_REPO }}
+          branch: ${{ env.TARGET_BRANCH }}
+          directory: output
+          message: "chore: unattended queue results for ${{ env.TASK }}"
+
+      - name: Notify on failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "Unattended Queue Failure: ${{ env.TASK }}"
+          body: "The unattended queue task ${{ env.TASK }} failed. See logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          to: founder@example.com
+          from: queue@example.com
+
+      - name: Check for new notes
+        id: notes
+        run: |
+          NOTE_FILES=$(ls notes/*.md 2>/dev/null || echo "")
+          if [ -n "$NOTE_FILES" ]; then
+            echo "notes_digest<<EOF" >> $GITHUB_OUTPUT
+            for file in $NOTE_FILES; do
+              echo "- $(basename $file): $(head -n 1 $file)" >> $GITHUB_OUTPUT
+            done
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send digest email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "Unattended Queue Digest: ${{ env.TASK }}"
+          body: "Task ${{ env.TASK }} completed. New notes:\n${{ steps.notes.outputs.notes_digest }}"
+          to: founder@example.com
+          from: queue@example.com
