@@ -1,0 +1,21 @@
+name: crypto-route-diag
+on: {workflow_dispatch: {}}
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: routes to BYBIT data from a US runner
+        run: |
+          probe () { printf "%-46s " "$1"; C=$(curl -s -o /tmp/r.txt -w "%{http_code}" -A "plexus/1.0" --max-time 20 "$2"); echo "$C  $(head -c 110 /tmp/r.txt | tr -d '\n')"; }
+          echo "=== агрегаторы, данные ИМЕННО Bybit ==="
+          probe "cryptocompare histohour e=Bybit" "https://min-api.cryptocompare.com/data/v2/histohour?fsym=BTC&tsym=USDT&e=Bybit&limit=2"
+          probe "cryptocompare histoday e=Bybit"  "https://min-api.cryptocompare.com/data/v2/histoday?fsym=BTC&tsym=USDT&e=Bybit&limit=2"
+          probe "coinapi ohlcv BYBIT (no key)"    "https://rest.coinapi.io/v1/ohlcv/BYBIT_PERP_BTC_USDT/history?period_id=1HRS&limit=2"
+          echo "=== агрегаторы, сводные ==="
+          probe "coingecko ohlc btc"              "https://api.coingecko.com/api/v3/coins/bitcoin/ohlc?vs_currency=usd&days=1"
+          probe "cryptocompare histohour сводно"  "https://min-api.cryptocompare.com/data/v2/histohour?fsym=BTC&tsym=USDT&limit=2"
+          echo "=== прямые биржи, для сравнения ==="
+          probe "bybit"                           "https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=60&limit=2"
+          probe "okx"                             "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT-SWAP&bar=1H&limit=2"
+          probe "bitget"                          "https://api.bitget.com/api/v2/mix/market/candles?symbol=BTCUSDT&productType=usdt-futures&granularity=1H&limit=2"
+          probe "gate.io"                         "https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract=BTC_USDT&interval=1h&limit=2"
