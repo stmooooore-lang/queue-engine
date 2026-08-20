@@ -1,5 +1,12 @@
 name: cloud-agent
 
+# No proxy on the runner. LiteLLM exists locally to route between fourteen
+# providers and to fall back when one dies; in the cloud there is exactly one
+# provider, and NVIDIA speaks the OpenAI protocol directly. Installing a proxy
+# to reach a single endpoint added a Python install, a port, a readiness wait
+# and a whole class of failure - it failed on the first run with
+# ModuleNotFoundError: No module named 'proxy_server'. Removed rather than fixed.
+
 on:
   workflow_dispatch:
     inputs:
@@ -12,70 +19,44 @@ jobs:
   run-agent:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: '3.11'}
       - uses: actions/setup-node@v4
         with: {node-version: '20'}
 
-      - name: install litellm and cline
-        run: |
-          pip install -q "litellm[proxy]"
-          npm i -g cline --silent
+      - name: install cline
+        run: npm i -g cline --silent
 
-      - name: proxy config (the key is a reference, never a value)
+      - name: point cline straight at NVIDIA
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
-          cat > proxy-config.yaml <<'EOF'
-          model_list:
-            - model_name: cloud-act
-              litellm_params:
-                model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
-                api_key: os.environ/NVIDIA_API_KEY
-          EOF
-
-      - name: cline provider config
-        run: |
-          # Without this cline has no idea where the proxy is. A fresh runner
-          # has no ~/.cline, so -P openai-compatible would resolve to nothing.
           mkdir -p ~/.cline/data/settings
-          cat > ~/.cline/data/settings/providers.json <<'EOF'
-          {"version":1,"providers":{"openai-compatible":{"settings":{
-            "apiKey":"sk-any","baseUrl":"http://127.0.0.1:4000/v1","model":"cloud-act"}}}}
-          EOF
-
-      - name: start proxy and wait for it
-        run: |
-          nohup litellm --config proxy-config.yaml --port 4000 --host 127.0.0.1 \
-            > proxy.log 2>&1 &
-          echo $! > proxy.pid
-          for i in $(seq 1 20); do
-            curl -fsS -m 5 http://127.0.0.1:4000/health/liveliness >/dev/null 2>&1 && \
-              { echo "proxy up after $((i*3))s"; break; }
-            sleep 3
-            [ "$i" = 20 ] && { echo "proxy never came up"; tail -40 proxy.log; exit 1; }
-          done
+          python3 - <<'PY'
+          import json, os
+          cfg = {"version": 1, "providers": {"openai-compatible": {"settings": {
+              "apiKey": os.environ["NVIDIA_API_KEY"],
+              "baseUrl": "https://integrate.api.nvidia.com/v1",
+              "model": "nvidia/nemotron-3-ultra-550b-a55b"}}}}
+          p = os.path.expanduser("~/.cline/data/settings/providers.json")
+          open(p, "w").write(json.dumps(cfg))
+          os.chmod(p, 0o600)
+          PY
+          echo "provider config written, $(wc -c < ~/.cline/data/settings/providers.json) bytes"
 
       - name: run the agent
         env:
           PROMPT: ${{ inputs.prompt }}
         run: |
-          # PROMPT arrives as an env var, not interpolated into the shell:
-          # a prompt containing a quote would otherwise break the command.
-          cline --cwd "$GITHUB_WORKSPACE" -P openai-compatible -m cloud-act \
+          cline --cwd "$GITHUB_WORKSPACE" -P openai-compatible \
+            -m nvidia/nemotron-3-ultra-550b-a55b \
             --compaction off --retries 3 "$PROMPT" 2>&1 | tee agent-output.txt
-
-      - name: what the proxy actually served
-        if: always()
-        run: grep -iE 'cloud-act|POST|200 OK|error' proxy.log | tail -20 || true
 
       - name: no key may leave in an artifact
         if: always()
         run: |
-          if grep -rq 'nvapi-' agent-output.txt proxy.log 2>/dev/null; then
-            echo "KEY LEAKED INTO OUTPUT"; exit 1
+          if grep -q 'nvapi-' agent-output.txt 2>/dev/null; then
+            echo "KEY LEAKED"; exit 1
           fi
           echo "no key in output"
 
@@ -83,6 +64,4 @@ jobs:
         if: always()
         with:
           name: cloud-agent-output
-          path: |
-            agent-output.txt
-            proxy.log
+          path: agent-output.txt
