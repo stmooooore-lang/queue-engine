@@ -1,0 +1,43 @@
+name: plexus-s12-13
+
+# What cut the ropes: the code or the data. One series of candles, two engines.
+# No model, no key, no quota - so it can live here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_days:
+        description: 'MAX_DAYS'
+        required: false
+        default: '180'
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: two engines, one series
+        working-directory: plexus
+        env:
+          MAX_DAYS: ${{ inputs.max_days || '180' }}
+          PROGRESS_LOG: s12-13.progress.log
+        run: node scripts/measure-s12-13-engine-vs-data.mjs > s12-13.json 2> console.txt || true
+
+      - name: verdict
+        working-directory: plexus
+        run: grep -E "^median delta|^VERDICT" console.txt || tail -30 console.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s12-13
+          path: |
+            plexus/s12-13.json
+            plexus/s12-13.progress.log
+            plexus/console.txt
