@@ -1,77 +1,37 @@
 name: Task Executor
 
+# Runs one queued task from Turso and reports back to Telegram.
+#
+# The script lives in scripts/executor.mjs, not inline. It was inlined under
+# `run: node -e "` and YAML stopped parsing at the first colon inside the
+# JavaScript: three runs failed before a job was even created, which is why
+# those failures had no logs and no steps to look at.
+
 on:
   workflow_dispatch:
     inputs:
       taskId:
-        description: 'Task ID to execute'
+        description: 'Task id to execute'
         required: true
 
 jobs:
   execute:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+
+      - uses: actions/setup-node@v4
         with:
-          node-version: 20
-      - name: Install dependencies
-        run: npm install @libsql/client
-      - name: Fetch and execute task
+          node-version: '20'
+
+      - name: install the database client
+        run: npm install --no-save @libsql/client
+
+      - name: run the task
         env:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TASK_ID: ${{ inputs.taskId }}
-        run: node -e "
-          const { createClient } = require('@libsql/client');
-          const client = createClient({ url: process.env.TURSO_DATABASE_URL, authToken: process.env.TURSO_AUTH_TOKEN });
-          
-          async function run() {
-            const taskId = process.env.TASK_ID;
-            const startTime = Date.now();
-            
-            // Fetch task
-            const taskRes = await client.execute({ sql: 'SELECT * FROM tasks WHERE id = ? AND status = ?', args: [taskId, 'ожидает'] });
-            const task = taskRes.rows[0];
-            if (!task) { console.log('No pending task found'); return; }
-            
-            // Mark as running
-            await client.execute({ sql: 'UPDATE tasks SET status = ?, actions_run_id = ? WHERE id = ?', args: ['выполняется', process.env.GITHUB_RUN_ID, taskId] });
-            
-            // Execute work
-            const workStart = Date.now();
-            const result = await doWork(task.text);
-            const workEnd = Date.now();
-            
-            // Update task
-            const status = result.success ? 'готова' : 'провал';
-            const minutesUsed = Math.ceil((workEnd - workStart) / 60000);
-            const secondsToFirstWork = Math.floor((workStart - startTime) / 1000);
-            
-            await client.execute({ 
-              sql: 'UPDATE tasks SET status = ?, result = ?, actions_run_id = ?, seconds_to_first_work = ?, minutes_used = ? WHERE id = ?',
-              args: [status, result.message, process.env.GITHUB_RUN_ID, secondsToFirstWork, minutesUsed, taskId]
-            });
-            
-            // Notify via Telegram to creator
-            await notifyTelegram(task.creator_id, `Задача ${taskId} ${status}: ${result.message}`);
-          }
-          
-          async function doWork(text) {
-            // Execution not implemented yet
-            return { success: false, message: 'исполнение не реализовано' };
-          }
-          
-          async function notifyTelegram(chatId, message) {
-            const url = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-            await fetch(url, { 
-              method: 'POST', 
-              headers: { 'Content-Type': 'application/json' }, 
-              body: JSON.stringify({ chat_id: chatId, text: message })
-            });
-          }
-          
-          run().catch(console.error);
-        "
+        run: node scripts/executor.mjs
