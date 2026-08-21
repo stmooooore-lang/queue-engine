@@ -8,15 +8,30 @@
  *   node scripts/measure-corridor-validation.mjs
  */
 import fs from "node:fs";
-import {
+
+// ENGINE=0803 runs the whole measurement on the engine as it stood before
+// 3 August, the one the original corridor result was measured with. Both files
+// are swapped together and never mixed: trader.js imports contactEvents from
+// rope.js beside it, so swapping only one would produce a chimera whose numbers
+// belong to neither engine.
+//
+// MEASURED 2026-08-21: ENGINE=0803 CANNOT run this measurement, and that is
+// itself a finding. The pre-August trader emits trades as {from,to,dir,entry,
+// exit,pnl,fee} - no `net`, and no `corridorGroup` at all, because the
+// corridor classification did not exist yet. The script and the engine
+// co-evolved, so the August result was produced by a pairing that no longer
+// exists. The switch is kept for a future engine of the same shape, and it
+// fails loudly rather than quietly producing a chimera.
+const ENGINE_DIR = process.env.ENGINE === "0803" ? "../site/engine-0803" : "../site/engine";
+const {
   computeFabric,
   computeATR,
   detectRopes,
   resolvePeriods,
   barMsOf,
   DEFAULT_CFG,
-} from "../site/engine/rope.js";
-import { runInstrument, DEFAULT_TRADE } from "../site/engine/trader.js";
+} = await import(`${ENGINE_DIR}/rope.js`);
+const { runInstrument, DEFAULT_TRADE } = await import(`${ENGINE_DIR}/trader.js`);
 
 const MAX_DAYS = Number(process.env.MAX_DAYS || 180);
 const PROG = process.env.PROGRESS_LOG || "notes/2026-08-03-corridor-validation.progress.log";
@@ -282,6 +297,7 @@ const out = {
   funding: "omitted (cross-class parity)",
   scanAheadAtr: DEFAULT_TRADE.scanAheadAtr,
   maxDays: MAX_DAYS,
+  engine: process.env.ENGINE === "0803" ? "pre-2026-08-03 (9b0bf65)" : "current",
   minBothGroups: MIN_BOTH,
   oosSplit: "calendar midpoint of loaded series; trade assigned by open time; nothing fitted",
   failureCriteria:

@@ -61,10 +61,22 @@ async function fetchYahoo(symbol, interval, range) {
   const u =
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}` +
     `?interval=${interval}&range=${range}`;
-  const j = await (await fetch(u, {
-    cache: "no-store",
-    headers: { "User-Agent": "Mozilla/5.0 (compatible; PlexusResearch/1.0)" },
-  })).json();
+  // One retry. A single network blink silently drops a cell, and the verdict is
+  // counted in cells: on 2026-08-21 EURUSD/4h and GBPUSD/4h were lost to one
+  // "fetch failed" each, taking the adequate-cell count down with them.
+  let j;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      j = await (await fetch(u, {
+        cache: "no-store",
+        headers: { "User-Agent": "Mozilla/5.0 (compatible; PlexusResearch/1.0)" },
+      })).json();
+      break;
+    } catch (e) {
+      if (attempt >= 2) throw e;
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
   const r = j.chart?.result?.[0];
   if (!r?.timestamp?.length) {
     throw new Error(`yahoo empty ${symbol} ${interval} ${range}: ${JSON.stringify(j.chart?.error || j)}`);
