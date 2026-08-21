@@ -1,0 +1,43 @@
+name: plexus-s12-13-bisect
+
+# Which of the four commits between 3 and 10 August cut the ropes.
+# Seven engine versions over one array of candles per cell. No model, no key.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_days:
+        description: 'MAX_DAYS'
+        required: false
+        default: '180'
+
+jobs:
+  bisect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: walk the engine versions
+        working-directory: plexus
+        env:
+          MAX_DAYS: ${{ inputs.max_days || '180' }}
+          PROGRESS_LOG: s12-13-bisect.progress.log
+        run: node scripts/measure-s12-13-bisect.mjs > s12-13-bisect.json 2> console.txt || true
+
+      - name: verdict
+        working-directory: plexus
+        run: grep -aE "BIGGEST DROP|-> " s12-13-bisect.json console.txt || tail -30 console.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s12-13-bisect
+          path: |
+            plexus/s12-13-bisect.json
+            plexus/s12-13-bisect.progress.log
+            plexus/console.txt
