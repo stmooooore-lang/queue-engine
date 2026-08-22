@@ -45,9 +45,20 @@ jobs:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
-          pip install --quiet "litellm[proxy]"
+          # Pinned to the version that runs on the founder's Mac. The latest
+          # release fails to start at all: proxy_cli.py line 1018 does a bare
+          # `from proxy_server import (...)`, which resolves only when the
+          # proxy package directory is on sys.path, and on the runner it is
+          # not - ModuleNotFoundError, exit 1, run 32549839784. Pinning also
+          # makes the cloud proxy the same build as the local one, which is
+          # what "the same stack in the cloud" is supposed to mean.
+          pip install --quiet "litellm[proxy]==1.83.9"
           python3 -c "import yaml;d=yaml.safe_load(open('cloud-config.yaml'));print('lanes:',sorted({m[\"model_name\"] for m in d[\"model_list\"]}))"
           nohup litellm --config cloud-config.yaml --port 4000 --host 127.0.0.1 --num_workers 1 > proxy.log 2>&1 &
+          sleep 5
+          # If the CLI died on import, say so here rather than after 120s of
+          # polling a port nothing is listening on.
+          grep -q "ModuleNotFoundError" proxy.log && { echo "прокси не стартовал:"; tail -20 proxy.log; exit 1; }
           for i in $(seq 1 40); do
             curl -fsS -m 3 http://127.0.0.1:4000/health/liveliness >/dev/null 2>&1 && { echo "proxy up after $((i*3))s"; exit 0; }
             sleep 3

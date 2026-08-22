@@ -18,12 +18,8 @@ model_list:
     api_key: os.environ/GROQ_API_KEY
 - model_name: plexus-coder
   litellm_params:
-    model: openrouter/cohere/north-mini-code:free
-    rpm: 1
-    api_key: os.environ/OPENROUTER_API_KEY
-- model_name: plexus-coder
-  litellm_params:
     model: nvidia_nim/poolside/laguna-xs-2.1
+    rpm: 40
     api_key: os.environ/NVIDIA_API_KEY
 - model_name: plexus-coder
   litellm_params:
@@ -37,11 +33,6 @@ model_list:
     rpm: 50
     tpm: 50000
     api_key: os.environ/MISTRAL_API_KEY
-- model_name: plexus-cheap
-  litellm_params:
-    model: openrouter/google/gemma-4-26b-a4b-it:free
-    rpm: 1
-    api_key: os.environ/OPENROUTER_API_KEY
 - model_name: plexus-cheap
   litellm_params:
     model: groq/qwen/qwen3.6-27b
@@ -103,18 +94,6 @@ model_list:
     model: gemini/gemini-3.1-flash-lite
     reasoning_effort: low
     rpm: 15
-    api_key: os.environ/GEMINI_API_KEY
-- model_name: plexus-gemini
-  litellm_params:
-    model: gemini/gemini-flash-latest
-    reasoning_effort: low
-    rpm: 5
-    api_key: os.environ/GEMINI_API_KEY
-- model_name: plexus-gemini
-  litellm_params:
-    model: gemini/gemini-3.6-flash
-    reasoning_effort: low
-    rpm: 5
     api_key: os.environ/GEMINI_API_KEY
 - model_name: plexus-gemini
   litellm_params:
