@@ -34,14 +34,24 @@ export default {
     const chatId = chat?.id;
     const userId = from?.id;
 
+    console.log(
+      `env check: TELEGRAM_BOT_TOKEN len=${(TELEGRAM_BOT_TOKEN || '').length} ` +
+      `TURSO_DATABASE_URL len=${(TURSO_DATABASE_URL || '').length} ` +
+      `TURSO_AUTH_TOKEN len=${(TURSO_AUTH_TOKEN || '').length} ` +
+      `GITHUB_TOKEN len=${(GITHUB_TOKEN || '').length} ` +
+      `ALLOWED_USER_ID=${TELEGRAM_ALLOWED_USER_ID} incoming userId=${userId} chatId=${chatId}`,
+    );
+
     if (String(userId) !== String(TELEGRAM_ALLOWED_USER_ID)) {
-      return new Response('ok', { status: 200 }); // silently dropped, not a reply-worthy event
+      console.log('DROPPED: userId does not match TELEGRAM_ALLOWED_USER_ID');
+      return new Response('ok', { status: 200 });
     }
     if (typeof text !== 'string' || !chatId) return new Response('ok', { status: 200 });
 
     const db = turso(TURSO_DATABASE_URL, TURSO_AUTH_TOKEN);
 
     try {
+      console.log(`handling text=${JSON.stringify(text)}`);
       if (text.startsWith('/task ')) {
         const taskText = text.slice(6).trim();
         const taskId = await createTask(db, taskText, userId);
@@ -62,7 +72,10 @@ export default {
         }
       }
     } catch (err) {
-      await sendMessage(TELEGRAM_BOT_TOKEN, chatId, `Ошибка: ${err.message}`).catch(() => {});
+      console.error(`HANDLER ERROR: ${err.message}`, err.stack);
+      await sendMessage(TELEGRAM_BOT_TOKEN, chatId, `Ошибка: ${err.message}`).catch((e2) => {
+        console.error(`ALSO FAILED to notify the user: ${e2.message}`);
+      });
     }
 
     return new Response('ok', { status: 200 });
@@ -77,7 +90,9 @@ async function sendMessage(botToken, chatId, text) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chat_id: chatId, text }),
   });
-  if (!res.ok) throw new Error(`telegram sendMessage ${res.status}: ${await res.text()}`);
+  const body = await res.text();
+  console.log(`sendMessage -> ${res.status}: ${body.slice(0, 200)}`);
+  if (!res.ok) throw new Error(`telegram sendMessage ${res.status}: ${body}`);
 }
 
 // --- Turso, over its documented HTTP API ---
