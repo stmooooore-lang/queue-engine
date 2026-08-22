@@ -1,17 +1,8 @@
 {
-  "name": "worker",
+  "name": "plexus-queue-worker",
   "version": "1.0.0",
-  "description": "",
+  "description": "Telegram bridge for the queue: no dependencies, every call is a plain fetch()",
   "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
-  "dependencies": {
-    "@libsql/client": "^0.17.4",
-    "@octokit/core": "^7.0.7"
-  }
+  "type": "module",
+  "license": "ISC"
 }
