@@ -46,6 +46,13 @@ async function run() {
   await notifyTelegram(task.creator_id, `Задача ${taskId} ${status}: ${result.message}`);
 }
 
+// The agent works INSIDE plexus/ and nowhere else. Founder's decision
+// 2026-08-22: a task arriving from a messenger turns text into work, and the
+// only limit that is easy to state and easy to check is where it is allowed to
+// touch. Everything the product needs lives under plexus/; nothing outside it
+// is a task the phone should be starting.
+const WORKDIR = "plexus";
+
 async function doWork(text) {
   // Execution not implemented yet
   return { success: false, message: 'исполнение не реализовано' };

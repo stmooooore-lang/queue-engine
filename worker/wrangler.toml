@@ -2,9 +2,18 @@ name = "plexus-queue-worker"
 main = "index.js"
 compatibility_date = "2026-08-20"
 
-[vars]
-TURSO_DATABASE_URL = "@turso-database-url"
-TURSO_AUTH_TOKEN = "@turso-auth-token"
-TELEGRAM_BOT_TOKEN = "@telegram-bot-token"
-TELEGRAM_ALLOWED_USER_ID = "@telegram-allowed-user-id"
-GITHUB_TOKEN = "@github-token"
+# NO [vars] BLOCK, deliberately.
+#
+# Everything this worker needs is a secret and is set with
+# `npx wrangler secret put <NAME>`, which asks for the value and never prints
+# it. A [vars] entry of the same name is a PLAINTEXT variable and it overrides
+# the secret on deploy - the placeholders that used to sit here ("@turso-
+# database-url" and friends) would have silently replaced five real secrets
+# with five literal strings the first time this was published.
+#
+# Secrets this worker expects, all set by a human:
+#   TURSO_DATABASE_URL        libsql://... from `turso db show`
+#   TURSO_AUTH_TOKEN          from `turso db tokens create`
+#   TELEGRAM_BOT_TOKEN        from @BotFather
+#   TELEGRAM_ALLOWED_USER_ID  your numeric id from @userinfobot
+#   GITHUB_TOKEN              fine-grained, queue-engine only, Actions: write

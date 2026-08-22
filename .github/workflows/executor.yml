@@ -35,3 +35,18 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TASK_ID: ${{ inputs.taskId }}
         run: node scripts/executor.mjs
+
+      - name: nothing outside plexus/ may have changed
+        if: always()
+        run: |
+          # The executor is confined to plexus/. This checks the confinement
+          # rather than trusting it: a task arriving from a messenger should
+          # never be able to touch the workflow that runs it, the worker, or
+          # anything else in this repository.
+          changed=$(git status --porcelain | awk '{print $2}' | grep -v '^plexus/' || true)
+          if [ -n "$changed" ]; then
+            echo "ГРАНИЦА НАРУШЕНА — тронуто вне plexus/:"
+            echo "$changed"
+            exit 1
+          fi
+          echo "граница цела: изменения только внутри plexus/"
