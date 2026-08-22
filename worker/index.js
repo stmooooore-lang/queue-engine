@@ -34,12 +34,20 @@ export default {
     const chatId = chat?.id;
     const userId = from?.id;
 
+    // Log LENGTHS only, never a raw env value - including TELEGRAM_ALLOWED_USER_ID,
+    // which is meant to be a small non-secret number but must not be trusted to
+    // stay that way. It was set to a bot-token-shaped string by mistake on
+    // 2026-08-22 and logging it in full put a live token in plaintext into
+    // wrangler tail output, which then landed in chat when pasted for
+    // debugging. incoming userId is safe: it is Telegram's own account id for
+    // whoever is messaging right now, not a secret.
     console.log(
       `env check: TELEGRAM_BOT_TOKEN len=${(TELEGRAM_BOT_TOKEN || '').length} ` +
       `TURSO_DATABASE_URL len=${(TURSO_DATABASE_URL || '').length} ` +
       `TURSO_AUTH_TOKEN len=${(TURSO_AUTH_TOKEN || '').length} ` +
       `GITHUB_TOKEN len=${(GITHUB_TOKEN || '').length} ` +
-      `ALLOWED_USER_ID=${TELEGRAM_ALLOWED_USER_ID} incoming userId=${userId} chatId=${chatId}`,
+      `ALLOWED_USER_ID len=${(TELEGRAM_ALLOWED_USER_ID || '').length} ` +
+      `incoming userId=${userId} chatId=${chatId}`,
     );
 
     if (String(userId) !== String(TELEGRAM_ALLOWED_USER_ID)) {
