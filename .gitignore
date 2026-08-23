@@ -1,2 +1,5 @@
 node_modules/
 proxy.log
+agent-output.txt
+render-service/server.log
+.cline/

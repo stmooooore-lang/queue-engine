@@ -127,7 +127,7 @@ jobs:
           if [ -n "$(git status --porcelain)" ]; then
             git config user.name "plexus-cloud-agent"
             git config user.email "noreply@queue-engine"
-            git add -A
+            git add render-service/ scripts/ worker/ plexus/ *.md *.yaml *.yml 2>/dev/null || true
             git commit -q -m "cloud-agent: uncommitted changes from this run (task not committed by the agent itself)"
           fi
           ahead=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)
