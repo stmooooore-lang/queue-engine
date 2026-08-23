@@ -18,7 +18,10 @@ on:
 jobs:
   run-agent:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 30 was too tight for a task that provisions infrastructure over SSH
+    # (VM create + scp + remote docker build), not just editing files -
+    # it killed the GCP e2-micro deploy run mid-build on 2026-08-23.
+    timeout-minutes: 50
     # Needed to push the commit step below makes. Missing until 2026-08-23:
     # the agent wrote and locally committed a working render-service/ (proven
     # by its own local test - GET /test returned {"answer":"привет"}), and the
