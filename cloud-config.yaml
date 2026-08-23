@@ -1,116 +1,145 @@
+
 model_list:
-- model_name: plexus-judge
-  litellm_params:
-    model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
-    rpm: 40
-    api_key: os.environ/NVIDIA_API_KEY
-- model_name: plexus-architect
-  litellm_params:
-    model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
-    rpm: 40
-    api_key: os.environ/NVIDIA_API_KEY
-- model_name: plexus-coder
-  litellm_params:
-    model: groq/openai/gpt-oss-120b
-    rpm: 30
-    tpm: 8000
-    max_tokens: 8000
-    api_key: os.environ/GROQ_API_KEY
-- model_name: plexus-coder
-  litellm_params:
-    model: nvidia_nim/poolside/laguna-xs-2.1
-    rpm: 40
-    api_key: os.environ/NVIDIA_API_KEY
-- model_name: plexus-coder
-  litellm_params:
-    model: mistral/devstral-2512
-    rpm: 50
-    tpm: 50000
-    api_key: os.environ/MISTRAL_API_KEY
-- model_name: plexus-coder
-  litellm_params:
-    model: mistral/mistral-medium-2508
-    rpm: 50
-    tpm: 50000
-    api_key: os.environ/MISTRAL_API_KEY
-- model_name: plexus-cheap
-  litellm_params:
-    model: groq/qwen/qwen3.6-27b
-    rpm: 30
-    tpm: 8000
-    max_tokens: 8000
-    api_key: os.environ/GROQ_API_KEY
-- model_name: plexus-cheap
-  litellm_params:
-    model: groq/openai/gpt-oss-20b
-    rpm: 30
-    tpm: 8000
-    max_tokens: 8000
-    api_key: os.environ/GROQ_API_KEY
-- model_name: plexus-gemini
-  litellm_params:
-    model: gemini/gemini-3.7-flash
-    reasoning_effort: low
-    rpm: 5
-    api_key: os.environ/GEMINI_API_KEY
-- model_name: plexus-gemini
-  litellm_params:
-    model: gemini/gemini-3-flash-preview
-    reasoning_effort: low
-    rpm: 5
-    api_key: os.environ/GEMINI_API_KEY
-- model_name: plexus-gemini
-  litellm_params:
-    model: gemini/gemini-3.1-flash-lite-preview
-    reasoning_effort: low
-    rpm: 5
-    api_key: os.environ/GEMINI_API_KEY
-- model_name: plexus-gemini
-  litellm_params:
-    model: gemini/gemini-flash-lite-latest
-    reasoning_effort: low
-    rpm: 5
-    api_key: os.environ/GEMINI_API_KEY
-- model_name: plexus-gemini
-  litellm_params:
-    model: gemini/gemini-3.6-flash
-    reasoning_effort: low
-    rpm: 5
-    api_key: os.environ/GEMINI_API_KEY
-- model_name: plexus-gemini
-  litellm_params:
-    model: gemini/gemini-3.5-flash
-    reasoning_effort: low
-    rpm: 5
-    api_key: os.environ/GEMINI_API_KEY
-- model_name: plexus-gemini
-  litellm_params:
-    model: gemini/gemini-3.5-flash-lite
-    reasoning_effort: low
-    rpm: 5
-    api_key: os.environ/GEMINI_API_KEY
-- model_name: plexus-gemini
-  litellm_params:
-    model: gemini/gemini-3.1-flash-lite
-    reasoning_effort: low
-    rpm: 15
-    api_key: os.environ/GEMINI_API_KEY
-- model_name: plexus-gemini
-  litellm_params:
-    model: gemini/gemini-flash-latest
-    reasoning_effort: low
-    rpm: 5
-    api_key: os.environ/GEMINI_API_KEY
-- model_name: plexus-plan
-  litellm_params:
-    model: mistral/mistral-small-latest
-    rpm: 50
-    api_key: os.environ/MISTRAL_API_KEY
-- model_name: plexus-act
-  litellm_params:
-    model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
-    rpm: 40
-    api_key: os.environ/NVIDIA_API_KEY
+
+  - model_name: plexus-judge
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
+      rpm: 40
+      api_key: os.environ/NVIDIA_API_KEY
+  - model_name: plexus-architect
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
+      rpm: 40
+      api_key: os.environ/NVIDIA_API_KEY
+
+  - model_name: plexus-coder
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      rpm: 30
+      tpm: 8000
+      max_tokens: 8000
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: plexus-reserve
+    litellm_params:
+      model: openrouter/cohere/north-mini-code:free
+      rpm: 1
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: plexus-coder
+    litellm_params:
+      model: nvidia_nim/poolside/laguna-xs-2.1
+      rpm: 40
+      api_key: os.environ/NVIDIA_API_KEY
+  - model_name: plexus-coder
+    litellm_params:
+      model: mistral/devstral-2512
+      rpm: 50
+      tpm: 50000
+      api_key: os.environ/MISTRAL_API_KEY
+  - model_name: plexus-coder
+    litellm_params:
+      model: mistral/mistral-medium-2508
+      rpm: 50
+      tpm: 50000
+      api_key: os.environ/MISTRAL_API_KEY
+
+
+  - model_name: plexus-reserve
+    litellm_params:
+      model: openrouter/google/gemma-4-26b-a4b-it:free
+      rpm: 1
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: plexus-cheap
+    litellm_params:
+      model: groq/qwen/qwen3.6-27b
+      rpm: 30
+      tpm: 8000
+      max_tokens: 8000
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: plexus-cheap
+    litellm_params:
+      model: groq/openai/gpt-oss-20b
+      rpm: 30
+      tpm: 8000
+      max_tokens: 8000
+      api_key: os.environ/GROQ_API_KEY
+
+
+  - model_name: plexus-pro
+    litellm_params:
+      model: vertex_ai/gemini-2.5-pro
+      rpm: 10
+      vertex_project: os.environ/VERTEX_PROJECT
+      vertex_location: "us-central1"
+      vertex_credentials: os.environ/VERTEX_CREDENTIALS_JSON
+
+  - model_name: plexus-gemini
+    litellm_params:
+      model: gemini/gemini-3.7-flash
+      reasoning_effort: "low"
+      rpm: 5
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: plexus-gemini
+    litellm_params:
+      model: gemini/gemini-3-flash-preview
+      reasoning_effort: "low"
+      rpm: 5
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: plexus-gemini
+    litellm_params:
+      model: gemini/gemini-3.1-flash-lite-preview
+      reasoning_effort: "low"
+      rpm: 5
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: plexus-gemini
+    litellm_params:
+      model: gemini/gemini-flash-lite-latest
+      reasoning_effort: "low"
+      rpm: 5
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: plexus-gemini
+    litellm_params:
+      model: gemini/gemini-3.6-flash
+      reasoning_effort: "low"
+      rpm: 5
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: plexus-gemini
+    litellm_params:
+      model: gemini/gemini-3.5-flash
+      reasoning_effort: "low"
+      rpm: 5
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: plexus-gemini
+    litellm_params:
+      model: gemini/gemini-3.5-flash-lite
+      reasoning_effort: "low"
+      rpm: 5
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: plexus-gemini
+    litellm_params:
+      model: gemini/gemini-3.1-flash-lite
+      reasoning_effort: "low"
+      rpm: 15
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: plexus-gemini
+    litellm_params:
+      model: gemini/gemini-flash-latest
+      reasoning_effort: "low"
+      rpm: 5
+      api_key: os.environ/GEMINI_API_KEY
+
+
+
+  - model_name: plexus-plan
+    litellm_params:
+      model: "mistral/mistral-small-latest"
+      rpm: 50
+      api_key: os.environ/MISTRAL_API_KEY
+  - model_name: plexus-act
+    litellm_params:
+      model: "nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b"
+      rpm: 40
+      api_key: os.environ/NVIDIA_API_KEY
+
 router_settings:
   routing_strategy: usage-based-routing-v2
   num_retries: 3
@@ -118,14 +147,14 @@ router_settings:
   allowed_fails: 2
   cooldown_time: 60
   fallbacks:
-  - plexus-architect:
-    - plexus-gemini
-    - plexus-cheap
-  - plexus-judge:
-    - plexus-architect
-  - plexus-act:
-    - plexus-coder
-    - plexus-cheap
-  - plexus-plan:
-    - plexus-architect
+    - plexus-architect: ["plexus-gemini", "plexus-cheap"]
+    - plexus-judge: ["plexus-architect"]
+    - plexus-act:  ["plexus-coder", "plexus-cheap"]
+    - plexus-plan: ["plexus-architect"]
 
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+
+  callbacks: plexus_hooks.proxy_handler_instance
