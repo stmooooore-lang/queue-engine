@@ -102,6 +102,8 @@ jobs:
         env:
           PROMPT: ${{ inputs.prompt }}
           HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         run: |
           set -o pipefail
           cline --cwd "$GITHUB_WORKSPACE" -P openai-compatible \
@@ -119,6 +121,7 @@ jobs:
         run: |
           grep -q 'nvapi-' agent-output.txt 2>/dev/null && { echo "KEY LEAKED"; exit 1; }
           grep -q 'hf_[A-Za-z0-9]' agent-output.txt 2>/dev/null && { echo "KEY LEAKED"; exit 1; }
+          grep -q 'BEGIN PRIVATE KEY\|"private_key"\|"private_key_id"' agent-output.txt 2>/dev/null && { echo "KEY LEAKED"; exit 1; }
           echo "no key in output"
 
       - name: push whatever the agent committed
