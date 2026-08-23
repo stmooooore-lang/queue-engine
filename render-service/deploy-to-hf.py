@@ -127,9 +127,10 @@ def main():
     print("Deploying render-service to Hugging Face Spaces")
     print("=" * 60)
     
-    # Check token
+    # Check token - length only, never the value or a prefix (queue-engine
+    # rule after the Telegram token leak: log what a secret is, not what it is)
     print(f"HUGGINGFACE_TOKEN present: {bool(HF_TOKEN)}")
-    print(f"Token prefix: {HF_TOKEN[:10]}...")
+    print(f"HUGGINGFACE_TOKEN length: {len(HF_TOKEN) if HF_TOKEN else 0}")
     
     # Create space
     repo_url = create_space()
@@ -144,7 +145,7 @@ def main():
 ## Status: FAILED — Docker Spaces require PRO subscription
 
 ### Error Details
-The HUGGINGFACE_TOKEN is present in the environment (`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`), but the token owner (`satandroid`) does **not** have a PRO subscription.
+The HUGGINGFACE_TOKEN is present in the environment (37 chars, `hf_` prefix), but the token owner (`satandroid`) does **not** have a PRO subscription.
 
 **Evidence:**
 ```bash

@@ -3,7 +3,7 @@
 ## Status: FAILED — Docker Spaces require PRO subscription
 
 ### Error Details
-The HUGGINGFACE_TOKEN is present in the environment (`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`), but the token owner (`satandroid`) does **not** have a PRO subscription.
+The HUGGINGFACE_TOKEN is present in the environment (37 chars, `hf_` prefix), but the token owner (`satandroid`) does **not** have a PRO subscription.
 
 **Evidence:**
 ```bash
