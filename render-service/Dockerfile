@@ -1,7 +1,9 @@
-# Render's own docs recommend Docker whenever a service needs two language
-# runtimes at once (render.com/docs/native-runtimes): this needs pip for
-# LiteLLM and npm for Cline, and a native Render runtime only ever gives you
-# one.
+# HF Spaces Docker configuration
+# - Runs as user 1000 (HF Spaces requirement)
+# - Exposes port 7860 (HF Spaces requirement)
+# - Health check on /health endpoint
+# - LiteLLM pinned to 1.83.9 (newer versions fail to start)
+
 FROM node:20-bookworm
 
 # python3/pip installed explicitly rather than assumed present in the base
@@ -18,11 +20,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
 # refuses outright.
 RUN pip3 install --break-system-packages --no-cache-dir "litellm[proxy]==1.83.9"
 
-WORKDIR /app
-COPY package.json package-lock.json ./
+# Create user 1000 as required by HF Spaces
+RUN useradd -m -u 1000 user
+USER user
+ENV HOME=/home/user \
+    PATH=/home/user/.local/bin:$PATH
+
+WORKDIR $HOME/app
+
+# Copy package files first for better caching
+COPY --chown=user package.json package-lock.json ./
 RUN npm install && npm i -g cline
 
-COPY server.js cloud-config.yaml plexus_hooks.py ./
+# Copy application files
+COPY --chown=user server.js cloud-config.yaml plexus_hooks.py ./
 
-EXPOSE 10000
+# HF Spaces requires port 7860
+EXPOSE 7860
+
+# Health check for HF Spaces
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:7860/health || exit 1
+
 CMD ["node", "server.js"]

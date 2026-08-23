@@ -4,7 +4,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const PORT = process.env.PORT || 3000;
+// HF Spaces requires port 7860
+const PORT = 7860;
 const LITELLM_PORT = 4000;
 const LITELLM_HOST = '127.0.0.1';
 const LITELLM_HEALTH_URL = `http://${LITELLM_HOST}:${LITELLM_PORT}/health/liveliness`;
