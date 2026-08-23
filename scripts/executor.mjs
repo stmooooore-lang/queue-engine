@@ -12,6 +12,10 @@
  */
 
 import { createClient } from "@libsql/client";
+import { execFile as execFileCb } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFile = promisify(execFileCb);
 
 const client = createClient({ url: process.env.TURSO_DATABASE_URL, authToken: process.env.TURSO_AUTH_TOKEN });
 
@@ -53,9 +57,40 @@ async function run() {
 // is a task the phone should be starting.
 const WORKDIR = "plexus";
 
+// Telegram caps a message at 4096 characters; keep well under it.
+const MAX_OUTPUT = 3500;
+
+function truncate(s) {
+  return s.length > MAX_OUTPUT ? `${s.slice(0, MAX_OUTPUT)}\n… (обрезано)` : s;
+}
+
+// eslint-disable-next-line no-control-regex
+const ANSI = /\x1b\[[0-9;]*m/g;
+
+/**
+ * The task text becomes one Cline turn against plexus/ - not a shell command.
+ * A task typed into the phone is meant to work like a task typed into
+ * cloud-agent.yml directly: same lane (plexus-act), same proxy, same
+ * confinement to plexus/ by --cwd, enforced again from outside by the
+ * workflow's post-run git-status check. The workflow step before this one
+ * ("proxy with the real lanes") must already be up; this function assumes it
+ * is and only shells out to `cline`.
+ */
 async function doWork(text) {
-  // Execution not implemented yet
-  return { success: false, message: 'исполнение не реализовано' };
+  try {
+    const { stdout, stderr } = await execFile(
+      "cline",
+      ["--cwd", WORKDIR, "-P", "openai-compatible", "-m", "plexus-act", "--compaction", "off", "--retries", "3", text],
+      { timeout: 25 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 },
+    );
+    const out = [stdout, stderr].filter(Boolean).join("\n").replace(ANSI, "").trim();
+    return { success: true, message: truncate(out || "(агент ничего не вывел)") };
+  } catch (err) {
+    const out = [err.stdout, err.stderr].filter(Boolean).join("\n").replace(ANSI, "").trim();
+    const first = String(err.message || err).split("\n")[0];
+    const code = err.code ?? err.signal ?? "?";
+    return { success: false, message: truncate(`код ${code}: ${first}${out ? `\n${out}` : ""}`) };
+  }
 }
 
 async function notifyTelegram(chatId, message) {

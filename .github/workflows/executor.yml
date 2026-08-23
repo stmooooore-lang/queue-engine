@@ -1,11 +1,12 @@
 name: Task Executor
 
-# Runs one queued task from Turso and reports back to Telegram.
+# Runs one queued task from Turso as a Cline agent turn, and reports back to
+# Telegram.
 #
-# The script lives in scripts/executor.mjs, not inline. It was inlined under
-# `run: node -e "` and YAML stopped parsing at the first colon inside the
-# JavaScript: three runs failed before a job was even created, which is why
-# those failures had no logs and no steps to look at.
+# The proxy+cline setup mirrors cloud-agent.yml exactly - same litellm pin,
+# same providers.json shape - so a task from the phone gets the same lane map
+# as a task typed directly into cloud-agent. scripts/executor.mjs owns the
+# Turso/Telegram plumbing; it shells out to `cline` once the proxy is up.
 
 on:
   workflow_dispatch:
@@ -27,6 +28,52 @@ jobs:
 
       - name: install the database client
         run: npm install --no-save @libsql/client
+
+      - name: install cline
+        run: npm i -g cline --silent
+
+      # Same pin, same reason as cloud-agent.yml: the unpinned litellm CLI
+      # fails to import proxy_server on this runner (run 32549839784).
+      - name: proxy with the real lanes
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          pip install --quiet "litellm[proxy]==1.83.9"
+          python3 -c "import yaml;d=yaml.safe_load(open('cloud-config.yaml'));print('lanes:',sorted({m[\"model_name\"] for m in d[\"model_list\"]}))"
+          nohup litellm --config cloud-config.yaml --port 4000 --host 127.0.0.1 --num_workers 1 > proxy.log 2>&1 &
+          sleep 5
+          grep -q "ModuleNotFoundError" proxy.log && { echo "прокси не стартовал:"; tail -20 proxy.log; exit 1; }
+          for i in $(seq 1 40); do
+            curl -fsS -m 3 http://127.0.0.1:4000/health/liveliness >/dev/null 2>&1 && { echo "proxy up after $((i*3))s"; exit 0; }
+            sleep 3
+          done
+          echo "proxy did not come up"; tail -20 proxy.log; exit 1
+
+      - name: provider config, exact shape of a working one
+        run: |
+          mkdir -p ~/.cline/data/settings
+          python3 - <<'PY'
+          import json, os, datetime
+          cfg = {
+            "version": 1,
+            "lastUsedProvider": "openai-compatible",
+            "providers": {"openai-compatible": {
+                "settings": {
+                    "provider": "openai-compatible",
+                    "apiKey": "not-used-by-the-local-proxy",
+                    "model": "plexus-act",
+                    "baseUrl": "http://127.0.0.1:4000/v1",
+                    "headers": {}},
+                "updatedAt": datetime.datetime.utcnow().isoformat() + "Z",
+                "tokenSource": "migration"}}}
+          p = os.path.expanduser("~/.cline/data/settings/providers.json")
+          open(p, "w").write(json.dumps(cfg))
+          os.chmod(p, 0o600)
+          PY
 
       - name: run the task
         env:
