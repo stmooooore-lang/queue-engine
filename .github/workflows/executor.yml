@@ -44,14 +44,14 @@ jobs:
         run: |
           pip install --quiet "litellm[proxy]==1.83.9"
           python3 -c "import yaml;d=yaml.safe_load(open('cloud-config.yaml'));print('lanes:',sorted({m[\"model_name\"] for m in d[\"model_list\"]}))"
-          nohup litellm --config cloud-config.yaml --port 4000 --host 127.0.0.1 --num_workers 1 > proxy.log 2>&1 &
+          nohup litellm --config cloud-config.yaml --port 4000 --host 127.0.0.1 --num_workers 1 > /tmp/proxy.log 2>&1 &
           sleep 5
-          grep -q "ModuleNotFoundError" proxy.log && { echo "прокси не стартовал:"; tail -20 proxy.log; exit 1; }
+          grep -q "ModuleNotFoundError" /tmp/proxy.log && { echo "прокси не стартовал:"; tail -20 /tmp/proxy.log; exit 1; }
           for i in $(seq 1 40); do
             curl -fsS -m 3 http://127.0.0.1:4000/health/liveliness >/dev/null 2>&1 && { echo "proxy up after $((i*3))s"; exit 0; }
             sleep 3
           done
-          echo "proxy did not come up"; tail -20 proxy.log; exit 1
+          echo "proxy did not come up"; tail -20 /tmp/proxy.log; exit 1
 
       - name: provider config, exact shape of a working one
         run: |

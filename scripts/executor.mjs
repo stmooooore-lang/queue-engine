@@ -76,20 +76,49 @@ const ANSI = /\x1b\[[0-9;]*m/g;
  * ("proxy with the real lanes") must already be up; this function assumes it
  * is and only shells out to `cline`.
  */
+// --json turns cline's output into one JSON object per line - hook_event,
+// agent_event (reasoning tokens, tool calls, text tokens as they stream) and,
+// last, a single run_result line carrying the assembled final answer in its
+// own `text` field. That line, and nothing else, is what belongs in a
+// Telegram message: measured on 2026-08-23, a plain-text run sent the whole
+// transcript - [thinking], tool calls, everything - which is unreadable in a
+// chat.
+function extractFinalAnswer(jsonLines) {
+  let last = null;
+  for (const line of jsonLines.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      const d = JSON.parse(t);
+      if (d.type === "run_result") last = d;
+    } catch {
+      // a non-JSON line (a warning printed to stdout, e.g. the Node/CA one
+      // seen on 2026-08-23) - not the channel we read from, skip it
+    }
+  }
+  return last;
+}
+
 async function doWork(text) {
   try {
-    const { stdout, stderr } = await execFile(
+    const { stdout } = await execFile(
       "cline",
-      ["--cwd", WORKDIR, "-P", "openai-compatible", "-m", "plexus-act", "--compaction", "off", "--retries", "3", text],
+      ["--cwd", WORKDIR, "-P", "openai-compatible", "-m", "plexus-act", "--compaction", "off", "--retries", "3", "--json", text],
       { timeout: 25 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 },
     );
-    const out = [stdout, stderr].filter(Boolean).join("\n").replace(ANSI, "").trim();
-    return { success: true, message: truncate(out || "(агент ничего не вывел)") };
+    const result = extractFinalAnswer(stdout);
+    if (!result) {
+      return { success: false, message: truncate(`агент не вернул run_result\n${stdout.replace(ANSI, "").slice(-1500)}`) };
+    }
+    const ok = result.finishReason === "completed";
+    const body = (result.text || "(агент ничего не ответил)").trim();
+    return { success: ok, message: truncate(ok ? body : `${result.finishReason}: ${body}`) };
   } catch (err) {
-    const out = [err.stdout, err.stderr].filter(Boolean).join("\n").replace(ANSI, "").trim();
+    const result = extractFinalAnswer(err.stdout || "");
+    if (result) return { success: false, message: truncate(`${result.finishReason}: ${(result.text || "").trim()}`) };
     const first = String(err.message || err).split("\n")[0];
     const code = err.code ?? err.signal ?? "?";
-    return { success: false, message: truncate(`код ${code}: ${first}${out ? `\n${out}` : ""}`) };
+    return { success: false, message: truncate(`код ${code}: ${first}`) };
   }
 }
 
