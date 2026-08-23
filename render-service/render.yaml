@@ -2,8 +2,7 @@ services:
   - type: web
     name: render-service
     rootDir: render-service
-    env: node
-    buildCommand: pip install "litellm[proxy]==1.83.9" && npm install && npm i -g cline
+    env: docker
     startCommand: node server.js
     envVars:
       - key: NVIDIA_API_KEY
@@ -13,5 +12,4 @@ services:
       - key: GROQ_API_KEY
         sync: false
       - key: MISTRAL_API_KEY
-        sync: false
         sync: false
