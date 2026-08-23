@@ -3,3 +3,5 @@ proxy.log
 agent-output.txt
 render-service/server.log
 .cline/
+__pycache__/
+*.pyc
