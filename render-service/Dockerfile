@@ -22,8 +22,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm install && npm i -g cline
 
-COPY server.js ./
-COPY cloud-config.yaml plexus_hooks.py /
+COPY server.js cloud-config.yaml plexus_hooks.py ./
 
 EXPOSE 10000
 CMD ["node", "server.js"]

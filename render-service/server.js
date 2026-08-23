@@ -9,7 +9,7 @@ const LITELLM_PORT = 4000;
 const LITELLM_HOST = '127.0.0.1';
 const LITELLM_HEALTH_URL = `http://${LITELLM_HOST}:${LITELLM_PORT}/health/liveliness`;
 const LITELLM_BASE_URL = `http://${LITELLM_HOST}:${LITELLM_PORT}/v1`;
-const CONFIG_PATH = path.join(__dirname, '..', 'cloud-config.yaml');
+const CONFIG_PATH = path.join(__dirname, 'cloud-config.yaml');
 
 let litellmProcess = null;
 
