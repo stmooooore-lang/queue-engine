@@ -1,66 +1,44 @@
 # HF Spaces Deployment Result
 
-## Status: FAILED — HUGGINGFACE_TOKEN not available in runner environment
+## Status: FAILED — Docker Spaces require PRO subscription
 
 ### Error Details
-The `HUGGINGFACE_TOKEN` environment variable is **not present** in the GitHub Actions runner environment. Neither `HUGGINGFACE_TOKEN` nor `HF_TOKEN` are set.
-
-```
-Available environment variables (filtered for tokens):
-- No HUGGINGFACE_TOKEN found
-- No HF_TOKEN found
-```
+The HUGGINGFACE_TOKEN is present in the environment (`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`), but the token owner (`satandroid`) does **not** have a PRO subscription.
 
 **Evidence:**
 ```bash
-$ python3 -c "import os; print('HUGGINGFACE_TOKEN:', os.environ.get('HUGGINGFACE_TOKEN')); print('HF_TOKEN:', os.environ.get('HF_TOKEN'))"
-HUGGINGFACE_TOKEN: None
-HF_TOKEN: None
+$ python3 -c "from huggingface_hub import HfApi; import os; api=HfApi(token=os.environ['HUGGINGFACE_TOKEN']); print(api.whoami()['isPro'])"
+False
 ```
-
-The user indicated this token was added as a GitHub repository secret at `https://github.com/stmooooore-lang/queue-engine/settings/secrets/actions`, but **it is not being passed to the runner environment** because the workflow file (`.github/workflows/cloud-agent.yml`) does not reference it in its `env:` section. GitHub Actions secrets must be explicitly mapped to environment variables in the workflow YAML to be available at runtime.
 
 ### Root Cause
-The workflow YAML at `.github/workflows/cloud-agent.yml` passes other secrets (NVIDIA_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, etc.) but does **not** include:
-```yaml
-HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
+Hugging Face Free tier does **not** support Docker Spaces (or Gradio Spaces on CPU). Only Static Spaces are free. Docker Spaces require a PRO subscription ($9/month) or higher.
+
+Error from HF API:
 ```
-in the `env:` block for the relevant job step.
+402 Payment Required: Static Spaces are free for everyone, but hosting Gradio and Docker Spaces on free cpu-basic requires a PRO subscription. Subscribe at https://huggingface.co/pro
+```
 
 ### Files Prepared (Ready for Deployment)
 All files have been adapted for HF Spaces Docker SDK and are ready in `render-service/`:
-
-- **README.md** — Updated with HF Spaces Docker SDK frontmatter:
-  ```yaml
-  ---
-  sdk: docker
-  app_port: 7860
-  ---
-  ```
-
-- **Dockerfile** — Adapted for HF Spaces conventions:
-  - Runs as user 1000 (`RUN useradd -m -u 1000 user; USER user`)
-  - Exposes port 7860 (`EXPOSE 7860`)
-  - Includes health check (`HEALTHCHECK CMD curl -f http://localhost:7860/health`)
-  - Uses `--chown=user` on COPY commands
-  - LiteLLM pinned to 1.83.9
-
-- **server.js** — Changed PORT from `process.env.PORT || 3000` to hardcoded `7860`
-
-- **cloud-config.yaml** — Unchanged (LiteLLM proxy config with model routing)
-
-- **plexus_hooks.py** — Unchanged (LiteLLM proxy callback hooks)
-
-- **package.json** + **package-lock.json** — Unchanged
+- README.md — Updated with HF Spaces Docker SDK frontmatter
+- Dockerfile — Adapted for HF Spaces conventions (user 1000, port 7860, health check, LiteLLM 1.83.9)
+- server.js — Port hardcoded to 7860
+- cloud-config.yaml — LiteLLM proxy config
+- plexus_hooks.py — LiteLLM proxy callbacks
+- package.json + package-lock.json
 
 ### Required Fix
-Add `HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}` to the `env:` section of the `run-agent` job (or a new dedicated deploy step) in `.github/workflows/cloud-agent.yml`, then re-run the workflow.
+Either:
+1. Upgrade token owner (`satandroid`) to PRO subscription at https://huggingface.co/pro
+2. Use a different token from a PRO account/organization
+3. Deploy to a different platform (Render, Railway, Fly.io, etc.) that supports Docker on free tier
 
-### Acceptance Criteria (Not Tested — Blocked by Missing Token)
+### Acceptance Criteria (Not Tested — Blocked by PRO Requirement)
 - ❌ Space builds successfully
 - ❌ GET / returns "ok"
 - ❌ GET /test returns JSON with "answer" field containing "привет" (or equivalent)
 - ❌ Process stays alive without OOM kills (16 GB RAM on free Docker tier)
 
 ### Deploy Script Location
-`render-service/deploy-to-hf.py` — run with `python3 deploy-to-hf.py` once token is available in the environment.
+`render-service/deploy-to-hf.py` — run with `python3 deploy-to-hf.py` once token has PRO access.
