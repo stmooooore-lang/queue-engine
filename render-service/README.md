@@ -23,7 +23,7 @@ If not using the Blueprint, create a **Web Service** with:
 | **Root Directory** | `render-service` |
 | **Build Command** | `pip install "litellm[proxy]==1.83.9" && npm install && npm i -g cline` |
 | **Start Command** | `node server.js` |
-| **Environment Variables** (keys only, no values) | `NVIDIA_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `MISTRAL_API_KEY`, `OPENROUTER_API_KEY` |
+| **Environment Variables** (keys only, no values) | `NVIDIA_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `MISTRAL_API_KEY` |
 
 These are the same keys used in `cloud-config.yaml` at the repo root.
 

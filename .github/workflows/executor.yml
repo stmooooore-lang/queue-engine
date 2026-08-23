@@ -40,7 +40,6 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           pip install --quiet "litellm[proxy]==1.83.9"
           python3 -c "import yaml;d=yaml.safe_load(open('cloud-config.yaml'));print('lanes:',sorted({m[\"model_name\"] for m in d[\"model_list\"]}))"
