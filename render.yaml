@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: render-service
+    rootDir: render-service
+    env: docker
+    startCommand: node server.js
+    envVars:
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: MISTRAL_API_KEY
+        sync: false
