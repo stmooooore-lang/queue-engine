@@ -19,6 +19,13 @@ jobs:
   run-agent:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Needed to push the commit step below makes. Missing until 2026-08-23:
+    # the agent wrote and locally committed a working render-service/ (proven
+    # by its own local test - GET /test returned {"answer":"привет"}), and the
+    # commit died with the runner because nothing pushed it. checkout@v4's
+    # default token can push once the job is allowed to ask for write access.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -109,6 +116,27 @@ jobs:
         run: |
           grep -q 'nvapi-' agent-output.txt 2>/dev/null && { echo "KEY LEAKED"; exit 1; }
           echo "no key in output"
+
+      - name: push whatever the agent committed
+        if: always()
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          # The agent may have already run its own `git commit` (it was asked
+          # to). Catch anything still uncommitted too, so a turn that did the
+          # work but skipped the commit step doesn't lose it the same way.
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "plexus-cloud-agent"
+            git config user.email "noreply@queue-engine"
+            git add -A
+            git commit -q -m "cloud-agent: uncommitted changes from this run (task not committed by the agent itself)"
+          fi
+          ahead=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)
+          if [ "$ahead" = "0" ]; then
+            echo "nothing to push"
+          else
+            git push origin HEAD:main
+            echo "pushed $ahead commit(s)"
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()
