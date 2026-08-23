@@ -101,6 +101,7 @@ jobs:
         shell: bash
         env:
           PROMPT: ${{ inputs.prompt }}
+          HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
         run: |
           set -o pipefail
           cline --cwd "$GITHUB_WORKSPACE" -P openai-compatible \
@@ -117,6 +118,7 @@ jobs:
         if: always()
         run: |
           grep -q 'nvapi-' agent-output.txt 2>/dev/null && { echo "KEY LEAKED"; exit 1; }
+          grep -q 'hf_[A-Za-z0-9]' agent-output.txt 2>/dev/null && { echo "KEY LEAKED"; exit 1; }
           echo "no key in output"
 
       - name: push whatever the agent committed
