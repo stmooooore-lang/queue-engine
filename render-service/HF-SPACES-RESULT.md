@@ -1,9 +1,9 @@
 # HF Spaces Deployment Result
 
-## Status: FAILED — HUGGINGFACE_TOKEN not available
+## Status: FAILED — HUGGINGFACE_TOKEN not available in runner environment
 
 ### Error Details
-The `HUGGINGFACE_TOKEN` environment variable is **not present** in the GitHub Actions runner environment.
+The `HUGGINGFACE_TOKEN` environment variable is **not present** in the GitHub Actions runner environment. Neither `HUGGINGFACE_TOKEN` nor `HF_TOKEN` are set.
 
 ```
 Available environment variables (filtered for tokens):
@@ -11,7 +11,21 @@ Available environment variables (filtered for tokens):
 - No HF_TOKEN found
 ```
 
-The user indicated this token should be passed via GitHub repository secret `HUGGINGFACE_TOKEN` and made available through `os.environ.get('HUGGINGFACE_TOKEN')`, but it is not set in the current workflow run.
+**Evidence:**
+```bash
+$ python3 -c "import os; print('HUGGINGFACE_TOKEN:', os.environ.get('HUGGINGFACE_TOKEN')); print('HF_TOKEN:', os.environ.get('HF_TOKEN'))"
+HUGGINGFACE_TOKEN: None
+HF_TOKEN: None
+```
+
+The user indicated this token was added as a GitHub repository secret at `https://github.com/stmooooore-lang/queue-engine/settings/secrets/actions`, but **it is not being passed to the runner environment** because the workflow file (`.github/workflows/cloud-agent.yml`) does not reference it in its `env:` section. GitHub Actions secrets must be explicitly mapped to environment variables in the workflow YAML to be available at runtime.
+
+### Root Cause
+The workflow YAML at `.github/workflows/cloud-agent.yml` passes other secrets (NVIDIA_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, etc.) but does **not** include:
+```yaml
+HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
+```
+in the `env:` block for the relevant job step.
 
 ### Files Prepared (Ready for Deployment)
 All files have been adapted for HF Spaces Docker SDK and are ready in `render-service/`:
@@ -39,21 +53,14 @@ All files have been adapted for HF Spaces Docker SDK and are ready in `render-se
 
 - **package.json** + **package-lock.json** — Unchanged
 
-### Next Steps Required
-1. **Add HUGGINGFACE_TOKEN to GitHub repository secrets** at:
-   `https://github.com/stmooooore-lang/queue-engine/settings/secrets/actions`
+### Required Fix
+Add `HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}` to the `env:` section of the `run-agent` job (or a new dedicated deploy step) in `.github/workflows/cloud-agent.yml`, then re-run the workflow.
 
-2. **Re-run the workflow** — the deployment script (`deploy-to-hf.py`) is ready and will:
-   - Create Space via API (`repo_type="space", space_sdk="docker"`)
-   - Push all files using `upload_folder()`
-   - Write result with Space URL on success
-
-### Acceptance Criteria (Not Yet Tested)
-Since deployment couldn't proceed:
+### Acceptance Criteria (Not Tested — Blocked by Missing Token)
 - ❌ Space builds successfully
 - ❌ GET / returns "ok"
 - ❌ GET /test returns JSON with "answer" field containing "привет" (or equivalent)
 - ❌ Process stays alive without OOM kills (16 GB RAM on free Docker tier)
 
 ### Deploy Script Location
-`render-service/deploy-to-hf.py` — run with `python3 deploy-to-hf.py` once token is available.
+`render-service/deploy-to-hf.py` — run with `python3 deploy-to-hf.py` once token is available in the environment.
