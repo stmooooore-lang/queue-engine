@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: render-service
+    rootDir: render-service
+    env: node
+    buildCommand: pip install "litellm[proxy]==1.83.9" && npm install && npm i -g cline
+    startCommand: node server.js
+    envVars:
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: MISTRAL_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
