@@ -4,8 +4,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-// HF Spaces requires port 7860
-const PORT = 7860;
+// GCP e2-micro uses standard port 3000
+const PORT = 3000;
 const LITELLM_PORT = 4000;
 const LITELLM_HOST = '127.0.0.1';
 const LITELLM_HEALTH_URL = `http://${LITELLM_HOST}:${LITELLM_PORT}/health/liveliness`;
