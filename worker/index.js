@@ -69,15 +69,15 @@ export default {
         const tasks = await getLastFiveTasks(db);
         await sendMessage(TELEGRAM_BOT_TOKEN, chatId, formatTasks(tasks));
       } else if (text === '/start') {
-        await sendMessage(TELEGRAM_BOT_TOKEN, chatId, 'Готов. /task <текст> — поставить задачу. /status — последние пять.');
+        await sendMessage(TELEGRAM_BOT_TOKEN, chatId, 'Готов. /task <текст> — поставить задачу. /status — последние пять. Любой обычный текст также создаёт задачу.');
+      } else if (text.startsWith('/')) {
+        // Unknown command - ignore silently but log
+        console.log(`Unknown command: ${text}`);
       } else {
-        const currentTask = await getCurrentTask(db, userId);
-        if (currentTask) {
-          await addDialogMessage(db, currentTask.id, text);
-          await sendMessage(TELEGRAM_BOT_TOKEN, chatId, 'Добавлено в диалог задачи.');
-        } else {
-          await sendMessage(TELEGRAM_BOT_TOKEN, chatId, 'Нет активной задачи. /task <текст>, чтобы создать.');
-        }
+        // Plain text message - create a task for conversational continuity
+        const taskId = await createTask(db, text, userId);
+        await triggerWorkflow(taskId, GITHUB_TOKEN);
+        await sendMessage(TELEGRAM_BOT_TOKEN, chatId, `Задача создана с ID ${taskId}`);
       }
     } catch (err) {
       console.error(`HANDLER ERROR: ${err.message}`, err.stack);

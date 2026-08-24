@@ -105,24 +105,13 @@ async function notifyTelegram(botToken, chatId, message) {
   return body;
 }
 
-async function doWork(text, litellmMasterKey) {
+async function doWork(text, litellmMasterKey, creatorId) {
   // Run Cline inside the prebuilt plexus-render:latest Docker image.
   // The image already has Cline, Node, and the providers.json pointing to
-  // Render LiteLLM with Authorization: Bearer <LITELLM_MASTER_KEY>.
-  //
-  // We mount the host's ~/.cline directory so Cline can read providers.json
-  // and write its data. The WORKDIR is /home/runner/plexus inside the container.
-  //
-  // The cline command matches executor.yml exactly:
-  // cline --cwd plexus -P openai-compatible -m plexus-act --compaction off --retries 3 --json "<text>"
-  
-  // Matches the already-proven working invocation exactly (SPLIT-RESULT.md,
-  // run 32681500202's "Final Verification" section) - --cwd plexus and the
-  // missing --config/--data-dir flags were the previous, broken guess: there
-  // is no /home/runner/plexus on this VM (that's an executor.yml/GitHub-
-  // Actions-runner checkout convention, not a poller-container one), and
-  // without --config/--data-dir cline's wrapper failed to spawn its own
-  // binary (run 32714988975, ENOENT on .cline/bin/.cline).
+  // Render LiteLLM. Cline's own session state lives under ~/.cline/data/
+  // which is a persistent Docker volume on plexus-queue-vm.
+  // Use creator_id as session ID for conversational continuity.
+  const sessionId = `telegram-${creatorId}`;
   const dockerArgs = [
     "run", "--rm",
     "-v", "/home/runner/.cline:/home/runner/.cline",
@@ -138,6 +127,7 @@ async function doWork(text, litellmMasterKey) {
     "--compaction", "off",
     "--retries", "3",
     "--json",
+    "--id", sessionId,
     text
   ];
 
@@ -192,7 +182,7 @@ async function processTask(db, task, botToken, litellmMasterKey) {
 
   // Execute work
   const workStart = Date.now();
-  const result = await doWork(task.text, litellmMasterKey);
+  const result = await doWork(task.text, litellmMasterKey, task.creator_id);
   const workEnd = Date.now();
 
   // Update task - reuse exact same query as executor.mjs
