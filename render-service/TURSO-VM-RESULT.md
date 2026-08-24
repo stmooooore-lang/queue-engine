@@ -1,7 +1,8 @@
 # Telegram Bot Task Queue — VM Poller Integration Result
 
 **Date:** 2026-08-24  
-**Commit:** 4ff077b (pushed)
+**Commit:** 4ff077b (pushed)  
+**Latest verification run:** 2026-08-24 15:19 UTC (this document updated with live test result)
 
 ---
 
@@ -9,9 +10,24 @@
 
 Built a complete long-running poller system for the GCP e2-micro VM (`plexus-queue-vm`, us-central1-a) that replaces GitHub Actions (`executor.yml`) as the executor for real Telegram bot tasks. The poller runs as a systemd service, polls Turso for pending tasks, executes them via Cline in the prebuilt `plexus-render:latest` Docker image (pointing at the Render LiteLLM split), and writes results back to Turso/Telegram — reusing the exact same schema, queries, and logic as `executor.yml` and `scripts/executor.mjs`.
 
-**VERIFIED: The poller systemd service is running and picks up tasks from Turso.** Task 17 was inserted with status `ожидает` and prompt "прочитай canon/START-HERE.md и скажи, какая дата стоит в разделе ## Last updated", picked up by the poller within 10 seconds, executed via Cline in `plexus-render:latest`, and status flipped to `готова`.
+**VERIFIED: The poller systemd service is running and picks up tasks from Turso.** Task 18 was inserted with status `ожидает` and prompt "прочитай canon/START-HERE.md и скажи, какая дата стоит в разделе ## Last updated", picked up by the poller within ~10 seconds (status changed to `провал` at 15:19:xx UTC), confirming the poller is actively polling Turso.
 
-**CRITICAL FINDING: `plexus-doc` is NOT cloned/mounted on the VM at `/home/runner/plexus-doc` (or anywhere else on the filesystem).** The Cline session running inside `plexus-render:latest` on the VM attempted to read `/canon/START-HERE.md` but the file does not exist on the VM. The result returned was "not found in the repo" — confirming Cline cannot read the real `plexus-doc` content because it is not present on the VM.
+**CRITICAL FINDING: `plexus-doc` is NOT cloned/mounted on the VM at `/home/runner/plexus-doc` (or anywhere else on the filesystem).** The Cline session running inside `plexus-render:latest` on the VM cannot read `/home/runner/plexus-doc/canon/START-HERE.md` because the file does not exist on the VM. The task execution failed with a docker command error (`код 1: Command failed: docker run ...`), not because of missing content — the container failed to start properly. Previous runs returned "not found in the repo" confirming Cline cannot read the real `plexus-doc` content because it is not present on the VM.
+
+**Expected date from `canon/START-HERE.md` `## Last updated` section: 2026-08-24** (verified in `plexus-doc/canon/START-HERE.md` line 7 in this repository).
+
+---
+
+## Latest Test Run — 2026-08-24 15:19 UTC
+
+| Step | Result | Evidence |
+|------|--------|----------|
+| 1. Insert task via `scripts/test-insert.mjs` | ✅ SUCCESS | Task 18 created with status `ожидает`, prompt "прочитай canon/START-HERE.md и скажи, какая дата стоит в разделе ## Last updated" |
+| 2. Poller picks up task | ✅ SUCCESS | Status changed to `провал` within ~10 seconds (actions_run_id: `poller-1-1787584811694`) |
+| 3. Cline executes in `plexus-render:latest` | ❌ FAILED | Docker command failed: `код 1: Command failed: docker run --rm -v /home/runner/.cline:/home/runner/.cline -w /home/runner plexus-render:latest cline --config /home/runner/.cline --data-dir /home/runner/.cline/data --cwd . -P openai-compatible -m plexus-act --compaction off --retries 3 --json "..."` |
+| 4. Task status updated in Turso | ✅ YES | Status `провал`, result contains docker error |
+| 5. **Cline reads real `plexus-doc` content** | ❌ **NO** | `plexus-doc` not mounted in container; file not on VM |
+| 6. **Date from `## Last updated` found** | ❌ **NO** | File doesn't exist on VM; expected date: **2026-08-24** |
 
 ---
 
@@ -179,12 +195,14 @@ find / -name "START-HERE.md" 2>/dev/null
 | SSH access | ✅ YES | gcloud compute ssh works |
 | Systemd poller service running | ✅ YES | `systemctl status poller` shows active (running) |
 | Poller polls Turso | ✅ YES | Journal shows "Turso connection OK" and tasks picked up |
+| **Task 18 (latest test) picked up** | ✅ YES | Status changed to `провал` within ~10s (actions_run_id: `poller-1-1787584811694`) |
 | Task 17 picked up | ✅ YES | Journal: "Processing task 17" at 13:53:26 UTC |
-| Cline executed in `plexus-render:latest` | ✅ YES | Session 1787579618392_j8kov completed |
-| Task status updated to `готова` | ✅ YES | Turso query confirms |
+| Cline executed in `plexus-render:latest` | ❌ FAILED (Task 18) | Docker command failed: `код 1: Command failed: docker run ...` |
+| Cline executed in `plexus-render:latest` | ✅ YES (Task 17) | Session 1787579618392_j8kov completed |
+| Task status updated in Turso | ✅ YES | Task 18: `провал`, Task 17: `готова` |
 | **`plexus-doc` mounted on VM** | ❌ **NO** | `find / -name "START-HERE.md"` returns nothing |
-| **Cline reads real `plexus-doc` content** | ❌ **NO** | Result: "not found in the repo" |
-| **Date from `## Last updated` found** | ❌ **NO** | File doesn't exist on VM |
+| **Cline reads real `plexus-doc` content** | ❌ **NO** | Task 18: container failed to start; Task 17: "not found in the repo" |
+| **Date from `## Last updated` found** | ❌ **NO** | File doesn't exist on VM; expected: **2026-08-24** |
 
 ---
 
@@ -199,6 +217,7 @@ find / -name "START-HERE.md" 2>/dev/null
 | **VM deploy automation** | 📋 Future | Could use `cloud-agent.yml` with GCP_SA_KEY to auto-provision VM + deploy poller, but not required for MVP |
 | **Health endpoint** | 📋 Optional | Could add HTTP health check (e.g., `/health` on port 8080) for GCP load balancer / monitoring |
 | **`plexus-doc` on VM** | ❌ MISSING | **BLOCKER:** The VM must have `plexus-doc` cloned at `/home/runner/plexus-doc` (or the Docker container must mount it) for Cline to read real content. Current poller mount config only mounts `/home/runner/.cline`. |
+| **Docker command in poller** | ❌ BROKEN | The `docker run` command in `poller.mjs` (line 119) fails with exit code 1. The command runs Cline inside `plexus-render:latest` but the container fails to start. Need to verify the exact working command from `SPLIT-RESULT.md` matches what's in the poller. |
 
 ---
 
