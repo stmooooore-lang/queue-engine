@@ -105,13 +105,41 @@ async function notifyTelegram(botToken, chatId, message) {
   return body;
 }
 
-async function doWork(text, litellmMasterKey, creatorId) {
+async function fetchHistory(db, creatorId, currentTaskId, limit = 6) {
+  // Fetch last N completed/failed tasks for this creator_id, excluding current task
+  const res = await db.execute({
+    sql: `SELECT text, result FROM tasks 
+          WHERE creator_id = ? AND status IN (?, ?) AND id != ? 
+          ORDER BY created_at DESC LIMIT ?`,
+    args: [creatorId, "готова", "провал", currentTaskId, limit]
+  });
+  return res.rows;
+}
+
+function buildPromptWithHistory(currentText, historyRows) {
+  if (historyRows.length === 0) {
+    return currentText;
+  }
+  // Reverse to chronological order (oldest first)
+  const chronological = historyRows.reverse();
+  let prompt = "Предыдущий разговор с этим пользователем (для контекста, не для ответа на старые сообщения):\n";
+  for (const row of chronological) {
+    const userText = row.text.slice(0, 500);
+    const assistantText = (row.result || "").slice(0, 500);
+    prompt += `Пользователь: ${userText}\nАссистент: ${assistantText}\n`;
+  }
+  prompt += `\nНовое сообщение пользователя:\n${currentText}`;
+  return prompt;
+}
+
+async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId) {
+  // Fetch history from Turso and build combined prompt
+  const historyRows = await fetchHistory(db, creatorId, currentTaskId, 6);
+  const combinedPrompt = buildPromptWithHistory(text, historyRows);
+
   // Run Cline inside the prebuilt plexus-render:latest Docker image.
   // The image already has Cline, Node, and the providers.json pointing to
-  // Render LiteLLM. Cline's own session state lives under ~/.cline/data/
-  // which is a persistent Docker volume on plexus-queue-vm.
-  // Use creator_id as session ID for conversational continuity.
-  const sessionId = `telegram-${creatorId}`;
+  // Render LiteLLM. No --id flag - we pass history manually in the prompt.
   const dockerArgs = [
     "run", "--rm",
     "-v", "/home/runner/.cline:/home/runner/.cline",
@@ -127,8 +155,7 @@ async function doWork(text, litellmMasterKey, creatorId) {
     "--compaction", "off",
     "--retries", "3",
     "--json",
-    "--id", sessionId,
-    text
+    combinedPrompt
   ];
 
   console.log(`[${new Date().toISOString()}] Docker command: docker ${dockerArgs.join(" ")}`);
@@ -182,7 +209,7 @@ async function processTask(db, task, botToken, litellmMasterKey) {
 
   // Execute work
   const workStart = Date.now();
-  const result = await doWork(task.text, litellmMasterKey, task.creator_id);
+  const result = await doWork(db, task.text, litellmMasterKey, task.creator_id, taskId);
   const workEnd = Date.now();
 
   // Update task - reuse exact same query as executor.mjs
