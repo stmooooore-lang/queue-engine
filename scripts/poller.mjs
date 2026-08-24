@@ -141,6 +141,8 @@ async function doWork(text, litellmMasterKey) {
     text
   ];
 
+  console.log(`[${new Date().toISOString()}] Docker command: docker ${dockerArgs.join(" ")}`);
+
   try {
     const { stdout } = await execFile("docker", dockerArgs, {
       timeout: CLINE_TIMEOUT_MS,

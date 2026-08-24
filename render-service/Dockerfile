@@ -20,8 +20,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
 # refuses outright.
 RUN pip3 install --break-system-packages --no-cache-dir "litellm[proxy]==1.83.9"
 
-# Create user 1000 as required by HF Spaces
-RUN useradd -m -u 1000 user
+# Install cline globally BEFORE switching to non-root user
+RUN npm install -g cline
+
+# Create user 1000 as required by HF Spaces - use 1001 since 1000 is taken
+RUN useradd -m -u 1001 user
 USER user
 ENV HOME=/home/user \
     PATH=/home/user/.local/bin:$PATH
@@ -30,7 +33,7 @@ WORKDIR $HOME/app
 
 # Copy package files first for better caching
 COPY --chown=user package.json package-lock.json ./
-RUN npm install && npm i -g cline
+RUN npm install
 
 # Copy application files
 COPY --chown=user server.js cloud-config.yaml plexus_hooks.py ./
