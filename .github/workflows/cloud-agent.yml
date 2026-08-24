@@ -87,6 +87,32 @@ jobs:
           done
           echo "proxy did not come up"; tail -20 proxy.log; exit 1
 
+      - name: give the VM its own plexus-doc git credential
+        # Plain bash, no LLM in this step - deliberately. REPO_TOKEN leaked
+        # into the agent's own output three times on 2026-08-24 (an `env`
+        # dump each time, despite explicit prompt instructions not to).
+        # Instructing the model harder didn't fix it; removing the model
+        # from this specific mechanical step does. Cline no longer receives
+        # REPO_TOKEN at all (see the env block below) - by the time it runs,
+        # the VM already has durable git access to plexus-doc via a
+        # credential helper, set up here deterministically.
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GCP_SA_KEY" > /tmp/gcp-key.json
+          gcloud auth activate-service-account --key-file=/tmp/gcp-key.json --project="$GCP_PROJECT_ID"
+          # Token travels over SSH stdin only - never in a --command string,
+          # never echoed, never landing in this job's own log.
+          printf 'https://x-access-token:%s@github.com\n' "$REPO_TOKEN" | \
+            gcloud compute ssh runner@plexus-queue-vm --zone=us-central1-a --project="$GCP_PROJECT_ID" \
+            --command='git config --global credential.helper store && cat > ~/.git-credentials && chmod 600 ~/.git-credentials && echo CREDENTIAL_WRITTEN'
+          gcloud compute ssh runner@plexus-queue-vm --zone=us-central1-a --project="$GCP_PROJECT_ID" \
+            --command='if [ -d /home/runner/plexus-doc/.git ]; then cd /home/runner/plexus-doc && git pull origin main; else git clone https://github.com/stmooooore-lang/plexus-doc.git /home/runner/plexus-doc; fi'
+          echo "plexus-doc is live on the VM with a durable credential"
+
       - name: provider config, exact shape of a working one
         run: |
           mkdir -p ~/.cline/data/settings
@@ -121,7 +147,6 @@ jobs:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
         run: |
           set -o pipefail
           cline --cwd "$GITHUB_WORKSPACE" -P openai-compatible \
