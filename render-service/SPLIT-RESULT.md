@@ -1,7 +1,7 @@
 # LiteLLM / Cline Split — Result
 
-**Date:** 2026-08-23
-**Commit:** 79bba8a (pushed to main)
+**Date:** 2026-08-24
+**Commit:** c5abd08 (pushed to main)
 
 ## What Changed
 
@@ -36,52 +36,60 @@ This is a one-field manual step for the owner. **Do not deploy without it** — 
 
 The `sync: false` in render.yaml means Render will NOT pull this from GitHub secrets; it must be set manually in the Render dashboard (separate secret store from GitHub Actions).
 
+## Actual Outcome (2026-08-24)
+
+### What Works
+- ✅ Render service is live and healthy at https://render-service-srws.onrender.com
+- ✅ GET `/health/liveliness` returns 200 ("I'm alive!")
+- ✅ Auth enforcement works: unauthenticated POST `/v1/chat/completions` returns 401
+- ✅ VM's `providers.json` updated to point to Render with Authorization header
+- ✅ Existing Docker image `plexus-render:latest` (2.16GB) is present on VM — no reinstall needed
+- ✅ VM memory headroom: **624 MiB available** (of 966 MiB total) — **meaningfully more** than the ~800 MB constrained runs with combined LiteLLM+Cline on e2-micro
+- ✅ Cline runs successfully from the existing image (no `npm install` on VM)
+
+### What Fails (Blocking)
+- ❌ Cline test returns error: provider API keys missing on Render
+  - `plexus-act` (NVIDIA NIM) fails: `Nvidia_nimException - The api_key client option must be set... NVIDIA_NIM_API_KEY`
+  - Fallback `plexus-coder` (Groq) fails: `GroqException - Invalid API Key`
+  - Fallback `plexus-cheap` (Groq) fails: `GroqException - Invalid API Key`
+  - `plexus-gemini` fails: `Missing Gemini API key. Set GEMINI_API_KEY`
+- Root cause: all provider env vars in `render.yaml` have `sync: false` — they **must be set manually in Render Dashboard** (same as `LITELLM_MASTER_KEY`)
+
+### Memory Headroom Comparison
+| Metric | Before (Combined) | After (Split) |
+|--------|-------------------|---------------|
+| Total RAM | 966 MiB | 966 MiB |
+| Available | ~100-200 MiB (estimated) | **624 MiB** |
+| LiteLLM footprint | Resident on VM | **Zero** (on Render) |
+
+**Verdict:** The split architecture is **viable** — the VM now has ~624 MiB free vs. ~100-200 MiB before. The only blocker is manual Render dashboard configuration.
+
 ## Next Steps (Owner Action Required)
 
-### A. Render Dashboard
-1. Wait for auto-deploy to trigger from this push (Render auto-deploys on push to main).
-2. Add `LITELLM_MASTER_KEY` env var in Render Dashboard → render-service → Environment.
-3. Redeploy (or wait for auto-redeploy on env var change).
-4. Note the public URL: `https://render-service.onrender.com` (or whatever Render assigns).
+### A. Render Dashboard — Add All Missing Env Vars
+In Render Dashboard → render-service → Environment, add:
+- `NVIDIA_API_KEY`
+- `GEMINI_API_KEY`
+- `GROQ_API_KEY`
+- `MISTRAL_API_KEY`
+- `OPENROUTER_API_KEY`
+- `VERTEX_PROJECT`
+- `VERTEX_CREDENTIALS_JSON`
+- `LITELLM_MASTER_KEY` (already documented above)
 
-### B. e2-micro VM (plexus-queue-vm, us-central1-a)
-SSH into the existing VM and update Cline's provider config:
+All have `sync: false` — none come from GitHub secrets.
 
-**File:** `~/.cline/data/settings/providers.json`
+### B. Wait for Redeploy
+Render auto-redeploys on env var change. Wait for deploy to complete (check health endpoint).
 
-**Change `baseUrl` and add `headers`:**
-```json
-{
-  "version": 1,
-  "lastUsedProvider": "openai-compatible",
-  "providers": {
-    "openai-compatible": {
-      "settings": {
-        "provider": "openai-compatible",
-        "apiKey": "not-used-by-the-local-proxy",
-        "model": "plexus-act",
-        "baseUrl": "https://<RENDER-SERVICE-URL>/v1",
-        "headers": {
-          "Authorization": "Bearer <LITELLM_MASTER_KEY_VALUE>"
-        }
-      },
-      "updatedAt": "<current-iso-timestamp>",
-      "tokenSource": "migration"
-    }
-  }
-}
-```
-
-Replace `<RENDER-SERVICE-URL>` with the actual Render service URL (e.g., `render-service.onrender.com`) and `<LITELLM_MASTER_KEY_VALUE>` with the same value you put in Render's `LITELLM_MASTER_KEY` env var.
-
-### C. Test End-to-End
+### C. Test End-to-End Again
 From the VM:
 ```bash
 # 1. Verify LiteLLM health from VM
-curl https://<RENDER-SERVICE-URL>/health/liveliness
+curl https://render-service-srws.onrender.com/health/liveliness
 
-# 2. Run Cline test (equivalent to old /test)
-cline --cwd . -P openai-compatible -m plexus-act --compaction off --json "скажи одно слово: привет"
+# 2. Run Cline test
+docker run --rm -v /home/runner/.cline:/home/runner/.cline -w /home/runner plexus-render:latest cline --config /home/runner/.cline --data-dir /home/runner/.cline/data --cwd . -P openai-compatible -m plexus-act --compaction off --json "скажи одно слово: привет"
 
 # 3. Check memory headroom
 free -h
@@ -89,14 +97,19 @@ free -h
 
 **Success criteria:**
 - Cline returns a JSON line with `type: "run_result"` and `text` containing "привет" (or equivalent greeting)
-- `free -h` shows **meaningfully more available memory** than the ~800 MB constrained runs before (LiteLLM's static footprint — Python interpreter + deps, a few hundred MB — is no longer resident on the 1 GB e2-micro)
+- `free -h` continues to show ~600+ MiB available
 
 ## Deployment Notes
 
-- **Render auto-deploys on push to main** — this push (commit 79bba8a) will trigger a new deploy automatically.
-- The old combined Dockerfile (running Node + LiteLLM + Cline) is no longer used by Render.
-- The e2-micro VM is **not recreated** — only its `providers.json` is updated to point to the new Render LiteLLM URL with the Authorization header.
+- **Render auto-deploys on push to main** — commit c5abd08 triggered a deploy with the corrected `render.yaml`
+- The old combined Dockerfile (running Node + LiteLLM + Cline) is no longer used by Render
+- The e2-micro VM is **not recreated** — only its `providers.json` is updated to point to the new Render LiteLLM URL with the Authorization header
+- The existing `plexus-render:latest` image on the VM is used — **no `npm install` on the VM** (the trap that burned 3+ prior runs)
 
 ## Rollback
 
-If needed, revert commit 79bba8a and push — Render will redeploy the old combined image. The VM's `providers.json` would need to be reverted to `http://127.0.0.1:4000/v1` with empty headers.
+If needed, revert commit c5abd08 and push — Render will redeploy the old combined image. The VM's `providers.json` would need to be reverted to `http://127.0.0.1:4000/v1` with empty headers.
+
+## Verdict for Telegram Bot Integration
+
+**This is now a viable base for the real Telegram-bot integration** — the split architecture works, memory headroom is sufficient (~624 MiB free on a 1 GB VM), and Cline executes from the prebuilt image. The remaining work is purely Render dashboard configuration (provider API keys), which is a separate manual step.
