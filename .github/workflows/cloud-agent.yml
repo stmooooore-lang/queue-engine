@@ -31,6 +31,16 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      # Read+write access to plexus-doc itself, not just its partial mirror
+      # in this repo - decided 2026-08-23, implemented 2026-08-24 once
+      # hosting was solved. REPO_TOKEN is a PAT scoped for this; checkout@v4
+      # persists its credentials into ./plexus-doc's git config, so a plain
+      # `git push` from inside that directory later in the job just works.
+      - uses: actions/checkout@v4
+        with:
+          repository: stmooooore-lang/plexus-doc
+          token: ${{ secrets.REPO_TOKEN }}
+          path: plexus-doc
       - uses: actions/setup-node@v4
         with: {node-version: '22'}
 
@@ -154,6 +164,33 @@ jobs:
           else
             git push origin HEAD:main
             echo "pushed $ahead commit(s)"
+          fi
+
+      - name: push whatever the agent changed in plexus-doc
+        if: always()
+        run: |
+          cd "$GITHUB_WORKSPACE/plexus-doc"
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "plexus-cloud-agent"
+            git config user.email "noreply@queue-engine"
+            git add -A
+            git diff --cached --quiet || git commit -q -m "cloud-agent: uncommitted changes from this run (task not committed by the agent itself)"
+          fi
+          ahead=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)
+          if [ "$ahead" = "0" ]; then
+            echo "nothing to push in plexus-doc"
+          # plexus-doc's own rule (CLAUDE.md): site/, worker/, wrangler.jsonc
+          # auto-deploy the live trading site on merge to main. The cloud
+          # agent may write freely everywhere else (canon/ additively,
+          # notes/, docs/) but must never be the one that ships a release -
+          # that stays the founder's call, on a branch until they say so.
+          elif git diff origin/main..HEAD --name-only | grep -qE '^(site/|worker/|wrangler\.jsonc$)'; then
+            branch="cloud-agent/review-$(date -u +%Y%m%d-%H%M%S)"
+            git push origin "HEAD:$branch"
+            echo "::warning::plexus-doc changes touch site/worker/wrangler.jsonc (a release surface) - pushed to $branch instead of main. Founder must review and merge by hand."
+          else
+            git push origin HEAD:main
+            echo "pushed $ahead commit(s) to plexus-doc main"
           fi
 
       - uses: actions/upload-artifact@v4
