@@ -7,7 +7,14 @@ Requires=docker.service
 Type=simple
 User=runner
 WorkingDirectory=/home/runner
-ExecStart=/usr/bin/node /home/runner/scripts/poller.mjs
+ExecStart=/usr/bin/docker run --rm \
+  -v /home/runner/scripts/poller.mjs:/home/runner/scripts/poller.mjs:ro \
+  -v /run/secrets:/run/secrets:ro \
+  -v /home/runner/.cline:/home/runner/.cline \
+  -w /home/runner/scripts \
+  --memory=800m --cpus=0.8 \
+  plexus-render:latest \
+  sh -c "npm install @libsql/client@0.14.0 --omit=dev 2>&1 | tail -5 && node /home/runner/scripts/poller.mjs"
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -15,10 +22,6 @@ StandardError=journal
 
 # Environment file with secrets (never printed in logs)
 EnvironmentFile=/run/secrets/poller.env
-
-# Resource limits for e2-micro
-MemoryLimit=800M
-CPUQuota=80%
 
 # Security hardening
 NoNewPrivileges=true

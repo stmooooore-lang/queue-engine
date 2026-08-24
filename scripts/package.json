@@ -1,0 +1,8 @@
+{
+  "name": "poller-scripts",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@libsql/client": "^0.14.0"
+  }
+}
