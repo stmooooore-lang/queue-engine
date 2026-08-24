@@ -109,10 +109,28 @@ jobs:
           # (run 32750131088: "Connection reset by peer" after 5+ minutes of
           # waiting, first SSH call in the job). Retry a few times with a
           # short pause rather than failing the whole step on one race.
+          ssh_ok=0
           for i in 1 2 3 4 5; do
-            gcloud compute ssh runner@plexus-queue-vm --zone=us-central1-a --project="$GCP_PROJECT_ID" --command='true' && break
+            gcloud compute ssh runner@plexus-queue-vm --zone=us-central1-a --project="$GCP_PROJECT_ID" --command='true' && { ssh_ok=1; break; }
             echo "SSH not ready yet (attempt $i/5), waiting 20s..."; sleep 20
           done
+          # 5 retries (run 32750966164) still hit "Connection reset by peer"
+          # for 26 minutes straight, ending in a hard timeout - that's not a
+          # key-propagation race anymore, the VM itself was unresponsive
+          # (likely from the day's repeated manual docker/systemctl work on
+          # it). Self-heal once: hard reset and give it real boot time,
+          # rather than failing the whole job and needing a second dispatch
+          # just to do this.
+          if [ "$ssh_ok" = "0" ]; then
+            echo "SSH still not responding after 5 tries - resetting the VM and waiting for it to come back"
+            gcloud compute instances reset plexus-queue-vm --zone=us-central1-a --project="$GCP_PROJECT_ID"
+            sleep 90
+            for i in 1 2 3 4 5 6; do
+              gcloud compute ssh runner@plexus-queue-vm --zone=us-central1-a --project="$GCP_PROJECT_ID" --command='true' && { ssh_ok=1; break; }
+              echo "still not up after reset (attempt $i/6), waiting 20s..."; sleep 20
+            done
+          fi
+          [ "$ssh_ok" = "1" ] || { echo "VM unreachable even after a reset - stopping, this needs human attention"; exit 1; }
           # Token travels over SSH stdin only - never in a --command string,
           # never echoed, never landing in this job's own log.
           printf 'https://x-access-token:%s@github.com\n' "$REPO_TOKEN" | \
