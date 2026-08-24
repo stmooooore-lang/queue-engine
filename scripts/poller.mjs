@@ -122,8 +122,6 @@ async function doWork(text, litellmMasterKey) {
     "-w", "/home/runner",
     "plexus-render:latest",
     "cline",
-    "--config", "/home/runner/.cline",
-    "--data-dir", "/home/runner/.cline/data",
     "--cwd", "plexus",
     "-P", "openai-compatible",
     "-m", "plexus-act",
