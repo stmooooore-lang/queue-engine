@@ -13,6 +13,7 @@ ExecStart=/usr/bin/docker run --rm --name poller \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /run/secrets:/run/secrets:ro \
   -v /home/runner/.cline:/home/runner/.cline \
+  -v /home/runner/plexus-doc:/home/runner/plexus-doc \
   --env-file /run/secrets/poller.env \
   poller:latest
 Restart=always
@@ -24,7 +25,7 @@ StandardError=journal
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/home/runner /run/secrets
+ReadWritePaths=/home/runner /home/runner/plexus-doc /run/secrets
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
