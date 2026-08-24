@@ -9,7 +9,9 @@
 
 Built a complete long-running poller system for the GCP e2-micro VM (`plexus-queue-vm`, us-central1-a) that replaces GitHub Actions (`executor.yml`) as the executor for real Telegram bot tasks. The poller runs as a systemd service, polls Turso for pending tasks, executes them via Cline in the prebuilt `plexus-render:latest` Docker image (pointing at the Render LiteLLM split), and writes results back to Turso/Telegram — reusing the exact same schema, queries, and logic as `executor.yml` and `scripts/executor.mjs`.
 
-**VERIFIED: The poller works end-to-end, confirmed via a real Turso round-trip.** Task 10 was inserted with status `ожидает` and prompt "скажи одно слово: привет", picked up by the poller within 10 seconds, executed via Cline in `plexus-render:latest`, and status flipped to `готова` with result "привет" (matching the prompt exactly). Lane used: `plexus-act` (NVIDIA NIM).
+**VERIFIED: The poller systemd service is running and picks up tasks from Turso.** Task 17 was inserted with status `ожидает` and prompt "прочитай canon/START-HERE.md и скажи, какая дата стоит в разделе ## Last updated", picked up by the poller within 10 seconds, executed via Cline in `plexus-render:latest`, and status flipped to `готова`.
+
+**CRITICAL FINDING: `plexus-doc` is NOT cloned/mounted on the VM at `/home/runner/plexus-doc` (or anywhere else on the filesystem).** The Cline session running inside `plexus-render:latest` on the VM attempted to read `/canon/START-HERE.md` but the file does not exist on the VM. The result returned was "not found in the repo" — confirming Cline cannot read the real `plexus-doc` content because it is not present on the VM.
 
 ---
 
@@ -85,103 +87,104 @@ LITELLM_MASTER_KEY=
 
 ---
 
-## Current VM State (from SPLIT-RESULT.md)
+## Verification Details (This Run)
 
-The VM (`plexus-queue-vm`) already has:
-- ✅ **Docker image `plexus-render:latest`** (2.16 GB) — prebuilt with Cline, Node, and `providers.json` pointing to Render LiteLLM with `Authorization: Bearer <LITELLM_MASTER_KEY>`
-- ✅ **~655 MiB free RAM** (of 966 MiB total) — sufficient headroom after LiteLLM split
-- ✅ **Cline execution verified** — end-to-end test passed with `plexus-act` (NVIDIA NIM lane), returned "привет"
-- ✅ **Providers.json configured** — points to `https://render-service-srws.onrender.com/v1` with auth header
+### 1. VM State Verification
+```
+plexus-queue-vm	us-central1-a	RUNNING
+```
+External IP: 35.223.231.116
+
+### 2. Systemd Service Status
+```
+● poller.service - Telegram Bot Task Queue Poller
+     Loaded: loaded (/etc/systemd/system/poller.service; enabled; preset: disabled)
+     Active: active (running) since Mon 2026-08-24 11:09:44 UTC; 2h 38min ago
+   Main PID: 56498 (docker)
+      Tasks: 8 (limit: 1085)
+     Memory: 9.7M
+        CPU: 462ms
+     CGroup: /system.slice/poller.service
+             └─56498 /usr/bin/docker run --rm --name poller -v /var/run/docker.sock:/var/run/docker.sock -v /run/secrets:/run/secrets:ro -v /home/runner/.cline:/home/runner/.cline --env-file /run/secrets/poller.env poller:latest
+```
+**Service is UP and RUNNING.**
+
+### 3. Journal Logs (Last 30 lines)
+```
+Aug 24 11:09:48 plexus-queue-vm docker[56498]: [2026-08-24T11:09:48.734Z] Starting VM poller...
+Aug 24 11:09:48 plexus-queue-vm docker[56498]: [2026-08-24T11:09:48.901Z] Secrets loaded
+Aug 24 11:09:49 plexus-queue-vm docker[56498]: [2026-08-24T11:09:49.571Z] Turso connection OK
+Aug 24 11:16:39 plexus-queue-vm docker[56498]: [2026-08-24T11:16:39.496Z] Processing task 10: скажи одно слово: привет
+Aug 24 11:17:03 plexus-queue-vm docker[56498]: [2026-08-24T11:17:03.590Z] Poll loop error: telegram sendMessage 400: {"ok":false,"error_code":400,"description":"Bad Request: chat not found"}
+Aug 24 12:56:14 plexus-queue-vm docker[56498]: [2026-08-24T12:56:14.761Z] Processing task 11: прочитай canon/START-HERE.md и скажи, какая дата стоит в разделе ## Last updated
+Aug 24 12:57:22 plexus-queue-vm docker[56498]: [2026-08-24T12:57:22.475Z] Poll loop error: telegram sendMessage 400: {"ok":false,"error_code":400,"description":"Bad Request: chat not found"}
+Aug 24 12:59:59 plexus-queue-vm docker[56498]: [2026-08-24T12:59:59.417Z] Processing task 12: прочитай canon/START-HERE.md и скажи, какая дата стоит в разделе ## Last updated
+Aug 24 13:00:39 plexus-queue-vm docker[56498]: [2026-08-24T13:00:39.810Z] Poll loop error: telegram sendMessage 400: {"ok":false,"error_code":400,"description":"Bad Request: chat not found"}
+Aug 24 13:20:39 plexus-queue-vm docker[56498]: [2026-08-24T13:20:39.423Z] Processing task 13: прочитай canon/START-HERE.md и скажи, какая дата стоит в разделе ## Last updated
+Aug 24 13:23:40 plexus-queue-vm docker[56498]: [2026-08-24T13:23:40.765Z] Poll loop error: telegram sendMessage 400: {"ok":false,"error_code":400,"description":"Bad Request: chat not found"}
+Aug 24 13:27:42 plexus-queue-vm docker[56498]: [2026-08-24T13:27:42.323Z] Processing task 15: прочитай canon/START-HERE.md и скажи, какая дата стоит в разделе ## Last updated
+Aug 24 13:30:45 plexus-queue-vm docker[56498]: [2026-08-24T13:30:45.745Z] Poll loop error: telegram sendMessage 400: {"ok":false,"error_code":400,"description":"Bad Request: chat not found"}
+Aug 24 13:32:51 plexus-queue-vm docker[56498]: [2026-08-24T13:32:51.599Z] Processing task 16: прочитай canon/START-HERE.md и скажи, какая дата стоит в разделе ## Last updated
+Aug 24 13:33:14 plexus-queue-vm docker[56498]: [2026-08-24T13:33:14.031Z] Poll loop error: telegram sendMessage 400: {"ok":false,"error_code":400,"description":"Bad Request: chat not found"}
+Aug 24 13:53:26 plexus-queue-vm docker[56498]: [2026-08-24T13:53:26.212Z] Processing task 17: прочитай canon/START-HERE.md и скажи, какая дата стоит в разделе ## Last updated
+Aug 24 13:54:40 plexus-queue-vm docker[56498]: [2026-08-24T13:54:40.874Z] Poll loop error: telegram sendMessage 400: {"ok":false,"error_code":400,"description":"Bad Request: chat not found"}
+```
+
+### 4. Test Task Insertion & Result
+**Inserted Task 17:**
+- Status: `ожидает`
+- Prompt: `прочитай canon/START-HERE.md и скажи, какая дата стоит в разделе ## Last updated`
+- Creator ID: 123456789
+
+**Poller picked up task 17 at 13:53:26 UTC** (within 10s of insert)
+
+**Cline execution result (from Cline session 1787579618392_j8kov):**
+- Cline attempted to read `/canon/START-HERE.md`
+- File read failed: `ENOENT: no such file or directory, statx '/canon/START-HERE.md'`
+- Cline then searched for `START-HERE.md` via `search_codebase`
+- No matches found on the VM filesystem
+- Final result written to Turso: **"not found in the repo"**
+
+**Final Task 17 State in Turso:**
+```json
+{
+  "id": 17,
+  "status": "готова",
+  "text": "прочитай canon/START-HERE.md и скажи, какая дата стоит в разделе ## Last updated",
+  "result": "not found in the repo",
+  "actions_run_id": "poller-1-1787579679890",
+  "minutes_used": 2,
+  "seconds_to_first_work": 0
+}
+```
+
+### 5. VM Filesystem Check for `plexus-doc`
+```
+ls -la /home/runner/ | grep -E "plexus-doc|canon"
+# Result: No plexus-doc or canon directory found
+
+find / -name "START-HERE.md" 2>/dev/null
+# Result: (empty - no such file anywhere on the VM)
+```
+
+**CONFIRMED: `plexus-doc` is NOT cloned on the VM.** The working directory inside the Docker container is `/home/runner` (set by `--cwd .` in the poller), and there is no `canon/START-HERE.md` there.
 
 ---
 
-## Required Manual Steps on VM
+## ACTUAL RESULT (2026-08-24, commit 4ff077b, THIS VERIFICATION RUN)
 
-Since GitHub Actions secrets (`TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`, `TELEGRAM_BOT_TOKEN`, `LITELLM_MASTER_KEY`) are **not** available in this workflow run (GitHub blocks pushing to `.github/workflows/`), the following must be done manually on the VM:
-
-```bash
-# 1. Copy scripts/ directory to VM (via gcloud compute scp or similar)
-#    gcloud compute scp --recurse scripts/ runner@plexus-queue-vm:/home/runner/ --zone=us-central1-a
-
-# 2. On VM, create secrets file:
-sudo mkdir -p /run/secrets
-sudo chmod 700 /run/secrets
-cp scripts/poller.env.template /run/secrets/poller.env
-sudo chmod 600 /run/secrets/poller.env
-# Edit /run/secrets/poller.env with actual values from GitHub Actions secrets
-
-# 3. Run setup (as root):
-sudo scripts/setup-poller.sh
-
-# 4. Verify:
-systemctl status poller
-journalctl -u poller -f
-```
-
----
-
-## Cloud-Agent.yml Diff (Human Must Apply)
-
-**Do NOT edit `.github/workflows/cloud-agent.yml` in this repo** — GitHub blocks pushes that touch it. Instead, apply this diff manually in GitHub UI or via a separate commit with proper permissions.
-
-```diff
---- a/.github/workflows/cloud-agent.yml
-+++ b/.github/workflows/cloud-agent.yml
-@@ -105,6 +105,8 @@ jobs:
-            PROMPT: ${{ inputs.prompt }}
-            HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
-            GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-            GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-            LITELLM_MASTER_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
-+           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
-+           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-         run: |
-           set -o pipefail
-           cline --cwd "$GITHUB_WORKSPACE" -P openai-compatible \
-```
-
-**Why these two lines:**  
-- `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` are already GitHub Actions secrets (used by `executor.yml`)  
-- `cloud-agent.yml` currently lacks them in its `env:` block (lines 105–110)  
-- Adding them enables `cloud-agent.yml` to also write to Turso if needed (e.g., for manual tasks that should appear in the bot queue)  
-- Same shape as existing `HUGGINGFACE_TOKEN`/`GCP_SA_KEY` lines — no new pattern
-
----
-
-## Verification Checklist — ALL PASSED ✅
-
-### Test the poller manually (before enabling systemd):
-```bash
-# On VM, with secrets in env:
-TURSO_DATABASE_URL=... TURSO_AUTH_TOKEN=... TELEGRAM_BOT_TOKEN=... LITELLM_MASTER_KEY=... \
-  node scripts/test-poller.mjs
-```
-Expected: Finds a pending task, runs it via Cline in Docker, updates Turso status to `готова`/`провал`, sends Telegram message to creator.
-
-### Test via actual bot flow:
-1. Send `/task <some prompt>` to the Telegram bot
-2. Worker (`worker/index.js`) inserts task with status `ожидает` and calls `triggerWorkflow` (GitHub dispatch) — **this still works but will be obsolete once poller is live**
-3. Poller picks up task within 10s, executes, replies via Telegram
-4. Verify `/status` shows the task as `готова` with result
-
-### What to watch in logs:
-```bash
-journalctl -u poller -f
-```
-Look for:
-- `[timestamp] Starting VM poller...`
-- `[timestamp] Secrets loaded`
-- `[timestamp] Turso connection OK`
-- `[timestamp] Processing task <id>: <text>`
-- `[timestamp] Task <id> completed with status: готова`
-
-**ACTUAL RESULT (2026-08-24, commit 4ff077b):**
-- Task 10 inserted: status `ожидает`, prompt "скажи одно слово: привет", creator_id=123456789
-- Poller picked up at 11:16:39 UTC (within 10s of insert)
-- Cline executed in `plexus-render:latest` with `--config /home/runner/.cline --data-dir /home/runner/.cline/data --cwd .`
-- Lane `plexus-act` (NVIDIA NIM) returned `run_result` with text "привет"
-- Status updated to `готова`, result="привет", actions_run_id="poller-1-1787570222273", minutes_used=1
-- Telegram sendMessage failed with "chat not found" (creator_id=123456789 was a test placeholder) — **this is expected behavior for test data; the core poller execution path works perfectly**
+| Step | Result | Evidence |
+|------|--------|----------|
+| VM reachable | ✅ YES | `gcloud compute instances list` shows RUNNING |
+| SSH access | ✅ YES | gcloud compute ssh works |
+| Systemd poller service running | ✅ YES | `systemctl status poller` shows active (running) |
+| Poller polls Turso | ✅ YES | Journal shows "Turso connection OK" and tasks picked up |
+| Task 17 picked up | ✅ YES | Journal: "Processing task 17" at 13:53:26 UTC |
+| Cline executed in `plexus-render:latest` | ✅ YES | Session 1787579618392_j8kov completed |
+| Task status updated to `готова` | ✅ YES | Turso query confirms |
+| **`plexus-doc` mounted on VM** | ❌ **NO** | `find / -name "START-HERE.md"` returns nothing |
+| **Cline reads real `plexus-doc` content** | ❌ **NO** | Result: "not found in the repo" |
+| **Date from `## Last updated` found** | ❌ **NO** | File doesn't exist on VM |
 
 ---
 
@@ -195,6 +198,7 @@ Look for:
 | **Duplicate execution risk** | ⚠️ During transition | Both executor.yml (via GitHub dispatch) AND poller may pick up the same task. Mitigation: poller marks task `выполняется` immediately with unique `actions_run_id`; executor.mjs also checks `status = 'ожидает'`. Only one will win. |
 | **VM deploy automation** | 📋 Future | Could use `cloud-agent.yml` with GCP_SA_KEY to auto-provision VM + deploy poller, but not required for MVP |
 | **Health endpoint** | 📋 Optional | Could add HTTP health check (e.g., `/health` on port 8080) for GCP load balancer / monitoring |
+| **`plexus-doc` on VM** | ❌ MISSING | **BLOCKER:** The VM must have `plexus-doc` cloned at `/home/runner/plexus-doc` (or the Docker container must mount it) for Cline to read real content. Current poller mount config only mounts `/home/runner/.cline`. |
 
 ---
 
@@ -216,7 +220,8 @@ Look for:
 
 1. **Human applies cloud-agent.yml diff** (2 lines) in GitHub UI
 2. **Update `worker/index.js`** to remove `triggerWorkflow` call now that poller is confirmed working — tasks will be picked up by poller directly
-3. **Optional:** Add health endpoint to poller for GCP monitoring
+3. **Mount `plexus-doc` on VM** — The poller service's Docker run command must add `-v /home/runner/plexus-doc:/home/runner/plexus-doc` (or similar) AND `plexus-doc` must be cloned on the VM at that path. Without this, Cline cannot read the actual documentation content.
+4. **Optional:** Add health endpoint to poller for GCP monitoring
 
 ---
 
@@ -224,10 +229,6 @@ Look for:
 
 - `scripts/poller.mjs` — main poller logic
 - `scripts/poller.service` — systemd unit file
-- `scripts/poller.env.template` — secrets template
-- `scripts/setup-poller.sh` — installation script
-- `scripts/test-poller.mjs` — single-cycle test script
-- `render-service/TURSO-VM-RESULT.md` — this document
 - `scripts/poller.env.template` — secrets template
 - `scripts/setup-poller.sh` — installation script
 - `scripts/test-poller.mjs` — single-cycle test script
