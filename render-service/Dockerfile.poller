@@ -1,0 +1,29 @@
+# Poller image - runs on GitHub Actions runner (not VM)
+# Based on node:20-slim, installs @libsql/client and docker CLI, runs poller.mjs
+# This container's only job: poll Turso, and for each task, shell out to
+# docker run --rm ... plexus-render:latest cline ... to run Cline.
+# It does NOT need Cline or LiteLLM itself.
+
+FROM node:20-slim
+
+WORKDIR /app
+
+# Install docker CLI (to spawn plexus-render:latest containers from within)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    gnupg \
+    lsb-release \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list \
+    && apt-get update && apt-get install -y --no-install-recommends docker-ce-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install @libsql/client (native module, but node:20-slim has build toolchain)
+RUN npm install @libsql/client@0.14.0 --omit=dev
+
+# Copy poller script
+COPY scripts/poller.mjs /app/poller.mjs
+
+# Entry point
+ENTRYPOINT ["node", "poller.mjs"]

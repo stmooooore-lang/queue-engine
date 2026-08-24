@@ -1,6 +1,8 @@
 #!/bin/bash
 # setup-poller.sh - Install the poller as a systemd service on plexus-queue-vm
 # Run as root (sudo) on the VM after copying the scripts/ directory there
+# Prerequisite: poller:latest Docker image must already be loaded on the VM
+# (transferred via docker save/load from GitHub Actions runner)
 
 set -euo pipefail
 
@@ -24,9 +26,13 @@ if [[ ! -d "${SCRIPTS_DIR}" ]]; then
     exit 1
 fi
 
-# Check poller.mjs exists
-if [[ ! -f "${SCRIPTS_DIR}/poller.mjs" ]]; then
-    echo "poller.mjs not found in ${SCRIPTS_DIR}"
+# Check poller:latest image exists on VM (transferred from runner via docker save/load)
+if ! docker image inspect poller:latest >/dev/null 2>&1; then
+    echo "ERROR: poller:latest image not found on VM."
+    echo "Build it on the GitHub Actions runner and transfer via:"
+    echo "  docker save poller:latest | gzip > /tmp/poller.tar.gz"
+    echo "  gcloud compute scp /tmp/poller.tar.gz plexus-queue-vm:/tmp/"
+    echo "  gcloud compute ssh plexus-queue-vm -- 'gunzip -c /tmp/poller.tar.gz | docker load'"
     exit 1
 fi
 

@@ -122,6 +122,8 @@ async function doWork(text, litellmMasterKey) {
     "-w", "/home/runner",
     "plexus-render:latest",
     "cline",
+    "--config", "/home/runner/.cline",
+    "--data-dir", "/home/runner/.cline/data",
     "--cwd", "plexus",
     "-P", "openai-compatible",
     "-m", "plexus-act",
@@ -241,7 +243,7 @@ async function main() {
 
   // Test connection
   try {
-    await db.execute({ sql: "SELECT 1" });
+    await db.execute({ sql: "SELECT 1", args: [] });
     console.log(`[${new Date().toISOString()}] Turso connection OK`);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Turso connection failed:`, err.message);

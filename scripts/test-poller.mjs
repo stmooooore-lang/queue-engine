@@ -129,7 +129,7 @@ async function main() {
   const db = createClient({ url: TURSO_DATABASE_URL, authToken: TURSO_AUTH_TOKEN });
 
   // Test connection
-  await db.execute({ sql: "SELECT 1" });
+  await db.execute({ sql: "SELECT 1", args: [] });
   console.log("Turso connection OK");
 
   // One poll cycle
