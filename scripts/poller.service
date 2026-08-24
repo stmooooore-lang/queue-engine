@@ -1,0 +1,33 @@
+[Unit]
+Description=Telegram Bot Task Queue Poller
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=runner
+WorkingDirectory=/home/runner
+ExecStart=/usr/bin/node /home/runner/scripts/poller.mjs
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment file with secrets (never printed in logs)
+EnvironmentFile=/run/secrets/poller.env
+
+# Resource limits for e2-micro
+MemoryLimit=800M
+CPUQuota=80%
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/runner /run/secrets
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
