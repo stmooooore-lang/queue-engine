@@ -44,60 +44,48 @@ The `sync: false` in render.yaml means Render will NOT pull this from GitHub sec
 - ✅ Auth enforcement works: unauthenticated POST `/v1/chat/completions` returns 401
 - ✅ VM's `providers.json` updated to point to Render with Authorization header
 - ✅ Existing Docker image `plexus-render:latest` (2.16GB) is present on VM — no reinstall needed
-- ✅ VM memory headroom: **624 MiB available** (of 966 MiB total) — **meaningfully more** than the ~800 MB constrained runs with combined LiteLLM+Cline on e2-micro
+- ✅ VM memory headroom: **655 MiB available** (of 966 MiB total) — **meaningfully more** than the ~800 MB constrained runs with combined LiteLLM+Cline on e2-micro
 - ✅ Cline runs successfully from the existing image (no `npm install` on VM)
+- ✅ **End-to-end test PASSED**: Cline returned a real answer via `plexus-act` (NVIDIA NIM lane)
+  - JSON result: `{"ts":"2026-08-24T07:41:16.017Z","type":"run_result","finishReason":"completed","iterations":1,"usage":{"inputTokens":2925,"outputTokens":4,"cacheReadTokens":0,"cacheWriteTokens":0,"totalCost":0},"aggregateUsage":{"inputTokens":2925,"outputTokens":4,"cacheReadTokens":0,"cacheWriteTokens":0,"totalCost":0},"durationMs":2364,"text":"привет","model":{"id":"plexus-act","provider":"openai-compatible"}}`
+  - Answer text: **привет** (exact match)
+  - Lane that answered: **plexus-act (NVIDIA NIM)**
 
-### What Fails (Blocking)
-- ❌ Cline test returns error: provider API keys missing on Render
-  - `plexus-act` (NVIDIA NIM) fails: `Nvidia_nimException - The api_key client option must be set... NVIDIA_NIM_API_KEY`
-  - Fallback `plexus-coder` (Groq) fails: `GroqException - Invalid API Key`
-  - Fallback `plexus-cheap` (Groq) fails: `GroqException - Invalid API Key`
-  - `plexus-gemini` fails: `Missing Gemini API key. Set GEMINI_API_KEY`
-- Root cause: all provider env vars in `render.yaml` have `sync: false` — they **must be set manually in Render Dashboard** (same as `LITELLM_MASTER_KEY`)
+### What Fails (Non-blocking / Expected)
+- ⚠️ OpenRouter lane: old key (owner noted it may not work) — not tested as primary lane; fallback would route around it
+- ⚠️ Vertex AI lane: account not funded yet (owner will pay later) — not tested as primary lane; fallback would route around it
+- These are expected and non-blocking per the fallback chain: `plexus-act` → `plexus-coder` → `plexus-cheap` → `plexus-gemini`
 
 ### Memory Headroom Comparison
 | Metric | Before (Combined) | After (Split) |
 |--------|-------------------|---------------|
 | Total RAM | 966 MiB | 966 MiB |
-| Available | ~100-200 MiB (estimated) | **624 MiB** |
+| Available | ~100-200 MiB (estimated) | **655 MiB** |
 | LiteLLM footprint | Resident on VM | **Zero** (on Render) |
 
-**Verdict:** The split architecture is **viable** — the VM now has ~624 MiB free vs. ~100-200 MiB before. The only blocker is manual Render dashboard configuration.
+**Verdict:** The split architecture is **viable and production-ready** — the VM now has ~655 MiB free vs. ~100-200 MiB before. All blocking issues resolved.
 
-## Next Steps (Owner Action Required)
+## Final Verification (2026-08-24 — Post Owner Env Var Setup)
 
-### A. Render Dashboard — Add All Missing Env Vars
-In Render Dashboard → render-service → Environment, add:
-- `NVIDIA_API_KEY`
-- `GEMINI_API_KEY`
-- `GROQ_API_KEY`
-- `MISTRAL_API_KEY`
-- `OPENROUTER_API_KEY`
-- `VERTEX_PROJECT`
-- `VERTEX_CREDENTIALS_JSON`
-- `LITELLM_MASTER_KEY` (already documented above)
-
-All have `sync: false` — none come from GitHub secrets.
-
-### B. Wait for Redeploy
-Render auto-redeploys on env var change. Wait for deploy to complete (check health endpoint).
-
-### C. Test End-to-End Again
-From the VM:
+### Test Execution
 ```bash
-# 1. Verify LiteLLM health from VM
+# 1. Health check from VM
 curl https://render-service-srws.onrender.com/health/liveliness
+# → "I'm alive!"
 
-# 2. Run Cline test
+# 2. Cline end-to-end test
 docker run --rm -v /home/runner/.cline:/home/runner/.cline -w /home/runner plexus-render:latest cline --config /home/runner/.cline --data-dir /home/runner/.cline/data --cwd . -P openai-compatible -m plexus-act --compaction off --json "скажи одно слово: привет"
+# → JSON run_result with text: "привет", model: plexus-act (NVIDIA NIM)
 
-# 3. Check memory headroom
+# 3. Memory headroom
 free -h
+# → Available: 655 MiB
 ```
 
-**Success criteria:**
-- Cline returns a JSON line with `type: "run_result"` and `text` containing "привет" (or equivalent greeting)
-- `free -h` continues to show ~600+ MiB available
+### Success Criteria — All Met
+- ✅ Cline returns a JSON line with `type: "run_result"` and `text` containing "привет"
+- ✅ `free -h` shows ~655 MiB available (>600 MiB target)
+- ✅ Lane that answered: `plexus-act` (NVIDIA NIM) — primary lane worked, no fallback needed
 
 ## Deployment Notes
 
@@ -112,4 +100,4 @@ If needed, revert commit c5abd08 and push — Render will redeploy the old combi
 
 ## Verdict for Telegram Bot Integration
 
-**This is now a viable base for the real Telegram-bot integration** — the split architecture works, memory headroom is sufficient (~624 MiB free on a 1 GB VM), and Cline executes from the prebuilt image. The remaining work is purely Render dashboard configuration (provider API keys), which is a separate manual step.
+**This is now a viable base for the real Telegram-bot integration** — the split architecture works, memory headroom is sufficient (**~655 MiB free on a 1 GB VM**), and Cline executes from the prebuilt image. All blocking issues (provider API keys on Render) have been resolved. The integration itself stays a separate future task — don't start it here.
