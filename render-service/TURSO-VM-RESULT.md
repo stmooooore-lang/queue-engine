@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-24  
 **Commit:** 4ff077b (pushed)  
-**Latest verification run:** 2026-08-24 15:45 UTC (this document updated with live test result)
+**Latest verification run:** 2026-08-24 17:42 UTC (this document updated with live test result)
 
 ---
 
@@ -26,16 +26,16 @@ This run investigated the claim that "the poller systemd service on plexus-queue
 
 ---
 
-## Latest Test Run — 2026-08-24 15:35 UTC (on this runner)
+## Latest Test Run — 2026-08-24 17:36 UTC (on this runner)
 
 | Step | Result | Evidence |
 |------|--------|----------|
-| 1. Insert task via `scripts/test-insert.mjs` | ✅ SUCCESS | Task 19 created with status `ожидает`, prompt "прочитай canon/START-HERE.md и скажи, какая дата стоит в разделе ## Last updated" |
-| 2. Poller picks up task | ✅ SUCCESS | Status changed to `выполняется` within ~10 seconds (actions_run_id: `poller-1-1787585754683`) |
-| 3. Cline executes on this runner (not in Docker) | ⏳ IN PROGRESS | Cline process PID 2224 running since 15:27 UTC, still `выполняется` after 10+ minutes |
-| 4. Task status updated in Turso | ✅ YES | Status `выполняется` |
-| 5. **Cline reads real `plexus-doc` content** | ❌ **NOT YET** | `plexus-doc` exists in this checkout at `/home/runner/work/queue-engine/queue-engine/plexus-doc` but NOT at `/home/runner/plexus-doc` where the Cline working directory expects it |
-| 6. **Date from `## Last updated` found** | ❌ **NOT YET** | Task still `выполняется` after 10+ minutes; Cline likely cannot find the file at expected path |
+| 1. Insert task via `scripts/test-insert.mjs` | ✅ SUCCESS | Task 21 created with status `ожидает`, prompt "прочитай canon/START-HERE.md и скажи, какая дата стоит в разделе ## Last updated" |
+| 2. Poller picks up task | ✅ SUCCESS | Status changed to `выполняется` within ~10 seconds (actions_run_id: `poller-1-1787593019125`) |
+| 3. Cline executes on this runner (not in Docker) | ✅ COMPLETED | Cline process completed task in ~2 minutes |
+| 4. Task status updated in Turso | ✅ YES | Status changed to `готова` |
+| 5. **Cline reads real `plexus-doc` content** | ❌ **FAILED** | `plexus-doc` exists in this checkout at `/home/runner/work/queue-engine/queue-engine/plexus-doc` but NOT at `/home/runner/plexus-doc` where the Cline working directory expects it |
+| 6. **Date from `## Last updated` found** | ❌ **NOT FOUND** | Result: "Файл `canon/START-HERE.md` **не найден** в текущей файловой системе. В рабочей директории `/home/runner` есть только папка `.cline/data/`, а директории `canon` и файл `START-HERE.md` отсутствуют." |
 
 ---
 
