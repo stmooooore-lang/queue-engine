@@ -104,6 +104,15 @@ jobs:
           set -euo pipefail
           printf '%s' "$GCP_SA_KEY" > /tmp/gcp-key.json
           gcloud auth activate-service-account --key-file=/tmp/gcp-key.json --project="$GCP_PROJECT_ID"
+          # A freshly generated runner SSH key can take longer to propagate
+          # to the VM's metadata than gcloud's own internal wait allows for
+          # (run 32750131088: "Connection reset by peer" after 5+ minutes of
+          # waiting, first SSH call in the job). Retry a few times with a
+          # short pause rather than failing the whole step on one race.
+          for i in 1 2 3 4 5; do
+            gcloud compute ssh runner@plexus-queue-vm --zone=us-central1-a --project="$GCP_PROJECT_ID" --command='true' && break
+            echo "SSH not ready yet (attempt $i/5), waiting 20s..."; sleep 20
+          done
           # Token travels over SSH stdin only - never in a --command string,
           # never echoed, never landing in this job's own log.
           printf 'https://x-access-token:%s@github.com\n' "$REPO_TOKEN" | \
