@@ -158,3 +158,6 @@ litellm_settings:
   set_verbose: false
 
   callbacks: plexus_hooks.proxy_handler_instance
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

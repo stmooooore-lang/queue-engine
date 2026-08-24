@@ -1,0 +1,32 @@
+# Render LiteLLM-only Docker configuration
+# - Runs as root (no HF Spaces user 1000 requirement)
+# - Exposes port 4000 (LiteLLM default proxy port)
+# - Health check on /health/liveliness endpoint
+# - LiteLLM pinned to 1.83.9 (newer versions fail to start)
+# - NO Node, NO npm, NO Cline - this is the whole point of the split
+
+FROM python:3.12-slim-bookworm
+
+# LiteLLM pinned to 1.83.9 - the version after it fails to start at all
+# (proxy_cli.py does a bare `from proxy_server import`, which only resolves
+# when the proxy package directory is on sys.path; confirmed on GitHub's
+# runner, run 32549839784). Debian 12/bookworm marks the system Python as
+# externally-managed (PEP 668) - --break-system-packages is required or pip
+# refuses outright.
+RUN pip3 install --break-system-packages --no-cache-dir "litellm[proxy]==1.83.9"
+
+WORKDIR /app
+
+# Copy LiteLLM config and hooks
+COPY cloud-config.yaml plexus_hooks.py ./
+
+# Render free tier uses port 10000 by default, but we'll expose 4000
+# and let Render map it. Health check on LiteLLM's endpoint.
+EXPOSE 4000
+
+# Health check for Render
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:4000/health/liveliness || exit 1
+
+# Start LiteLLM proxy directly (no Node wrapper)
+CMD ["litellm", "--config", "cloud-config.yaml", "--port", "4000", "--host", "0.0.0.0", "--num_workers", "1"]

@@ -3,6 +3,7 @@ services:
     name: render-service
     rootDir: render-service
     env: docker
+    dockerfilePath: ./Dockerfile.litellm
     envVars:
       - key: NVIDIA_API_KEY
         sync: false
@@ -11,4 +12,12 @@ services:
       - key: GROQ_API_KEY
         sync: false
       - key: MISTRAL_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: VERTEX_PROJECT
+        sync: false
+      - key: VERTEX_CREDENTIALS_JSON
+        sync: false
+      - key: LITELLM_MASTER_KEY
         sync: false
