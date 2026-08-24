@@ -108,6 +108,9 @@ jobs:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           LITELLM_MASTER_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           set -o pipefail
           cline --cwd "$GITHUB_WORKSPACE" -P openai-compatible \
@@ -126,6 +129,7 @@ jobs:
           grep -q 'nvapi-' agent-output.txt 2>/dev/null && { echo "KEY LEAKED"; exit 1; }
           grep -q 'hf_[A-Za-z0-9]' agent-output.txt 2>/dev/null && { echo "KEY LEAKED"; exit 1; }
           grep -q 'BEGIN PRIVATE KEY\|"private_key"\|"private_key_id"' agent-output.txt 2>/dev/null && { echo "KEY LEAKED"; exit 1; }
+          grep -qE '[0-9]{8,10}:[A-Za-z0-9_-]{35}' agent-output.txt 2>/dev/null && { echo "KEY LEAKED"; exit 1; }
           echo "no key in output"
 
       - name: push whatever the agent committed
