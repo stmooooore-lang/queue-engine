@@ -17,6 +17,7 @@ import { createClient } from "@libsql/client";
 import { execFile as execFileCb } from "node:child_process";
 import { promises as fs } from "node:fs";
 import { promisify } from "node:util";
+import telegramifyMarkdown from "telegramify-markdown";
 
 const execFile = promisify(execFileCb);
 
@@ -116,16 +117,25 @@ function splitForTelegram(text) {
   return chunks;
 }
 
-async function sendOneTelegramMessage(botToken, chatId, text) {
+async function sendOneTelegramMessage(botToken, chatId, rawText) {
   const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-  // Try Markdown first for real formatting; Cline's output isn't guaranteed
-  // to be valid Telegram Markdown (unescaped _ ( ) etc. make Telegram's
-  // parser reject the whole message with 400 "can't parse entities") - fall
-  // back to plain text rather than losing the message over a formatting bug.
-  for (const parse_mode of ["Markdown", undefined]) {
-    const body = parse_mode
-      ? { chat_id: chatId, text, parse_mode }
-      : { chat_id: chatId, text };
+  // telegramify-markdown converts Cline's plain markdown (including GFM
+  // tables, which Telegram cannot render under any parse_mode) into valid
+  // Telegram MarkdownV2 - correct escaping, tables become a monospace
+  // block. Converted per-chunk (not on the whole message before splitting)
+  // so a bold/italic span never straddles a chunk boundary and breaks
+  // mid-entity. If conversion or Telegram's own parse still fails for some
+  // unexpected input, fall back to the raw chunk as plain text rather than
+  // losing the message over a formatting bug.
+  let converted;
+  try {
+    converted = telegramifyMarkdown(rawText, "escape");
+  } catch (err) {
+    console.log(`telegramify-markdown failed, sending raw: ${err.message}`);
+    converted = null;
+  }
+  for (const [text, parse_mode] of converted ? [[converted, "MarkdownV2"], [rawText, undefined]] : [[rawText, undefined]]) {
+    const body = parse_mode ? { chat_id: chatId, text, parse_mode } : { chat_id: chatId, text };
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -134,7 +144,7 @@ async function sendOneTelegramMessage(botToken, chatId, text) {
     if (res.ok) return await res.text();
     const errBody = await res.text();
     if (parse_mode) {
-      console.log(`sendMessage with Markdown failed (${res.status}), retrying plain: ${errBody.slice(0, 200)}`);
+      console.log(`sendMessage with MarkdownV2 failed (${res.status}), retrying plain: ${errBody.slice(0, 200)}`);
       continue;
     }
     throw new Error(`telegram sendMessage ${res.status}: ${errBody}`);
@@ -162,14 +172,17 @@ async function fetchHistory(db, creatorId, currentTaskId, limit = 6) {
   return res.rows;
 }
 
-// Telegram has no table syntax at all - a Markdown table renders as raw
-// pipes and dashes, unreadable. Told once here rather than left for Cline
-// to guess; *bold*/`code` do render (sendOneTelegramMessage sends with
-// parse_mode Markdown), so those stay useful.
+// telegramify-markdown (in sendOneTelegramMessage) makes *bold*/`code`/etc.
+// safe automatically now - no need to warn about those. Tables are a
+// separate problem it does NOT solve: verified locally, it just escapes
+// the pipes/dashes (`\| a \| b \|`) rather than reformatting them, so a
+// table is still unreadable in Telegram even after conversion. That one
+// still needs telling.
 const TELEGRAM_FORMAT_HINT =
-  "Отвечаешь в Telegram-чат: **markdown-таблицы не рендерятся вообще** " +
-  "(пиши списком, не таблицей), простой markdown работает (*жирный*, `код`). " +
-  "Длинный ответ — это нормально, он придёт несколькими сообщениями подряд.";
+  "Отвечаешь в Telegram-чат: **не используй markdown-таблицы, пиши списком** " +
+  "(таблицы там нечитаемы даже после конвертации). Простое форматирование " +
+  "(жирный, код) работает само. Длинный ответ — это нормально, " +
+  "он придёт несколькими сообщениями подряд.";
 
 function buildPromptWithHistory(currentText, historyRows) {
   if (historyRows.length === 0) {
