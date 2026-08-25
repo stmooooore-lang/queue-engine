@@ -5,6 +5,8 @@ The VM poller (`poller.service` on `plexus-queue-vm`) is now running the **curre
 
 **Update 2026-08-25 (commit f0da3ef)**: Deployed updated `poller.mjs` with message splitting (instead of truncation), Markdown `parse_mode` with fallback, and Telegram-formatting hint in prompt. New image built, transferred, and service restarted. Test task 31 ("напиши три коротких абзаца про то, зачем нужна очередь задач") completed successfully — poller processed the multi-paragraph answer without crashing on the new `notifyTelegram`/`splitForTelegram` code path.
 
+**Update 2026-08-25 (commit 7c48c98)**: Deployed `poller.mjs` with `telegramify-markdown` for real MarkdownV2 conversion (v1.3.3). New image built, transferred to `plexus-queue-vm`, service restarted. **Restart confirmed**: `ActiveEnterTimestamp=Tue 2026-08-25 00:45:45 UTC` (genuinely recent). Test task 33 ("напиши два коротких пункта списком, один из них выдели жирным") completed successfully — poller processed the answer with **bold text** and bullet list via the new `telegramifyMarkdown(text, "escape")` code path without crashing.
+
 ---
 
 ## Root Cause Analysis
@@ -76,11 +78,14 @@ The file at `/home/runner/scripts/poller.mjs` on the VM already contained the co
 | **VM poller image ID** | `sha256:ca353e706073` (built 2026-08-25, matches local rebuild) |
 | **systemd restart timestamp (2026-08-24)** | `ActiveEnterTimestamp=Mon 2026-08-24 18:03:37 UTC` |
 | **systemd restart timestamp (2026-08-25, f0da3ef)** | `ActiveEnterTimestamp=Tue 2026-08-25 00:32:22 UTC` (genuinely recent) |
+| **systemd restart timestamp (2026-08-25, 7c48c98)** | `ActiveEnterTimestamp=Tue 2026-08-25 00:45:45 UTC` (genuinely recent) |
 | **Host-side plexus-doc** | `ls -la /home/runner/plexus-doc/canon/START-HERE.md` → 44198 bytes, Aug 24 14:39 |
 | **Test task 23 inserted** | `INSERT INTO tasks ...` → task ID 23, status `ожидает` |
 | **Task 23 processed** | Status `готова`, result: `В разделе **## Last updated** стоит дата **2026-08-24** (ночь).` |
 | **Test task 31 inserted (f0da3ef)** | `INSERT INTO tasks ...` → task ID 31, status `ожидает`, creator_id=1568126 |
 | **Task 31 processed** | Status `готова`, result: 3 paragraphs in Russian with **bold** markdown, no truncation, no crash |
+| **Test task 33 inserted (7c48c98)** | `INSERT INTO tasks ...` → task ID 33, status `ожидает`, creator_id=1568126 |
+| **Task 33 processed** | Status `готова`, result: `- **Первый пункт** — выделен жирным \n- Второй пункт — обычный текст` (bold + bullet list via telegramify-markdown) |
 | **Seconds to first work** | 0 (picked up immediately) |
 | **Minutes used** | 1 |
 
@@ -92,5 +97,6 @@ The file at `/home/runner/scripts/poller.mjs` on the VM already contained the co
 - **Mount works**: The `-v /home/runner/plexus-doc:/home/runner/plexus-doc` in the systemd unit + the `-w/--cwd` in `poller.mjs` now give Cline access to the real documentation.
 - **Real end-to-end test passed**: Task 23 returned the actual date from `START-HERE.md` (**2026-08-24**).
 - **Code update f0da3ef verified**: Task 31 produced a multi-paragraph Russian answer with markdown formatting. The poller processed it through the new `splitForTelegram` → `sendOneTelegramMessage` (Markdown with fallback to plain) → `notifyTelegram` code path without crashing or truncating.
+- **Code update 7c48c98 verified**: Task 33 produced a bullet list with bold text. The poller processed it through the new `telegramifyMarkdown(text, "escape")` code path (real MarkdownV2 conversion via telegramify-markdown v1.3.3) without crashing. The library correctly escapes MarkdownV2 special characters per-chunk so formatting spans never straddle message splits.
 
 No further infrastructure work needed. If NVIDIA NIM overload (litellm `APIConnectionError`/`RateLimitError`) causes future task failures, that is a provider-side capacity issue — retry the task once NVIDIA recovers. The fix itself (fresh poller.mjs deployed, timestamp confirms restart) is done.
