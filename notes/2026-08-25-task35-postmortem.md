@@ -16,33 +16,15 @@ Task 35 failed with exit code 128 from `docker run` (container failed to start) 
 
 **Undetermined.** The failure was transient and did not recur. No persistent infrastructure defect was found.
 
----
-
-## Why Disk and Memory Were Ruled Out
-
-At the time of investigation (after the failure), the following resource checks were performed on `plexus-queue-vm`:
-
-| Resource | Usage | Free | Verdict |
-|----------|-------|------|---------|
-| Root filesystem (`/`) | 69% used | 622 MB | **Healthy** — well above minimum |
-| Stateful partition (`/mnt/stateful_partition`) | 33% used | 18 GB | **Healthy** — abundant space |
-| Memory (RAM) | — | 675 MiB available | **Healthy** — e2-micro has 966 MiB total |
-
-**Conclusion:** Neither disk exhaustion nor memory exhaustion caused the failure. The hypothesis that resource pressure caused docker run code 128 was **wrong** and explicitly ruled out by direct measurement on the VM.
----
-
-## Exact Failure Mechanism
-
-From `START-HERE.md` (lines 27–36):
-
-> **One transient failure, cause not found, likely not systemic:** task 35 failed with `код 128: Command failed: docker run` (the container itself failed to start) and the same/similar symptom showed as "chat stopped seeing the repo". Checked the obvious causes on the VM directly and both were healthy - `/` 69% used (622M free), `/mnt/stateful_partition` 33% used (18G free), memory 675Mi available - so it was NOT disk or memory exhaustion, that hypothesis was wrong. Root cause still unknown; tasks before and after worked fine, so this reads as one transient blip, not a persistent problem. If it recurs, check `journalctl`/docker's own error text at the exact failure timestamp next, not disk/memory again.
-
-**Observed facts:**
-1. `docker run` exited with code 128 — this is Docker's "command failed to start" code (not an application error inside the container)
-2. "Chat stopped seeing the repo" — Cline could not access `plexus-doc` mount
-3. Both symptoms co-occurred at the same task timestamp
-4. Task 34 (before) and Task 36+ (after) completed normally
-5. The poller image bakes `poller.mjs` at build time (`Dockerfile.poller` line 29: `COPY scripts/poller.mjs /app/poller.mjs`) — a stale image could theoretically cause mount/config drift, but the image was confirmed fresh at the time of the post-failure verification
+**Evidence from START-HERE.md (lines 27-36):**
+- Task 35 failed with `код 128: Command failed: docker run` (container failed to start)
+- Same timestamp: "chat stopped seeing the repo" — Cline could not access `plexus-doc` mount
+- Direct measurement on `plexus-queue-vm` ruled out disk/memory pressure:
+  - Root filesystem (`/`): 69% used (622 MB free) — **Healthy**
+  - Stateful partition (`/mnt/stateful_partition`): 33% used (18 GB free) — **Healthy**
+  - Memory (RAM): 675 MiB available — **Healthy** (e2-micro has 966 MiB total)
+- Task 34 (before) and Task 36+ (after) completed normally
+- Poller image bakes `poller.mjs` at build time (`Dockerfile.poller` COPY) — image was confirmed fresh post-failure
 
 **What code 128 means in Docker:**
 - Exit code 128 = `128 + signal` where signal = 0 (not a signal)
@@ -166,3 +148,66 @@ async function pollLoop(db, botToken, litellmMasterKey) {
 - This postmortem was written from documented evidence in `plexus-doc/canon/START-HERE.md` and `render-service/TURSO-VM-RESULT.md` — no live SSH to the VM was possible from this environment (GitHub Actions runner).
 - The exact timestamp of task 35 is not in the local Turso database; it exists only in the production Turso instance on the VM.
 - If this failure recurs, the immediate next step is `journalctl -u poller --since='<exact-failure-time>' --until='<exact-failure-time+5m>'` and `journalctl -u docker --same-window` on the VM to capture Docker daemon's own error text.
+- **Correction:** The task description stated "Neither has sendRichMessage/RichBlockTable" — both branches currently have this implementation (added 2026-08-25, documented in `plexus-doc/notes/2026-08-25-telegram-rich-tables.md`).
+
+---
+
+## Current Telegram Formatting State (2026-08-25)
+
+### Comparison: `main` vs `cursor-build` (HEAD)
+
+| Feature | `main` (HEAD) | `cursor-build` | Status |
+|---------|---------------|----------------|--------|
+| **parse_mode** | HTML (`"HTML"`) | HTML (`"HTML"`) | ✅ Same |
+| **markdownToTelegramHTML()** | Present (hand-written) | Present (hand-written) | ✅ Same |
+| **sendRichMessage()** | Present (lines 205-211) | Present (lines 205-211) | ✅ Same |
+| **RichBlockTable support** | Present via `messageToRichBlocks()` | Present via `messageToRichBlocks()` | ✅ Same |
+| **containsMarkdownTable()** | Present (line 113) | Present (line 113) | ✅ Same |
+| **parseMarkdownTable()** | Present (line 120) | Present (line 120) | ✅ Same |
+| **markdownToRichText()** | Present (line 170) | Present (line 170) | ✅ Same |
+| **messageToRichBlocks()** | Present (line 185) | Present (line 185) | ✅ Same |
+| **notifyTelegram routing** | Table → sendRichMessage, else HTML | Table → sendRichMessage, else HTML | ✅ Same |
+| **Rate limiter** | Not present | Not present | ✅ Not needed |
+
+**Key finding:** The task description claimed "Neither has sendRichMessage/RichBlockTable" — this is **incorrect**. Both branches (which are currently identical at HEAD) already contain the full `sendRichMessage`/`RichBlockTable` implementation added in the 2026-08-25 session (documented in `plexus-doc/notes/2026-08-25-telegram-rich-tables.md`).
+
+**Current implementation flow in `notifyTelegram`:**
+1. `containsMarkdownTable(message)` — detects `|---|` markdown table syntax
+2. If table: `messageToRichBlocks()` → `sendRichMessage()` (Telegram Bot API `sendRichMessage` with `RichBlockTable`)
+3. On sendRichMessage failure: falls back to `sendMessage` with HTML mode
+4. If no table: `splitForTelegram()` → `sendOneTelegramMessage()` with `markdownToTelegramHTML()` + `parse_mode: "HTML"`
+
+---
+
+## Concrete Next Steps for Stable Poller + Readable Telegram Messages
+
+### Step 1: Add Docker Run Retry for Transient Failures (exit codes 125, 126, 127, 128)
+**Rationale:** Task 35's exit code 128 was a transient Docker daemon error. A retry wrapper with exponential backoff will auto-recover from such blips without manual intervention.
+
+**Acceptance check:**
+```bash
+# Verify retry logic exists in doWork() around the docker run call
+grep -n "runDockerWithRetry\|DOCKER_RETRY_BASE_MS\|transientCodes" scripts/poller.mjs
+# Expected: function definition + usage in doWork
+```
+
+### Step 2: Add Systemd Watchdog to Poller Service
+**Rationale:** If the poller process hangs (e.g., Docker daemon wedge), systemd will auto-restart it within 60s.
+
+**Acceptance check:**
+```bash
+# Verify WatchdogSec in poller.service
+grep -n "WatchdogSec\|Restart=always" render-service/poller.service 2>/dev/null || grep -n "WatchdogSec\|Restart=always" scripts/poller.service
+# Expected: WatchdogSec=60, Restart=always, RestartSec=10
+```
+
+### Step 3: Verify Live Telegram Rendering (Tables + HTML)
+**Rationale:** Confirm the `sendRichMessage`/`RichBlockTable` path works end-to-end and HTML fallback is solid.
+
+**Acceptance check:**
+```bash
+# Insert a test task with a markdown table via Turso
+# Expected: Telegram renders native table (RichBlockTable), not raw markdown
+# Verify in poller logs: "sendRichMessage" path taken, not fallback
+grep -E "sendRichMessage|containsMarkdownTable" /var/log/syslog | tail -5
+```
