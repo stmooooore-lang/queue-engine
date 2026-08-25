@@ -20,12 +20,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # @libsql/client: native module, node:20-slim has the build toolchain.
-# telegramify-markdown: converts Cline's plain markdown (incl. GFM tables,
-# which Telegram cannot render in any parse_mode) into safe Telegram
-# MarkdownV2 - tables become a monospace block instead of raw pipes, and
-# escaping is handled properly instead of hoping the model avoids the
-# characters that break parse_mode.
-RUN npm install @libsql/client@0.14.0 telegramify-markdown@1 --omit=dev
+# No markdown library needed - poller.mjs converts to Telegram HTML with a
+# small hand-written function (fewer characters to escape than MarkdownV2,
+# more predictable on real multi-paragraph Cline output).
+RUN npm install @libsql/client@0.14.0 --omit=dev
 
 # Copy poller script
 COPY scripts/poller.mjs /app/poller.mjs

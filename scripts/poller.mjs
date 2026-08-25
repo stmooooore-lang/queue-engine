@@ -17,7 +17,6 @@ import { createClient } from "@libsql/client";
 import { execFile as execFileCb } from "node:child_process";
 import { promises as fs } from "node:fs";
 import { promisify } from "node:util";
-import telegramifyMarkdown from "telegramify-markdown";
 
 const execFile = promisify(execFileCb);
 
@@ -117,24 +116,37 @@ function splitForTelegram(text) {
   return chunks;
 }
 
+// MarkdownV2 (telegramify-markdown) was tried first and dropped: it needs
+// ~20 punctuation characters escaped everywhere in the text, not just
+// inside formatting, and real multi-paragraph Cline output (numbered
+// lists, headers) kept tripping Telegram's parser into a 400, silently
+// falling back to raw GFM markdown as plain text - which is exactly the
+// "bold looks like plain text, with literal **" the founder saw live.
+// HTML mode only requires escaping & < > - far fewer ways to break - so a
+// small hand-written converter for the handful of things Cline actually
+// writes (bold, italic, inline code, headers) is more predictable than a
+// general-purpose Markdown parser here. Tested locally against real
+// multi-line output before shipping.
+function markdownToTelegramHTML(text) {
+  let s = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  s = s.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  s = s.replace(/__([^_\n]+)__/g, "<b>$1</b>");
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*([^*]|$)/g, "$1<i>$2</i>$3");
+  s = s.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
+  return s;
+}
+
 async function sendOneTelegramMessage(botToken, chatId, rawText) {
   const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-  // telegramify-markdown converts Cline's plain markdown (including GFM
-  // tables, which Telegram cannot render under any parse_mode) into valid
-  // Telegram MarkdownV2 - correct escaping, tables become a monospace
-  // block. Converted per-chunk (not on the whole message before splitting)
-  // so a bold/italic span never straddles a chunk boundary and breaks
-  // mid-entity. If conversion or Telegram's own parse still fails for some
-  // unexpected input, fall back to the raw chunk as plain text rather than
-  // losing the message over a formatting bug.
   let converted;
   try {
-    converted = telegramifyMarkdown(rawText, "escape");
+    converted = markdownToTelegramHTML(rawText);
   } catch (err) {
-    console.log(`telegramify-markdown failed, sending raw: ${err.message}`);
+    console.log(`markdown-to-HTML conversion failed, sending raw: ${err.message}`);
     converted = null;
   }
-  for (const [text, parse_mode] of converted ? [[converted, "MarkdownV2"], [rawText, undefined]] : [[rawText, undefined]]) {
+  for (const [text, parse_mode] of converted ? [[converted, "HTML"], [rawText, undefined]] : [[rawText, undefined]]) {
     const body = parse_mode ? { chat_id: chatId, text, parse_mode } : { chat_id: chatId, text };
     const res = await fetch(url, {
       method: "POST",
@@ -144,7 +156,7 @@ async function sendOneTelegramMessage(botToken, chatId, rawText) {
     if (res.ok) return await res.text();
     const errBody = await res.text();
     if (parse_mode) {
-      console.log(`sendMessage with MarkdownV2 failed (${res.status}), retrying plain: ${errBody.slice(0, 200)}`);
+      console.log(`sendMessage with HTML failed (${res.status}), retrying plain: ${errBody.slice(0, 200)}`);
       continue;
     }
     throw new Error(`telegram sendMessage ${res.status}: ${errBody}`);
@@ -172,12 +184,12 @@ async function fetchHistory(db, creatorId, currentTaskId, limit = 6) {
   return res.rows;
 }
 
-// telegramify-markdown (in sendOneTelegramMessage) makes *bold*/`code`/etc.
-// safe automatically now - no need to warn about those. Tables are a
-// separate problem it does NOT solve: verified locally, it just escapes
-// the pipes/dashes (`\| a \| b \|`) rather than reformatting them, so a
-// table is still unreadable in Telegram even after conversion. That one
-// still needs telling.
+// markdownToTelegramHTML (in sendOneTelegramMessage) makes bold/code safe
+// automatically now - no need to warn about those. Tables are a separate,
+// mode-independent problem: Telegram's supported HTML tag set (b, i, u, s,
+// code, pre, a, blockquote, spoiler) has no <table> at all, same as
+// MarkdownV2 has no table syntax - a table is unreadable in a Telegram bot
+// message under any parse_mode, full stop. That one still needs telling.
 const TELEGRAM_FORMAT_HINT =
   "Отвечаешь в Telegram-чат: **не используй markdown-таблицы, пиши списком** " +
   "(таблицы там нечитаемы даже после конвертации). Простое форматирование " +
