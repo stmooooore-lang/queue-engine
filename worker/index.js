@@ -74,10 +74,14 @@ export default {
         // Unknown command - ignore silently but log
         console.log(`Unknown command: ${text}`);
       } else {
-        // Plain text message - create a task for conversational continuity
+        // Plain text message - create a task for conversational continuity.
+        // No "task created" text here: a typing indicator instead, so this
+        // reads as a chat and not as filing a ticket. /task keeps the ID
+        // reply on purpose - that's the explicit, track-it-via-/status path.
+        await sendTyping(TELEGRAM_BOT_TOKEN, chatId);
         const taskId = await createTask(db, text, userId);
         await triggerWorkflow(taskId, GITHUB_TOKEN);
-        await sendMessage(TELEGRAM_BOT_TOKEN, chatId, `Задача создана с ID ${taskId}`);
+        console.log(`plain-text task created, id=${taskId}`);
       }
     } catch (err) {
       console.error(`HANDLER ERROR: ${err.message}`, err.stack);
@@ -101,6 +105,23 @@ async function sendMessage(botToken, chatId, text) {
   const body = await res.text();
   console.log(`sendMessage -> ${res.status}: ${body.slice(0, 200)}`);
   if (!res.ok) throw new Error(`telegram sendMessage ${res.status}: ${body}`);
+}
+
+// A queue-ID acknowledgement on every plain message reads as a task tracker,
+// not a chat. Telegram's native "typing" indicator gives the same "received
+// it" feedback without surfacing the queue's own bookkeeping - it fades on
+// its own in a few seconds, no follow-up call needed. Best-effort: a failure
+// here must never block the real work of queuing the task.
+async function sendTyping(botToken, chatId) {
+  try {
+    await fetch(`https://api.telegram.org/bot${botToken}/sendChatAction`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, action: 'typing' }),
+    });
+  } catch (err) {
+    console.log(`sendChatAction failed (non-fatal): ${err.message}`);
+  }
 }
 
 // --- Turso, over its documented HTTP API ---
