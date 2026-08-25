@@ -325,39 +325,73 @@ async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId) {
 
   console.log(`[${new Date().toISOString()}] Docker command: docker ${dockerArgs.join(" ")}`);
 
-  try {
-    const { stdout } = await execFile("docker", dockerArgs, {
-      timeout: CLINE_TIMEOUT_MS,
-      maxBuffer: 20 * 1024 * 1024,
-      env: {
-        ...process.env,
-        LITELLM_MASTER_KEY: litellmMasterKey,
+  // Retry logic for transient Docker exit codes 125, 126, 127, 128
+  const TRANSIENT_CODES = new Set([125, 126, 127, 128]);
+  const MAX_ATTEMPTS = 3;
+  const RETRY_DELAY_MS = 5000;
+
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const { stdout } = await execFile("docker", dockerArgs, {
+        timeout: CLINE_TIMEOUT_MS,
+        maxBuffer: 20 * 1024 * 1024,
+        env: {
+          ...process.env,
+          LITELLM_MASTER_KEY: litellmMasterKey,
+        }
+      });
+
+      const result = extractFinalAnswer(stdout);
+      if (!result) {
+        return {
+          success: false,
+          message: truncate(`агент не вернул run_result\n${stdout.replace(ANSI, "").slice(-1500)}`)
+        };
       }
-    });
 
-    const result = extractFinalAnswer(stdout);
-    if (!result) {
+      const ok = result.finishReason === "completed";
+      const body = (result.text || "(агент ничего не ответил)").trim();
+      if (attempt > 1) {
+        console.log(`[${new Date().toISOString()}] Docker succeeded on attempt ${attempt}/${MAX_ATTEMPTS}`);
+      }
       return {
-        success: false,
-        message: truncate(`агент не вернул run_result\n${stdout.replace(ANSI, "").slice(-1500)}`)
+        success: ok,
+        message: truncate(ok ? body : `${result.finishReason}: ${body}`)
       };
-    }
+    } catch (err) {
+      lastError = err;
+      const code = err.code ?? err.signal ?? "?";
+      const numericCode = typeof code === "number" ? code : parseInt(code, 10);
 
-    const ok = result.finishReason === "completed";
-    const body = (result.text || "(агент ничего не ответил)").trim();
-    return {
-      success: ok,
-      message: truncate(ok ? body : `${result.finishReason}: ${body}`)
-    };
-  } catch (err) {
-    const result = extractFinalAnswer(err.stdout || "");
-    if (result) {
-      return { success: false, message: truncate(`${result.finishReason}: ${(result.text || "").trim()}`) };
+      console.log(`[${new Date().toISOString()}] Docker attempt ${attempt}/${MAX_ATTEMPTS} failed with exit code: ${code}`);
+
+      // Check if we should retry
+      const isTransient = !isNaN(numericCode) && TRANSIENT_CODES.has(numericCode);
+      const isLastAttempt = attempt === MAX_ATTEMPTS;
+
+      if (isTransient && !isLastAttempt) {
+        console.log(`[${new Date().toISOString()}] Transient Docker error (code ${numericCode}), retrying in ${RETRY_DELAY_MS/1000}s...`);
+        await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+        continue;
+      }
+
+      // Not a transient error, or last attempt - fall through to error handling
+      break;
     }
-    const first = String(err.message || err).split("\n")[0];
-    const code = err.code ?? err.signal ?? "?";
-    return { success: false, message: truncate(`код ${code}: ${first}`) };
   }
+
+  // If we got here, all retries exhausted or non-transient error
+  const err = lastError;
+  const result = extractFinalAnswer(err.stdout || "");
+  if (result) {
+    return { success: false, message: truncate(`${result.finishReason}: ${(result.text || "").trim()}`) };
+  }
+  const first = String(err.message || err).split("\n")[0];
+  const code = err.code ?? err.signal ?? "?";
+  console.log(`[${new Date().toISOString()}] Docker failed after ${MAX_ATTEMPTS} attempt(s), final exit code: ${code}`);
+  return { success: false, message: truncate(`код ${code}: ${first}`) };
 }
 
 async function processTask(db, task, botToken, litellmMasterKey) {
