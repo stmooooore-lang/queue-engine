@@ -137,80 +137,6 @@ function markdownToTelegramHTML(text) {
   return s;
 }
 
-// Check if text contains a markdown table (|---| syntax)
-function containsMarkdownTable(text) {
-  return /|[\s]*:?-{3,}:?[\s]*|/.test(text);
-}
-
-function parseMarkdownTable(text) {
-  const lines = text.split('\n');
-  const tableLines = [];
-  let inTable = false;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
-      tableLines.push(trimmed);
-      inTable = true;
-    } else if (inTable) {
-      break;
-    }
-  }
-  if (tableLines.length < 2) return null;
-  const rows = tableLines.map(line => line.split('|').slice(1, -1).map(c => c.trim()));
-  let headerRow = 0;
-  for (let i = 0; i < rows.length; i++) {
-    if (rows[i].every(cell => /^:?-+:?$/.test(cell))) {
-      headerRow = i;
-      break;
-    }
-  }
-  const dataRows = rows.slice(headerRow + 1);
-  return { headers: rows[0], rows: dataRows, allRows: rows.filter((_, i) => i !== headerRow) };
-}
-
-function markdownToRichText(text) {
-  let s = text.replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>');
-  s = s.replace(/\*\*([^*\n]+)\*\*/g, (_, c) => JSON.stringify({ type: 'bold', text: c }));
-  s = s.replace(/(^|[^*])\*([^*\n]+)\*([^*]|$)/g, (_, b, c, a) => b + JSON.stringify({ type: 'italic', text: c }) + a);
-  s = s.replace(/`([^`\n]+)`/g, (_, c) => JSON.stringify({ type: 'code', text: c }));
-  try { return JSON.parse(s); } catch { return s; }
-}
-
-function messageToRichBlocks(text) {
-  const blocks = [];
-  const lines = text.split('\n');
-  const tableMatch = parseMarkdownTable(text);
-  if (tableMatch) {
-    const tableStartIdx = lines.findIndex(l => l.trim().startsWith('|') && l.trim().endsWith('|'));
-    const separatorIdx = lines.slice(tableStartIdx).findIndex(l => /|[\s]*:?-{3,}:?[\s]*|/.test(l));
-    const actualSeparatorIdx = tableStartIdx + separatorIdx;
-    let tableEndIdx = actualSeparatorIdx + 1;
-    while (tableEndIdx < lines.length && lines[tableEndIdx].trim().startsWith('|') && lines[tableEndIdx].trim().endsWith('|')) tableEndIdx++;
-    const beforeText = lines.slice(0, tableStartIdx).join('\n').trim();
-    if (beforeText) blocks.push({ type: 'paragraph', text: markdownToRichText(beforeText) });
-    const cells = tableMatch.allRows.map(r => r.map(c => ({ text: markdownToRichText(c), align: 'left', valign: 'middle' })));
-    blocks.push({ type: 'table', cells, is_bordered: true, is_striped: true, is_compact: false });
-    const afterText = lines.slice(tableEndIdx).join('\n').trim();
-    if (afterText) blocks.push({ type: 'paragraph', text: markdownToRichText(afterText) });
-    return blocks;
-  }
-  const paragraphs = text.split('\n\n').filter(p => p.trim());
-  for (const para of paragraphs) {
-    const trimmed = para.trim();
-    if (trimmed) blocks.push({ type: 'paragraph', text: markdownToRichText(trimmed) });
-  }
-  return blocks;
-}
-
-async function sendRichMessage(botToken, chatId, richBlocks) {
-  const url = 'https://api.telegram.org/bot' + botToken + '/sendRichMessage';
-  const body = { chat_id: chatId, rich_message: { blocks: richBlocks } };
-  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  if (!res.ok) throw new Error('telegram sendRichMessage ' + res.status + ': ' + await res.text());
-  return await res.text();
-}
-
-
 async function sendOneTelegramMessage(botToken, chatId, rawText) {
   const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
   let converted;
@@ -238,17 +164,6 @@ async function sendOneTelegramMessage(botToken, chatId, rawText) {
 }
 
 async function notifyTelegram(botToken, chatId, message) {
-  // Check if message contains markdown table - if so, use sendRichMessage
-  if (containsMarkdownTable(message)) {
-    try {
-      const richBlocks = messageToRichBlocks(message);
-      return await sendRichMessage(botToken, chatId, richBlocks);
-    } catch (err) {
-      console.log(`sendRichMessage failed, falling back to sendMessage: ${err.message}`);
-      // Fall through to regular sendMessage path
-    }
-  }
-  
   const chunks = splitForTelegram(message);
   let lastBody;
   for (let i = 0; i < chunks.length; i++) {
