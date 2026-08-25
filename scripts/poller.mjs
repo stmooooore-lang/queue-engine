@@ -29,12 +29,16 @@ const MAX_CONCURRENT = 1;
 // Cline timeout (25 minutes, same as executor.yml)
 const CLINE_TIMEOUT_MS = 25 * 60 * 1000;
 
-// Telegram message cap
-const MAX_OUTPUT = 3500;
+// Safety cap against genuinely runaway output - not the normal path anymore.
+// Real answers now go through notifyTelegram's own chunking, which splits
+// at Telegram's actual per-message limit instead of silently discarding
+// everything past a much smaller cap (found 2026-08-24: a real retro answer
+// got cut mid-sentence at 3500 chars with no way to see the rest).
+const MAX_OUTPUT = 12000;
 
 function truncate(s) {
   return s.length > MAX_OUTPUT
-    ? `${s.slice(0, MAX_OUTPUT)}\n… (обрезано)`
+    ? `${s.slice(0, MAX_OUTPUT)}\n… (обрезано, ответ был необычно длинным)`
     : s;
 }
 
@@ -91,18 +95,60 @@ async function loadSecrets() {
   return secrets;
 }
 
-async function notifyTelegram(botToken, chatId, message) {
-  const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text: message }),
-  });
-  const body = await res.text();
-  if (!res.ok) {
-    throw new Error(`telegram sendMessage ${res.status}: ${body}`);
+// Telegram's own hard limit is 4096 chars per message. A long real answer
+// (e.g. a retro) must arrive as several consecutive messages, never
+// silently cut - splitting on paragraph breaks where possible keeps each
+// chunk readable instead of severing mid-sentence.
+const TELEGRAM_CHUNK_LIMIT = 3900;
+
+function splitForTelegram(text) {
+  if (text.length <= TELEGRAM_CHUNK_LIMIT) return [text];
+  const chunks = [];
+  let rest = text;
+  while (rest.length > TELEGRAM_CHUNK_LIMIT) {
+    let cut = rest.lastIndexOf("\n\n", TELEGRAM_CHUNK_LIMIT);
+    if (cut < TELEGRAM_CHUNK_LIMIT * 0.5) cut = rest.lastIndexOf("\n", TELEGRAM_CHUNK_LIMIT);
+    if (cut < TELEGRAM_CHUNK_LIMIT * 0.5) cut = TELEGRAM_CHUNK_LIMIT;
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^\n+/, "");
   }
-  return body;
+  if (rest) chunks.push(rest);
+  return chunks;
+}
+
+async function sendOneTelegramMessage(botToken, chatId, text) {
+  const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+  // Try Markdown first for real formatting; Cline's output isn't guaranteed
+  // to be valid Telegram Markdown (unescaped _ ( ) etc. make Telegram's
+  // parser reject the whole message with 400 "can't parse entities") - fall
+  // back to plain text rather than losing the message over a formatting bug.
+  for (const parse_mode of ["Markdown", undefined]) {
+    const body = parse_mode
+      ? { chat_id: chatId, text, parse_mode }
+      : { chat_id: chatId, text };
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (res.ok) return await res.text();
+    const errBody = await res.text();
+    if (parse_mode) {
+      console.log(`sendMessage with Markdown failed (${res.status}), retrying plain: ${errBody.slice(0, 200)}`);
+      continue;
+    }
+    throw new Error(`telegram sendMessage ${res.status}: ${errBody}`);
+  }
+}
+
+async function notifyTelegram(botToken, chatId, message) {
+  const chunks = splitForTelegram(message);
+  let lastBody;
+  for (let i = 0; i < chunks.length; i++) {
+    const text = chunks.length > 1 ? `${chunks[i]}\n\n[${i + 1}/${chunks.length}]` : chunks[i];
+    lastBody = await sendOneTelegramMessage(botToken, chatId, text);
+  }
+  return lastBody;
 }
 
 async function fetchHistory(db, creatorId, currentTaskId, limit = 6) {
@@ -116,13 +162,22 @@ async function fetchHistory(db, creatorId, currentTaskId, limit = 6) {
   return res.rows;
 }
 
+// Telegram has no table syntax at all - a Markdown table renders as raw
+// pipes and dashes, unreadable. Told once here rather than left for Cline
+// to guess; *bold*/`code` do render (sendOneTelegramMessage sends with
+// parse_mode Markdown), so those stay useful.
+const TELEGRAM_FORMAT_HINT =
+  "Отвечаешь в Telegram-чат: **markdown-таблицы не рендерятся вообще** " +
+  "(пиши списком, не таблицей), простой markdown работает (*жирный*, `код`). " +
+  "Длинный ответ — это нормально, он придёт несколькими сообщениями подряд.";
+
 function buildPromptWithHistory(currentText, historyRows) {
   if (historyRows.length === 0) {
-    return currentText;
+    return `${TELEGRAM_FORMAT_HINT}\n\n${currentText}`;
   }
   // Reverse to chronological order (oldest first)
   const chronological = historyRows.reverse();
-  let prompt = "Предыдущий разговор с этим пользователем (для контекста, не для ответа на старые сообщения):\n";
+  let prompt = `${TELEGRAM_FORMAT_HINT}\n\nПредыдущий разговор с этим пользователем (для контекста, не для ответа на старые сообщения):\n`;
   for (const row of chronological) {
     const userText = row.text.slice(0, 500);
     const assistantText = (row.result || "").slice(0, 500);
