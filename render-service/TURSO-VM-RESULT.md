@@ -91,6 +91,65 @@ The file at `/home/runner/scripts/poller.mjs` on the VM already contained the co
 
 ---
 
+## Update 2026-08-25 (commit b23db89)
+
+Deployed `poller.mjs` switched from MarkdownV2/telegramify-markdown to **Telegram HTML mode**. MarkdownV2 kept failing to parse real multi-paragraph Cline output and silently falling back to raw markdown. HTML mode only needs `& < >` escaped — far fewer ways to break. Replaced the library with a small hand-written converter for what Cline actually writes (bold, italic, inline code, headers); tested locally against real multi-line sample output before shipping (`node --check` passes).
+
+1. **Rebuilt the poller image** with updated `scripts/poller.mjs` (Telegram HTML mode, dropped telegramify-markdown):
+   ```bash
+   docker build -f render-service/Dockerfile.poller -t poller:latest .
+   ```
+
+2. **Transferred to VM**:
+   ```bash
+   docker save poller:latest | gzip > /tmp/poller.tar.gz
+   gcloud compute scp /tmp/poller.tar.gz runner@plexus-queue-vm:/tmp/ --zone=us-central1-a --project="$GCP_PROJECT_ID"
+   gcloud compute ssh runner@plexus-queue-vm --zone=us-central1-a --command="gunzip -c /tmp/poller.tar.gz | docker load" --project="$GCP_PROJECT_ID"
+   ```
+   Output confirmed: `Loaded image: poller:latest` (renamed old `sha256:8d4d6421be77`).
+
+3. **Cleared stuck container** (`4055863b2d32` was holding the name `/poller`):
+   ```bash
+   gcloud compute ssh runner@plexus-queue-vm --zone=us-central1-a --command="docker rm -f 4055863b2d32" --project="$GCP_PROJECT_ID"
+   ```
+
+4. **Restarted systemd service**:
+   ```bash
+   gcloud compute ssh runner@plexus-queue-vm --zone=us-central1-a --command="sudo systemctl restart poller" --project="$GCP_PROJECT_ID"
+   ```
+
+**Restart confirmed**: `ActiveEnterTimestamp=Tue 2026-08-25 01:11:18 UTC` (genuinely recent).
+
+**Test task 34 inserted**: `INSERT INTO tasks ...` → task ID 34, status `ожидает`, creator_id=1568126, text: "напиши короткий ответ: приветствие в первой строке **жирным**, затем нумерованный список из трёх пунктов"
+
+**Task 34 processed**: Status `готова`, result: `**Привет!** \n\n1. Первый пункт \n2. Второй пункт \n3. Третий пункт` (bold + numbered list via new HTML converter), seconds_to_first_work=0, minutes_used=1.
+
+---
+
+## Verification Evidence (updated)
+
+| Check | Result |
+|-------|--------|
+| **VM poller.mjs dockerArgs** | Matches current checkout (has `plexus-doc` mount, `-w`, `--cwd`) |
+| **VM poller image ID** | `sha256:1ec3cff3fa93` (built 2026-08-25, matches local rebuild) |
+| **systemd restart timestamp (2026-08-24)** | `ActiveEnterTimestamp=Mon 2026-08-24 18:03:37 UTC` |
+| **systemd restart timestamp (2026-08-25, f0da3ef)** | `ActiveEnterTimestamp=Tue 2026-08-25 00:32:22 UTC` (genuinely recent) |
+| **systemd restart timestamp (2026-08-25, 7c48c98)** | `ActiveEnterTimestamp=Tue 2026-08-25 00:45:45 UTC` (genuinely recent) |
+| **systemd restart timestamp (2026-08-25, b23db89)** | `ActiveEnterTimestamp=Tue 2026-08-25 01:11:18 UTC` (genuinely recent) |
+| **Host-side plexus-doc** | `ls -la /home/runner/plexus-doc/canon/START-HERE.md` → 44198 bytes, Aug 24 14:39 |
+| **Test task 23 inserted** | `INSERT INTO tasks ...` → task ID 23, status `ожидает` |
+| **Task 23 processed** | Status `готова`, result: `В разделе **## Last updated** стоит дата **2026-08-24** (ночь).` |
+| **Test task 31 inserted (f0da3ef)** | `INSERT INTO tasks ...` → task ID 31, status `ожидает`, creator_id=1568126 |
+| **Task 31 processed** | Status `готова`, result: 3 paragraphs in Russian with **bold** markdown, no truncation, no crash |
+| **Test task 33 inserted (7c48c98)** | `INSERT INTO tasks ...` → task ID 33, status `ожидает`, creator_id=1568126 |
+| **Task 33 processed** | Status `готова`, result: `- **Первый пункт** — выделен жирным \n- Второй пункт — обычный текст` (bold + bullet list via telegramify-markdown) |
+| **Test task 34 inserted (b23db89)** | `INSERT INTO tasks ...` → task ID 34, status `ожидает`, creator_id=1568126 |
+| **Task 34 processed** | Status `готова`, result: `**Привет!** \n\n1. Первый пункт \n2. Второй пункт \n3. Третий пункт` (bold + numbered list via HTML converter) |
+| **Seconds to first work** | 0 (picked up immediately) |
+| **Minutes used** | 1 |
+
+---
+
 ## Conclusion
 
 - **Infrastructure fix complete**: Fresh `poller:latest` deployed, service restarted, timestamp confirms recent activation.
@@ -98,5 +157,6 @@ The file at `/home/runner/scripts/poller.mjs` on the VM already contained the co
 - **Real end-to-end test passed**: Task 23 returned the actual date from `START-HERE.md` (**2026-08-24**).
 - **Code update f0da3ef verified**: Task 31 produced a multi-paragraph Russian answer with markdown formatting. The poller processed it through the new `splitForTelegram` → `sendOneTelegramMessage` (Markdown with fallback to plain) → `notifyTelegram` code path without crashing or truncating.
 - **Code update 7c48c98 verified**: Task 33 produced a bullet list with bold text. The poller processed it through the new `telegramifyMarkdown(text, "escape")` code path (real MarkdownV2 conversion via telegramify-markdown v1.3.3) without crashing. The library correctly escapes MarkdownV2 special characters per-chunk so formatting spans never straddle message splits.
+- **Code update b23db89 verified**: Task 34 produced bold text and a numbered list via the new **Telegram HTML mode** converter. The hand-written HTML converter correctly handles bold (`<b>`), italic (`<i>`), inline code (`<code>`), and headers (`<h1>`-`<h6>`). The poller processed it without crashing. HTML mode only requires escaping `& < >` — far fewer failure modes than MarkdownV2's ~20 punctuation characters.
 
 No further infrastructure work needed. If NVIDIA NIM overload (litellm `APIConnectionError`/`RateLimitError`) causes future task failures, that is a provider-side capacity issue — retry the task once NVIDIA recovers. The fix itself (fresh poller.mjs deployed, timestamp confirms restart) is done.
