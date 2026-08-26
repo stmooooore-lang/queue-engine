@@ -165,7 +165,7 @@ jobs:
             gcloud compute ssh runner@plexus-queue-vm --zone=us-central1-a --project="$GCP_PROJECT_ID" \
             --command='git config --global credential.helper store && cat > ~/.git-credentials && chmod 600 ~/.git-credentials && echo CREDENTIAL_WRITTEN'
           gcloud compute ssh runner@plexus-queue-vm --zone=us-central1-a --project="$GCP_PROJECT_ID" \
-            --command='if [ -d /home/runner/plexus-doc/.git ]; then cd /home/runner/plexus-doc && git pull origin main; else git clone https://github.com/stmooooore-lang/plexus-doc.git /home/runner/plexus-doc; fi'
+            --command='if [ -d /home/runner/plexus-doc/.git ]; then cd /home/runner/plexus-doc && git fetch origin && git reset --hard origin/main; else git clone https://github.com/stmooooore-lang/plexus-doc.git /home/runner/plexus-doc; fi'
           echo "plexus-doc is live on the VM with a durable credential"
 
       - name: provider config, exact shape of a working one
