@@ -45,7 +45,7 @@ jobs:
         with: {node-version: '22'}
 
       - name: install cline
-        run: npm i -g cline --silent
+        run: npm i -g cline
 
       # Plain bash, no LLM - deploying the worker and clearing a stale test
       # row are both fully mechanical. Found 2026-08-24: worker/index.js
