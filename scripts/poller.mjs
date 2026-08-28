@@ -169,11 +169,21 @@ function parseMarkdownTable(text) {
 }
 
 function markdownToRichText(text) {
-  let s = text.replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>');
-  s = s.replace(/\*\*([^*\n]+)\*\*/g, (_, c) => JSON.stringify({ type: 'bold', text: c }));
-  s = s.replace(/(^|[^*])\*([^*\n]+)\*([^*]|$)/g, (_, b, c, a) => b + JSON.stringify({ type: 'italic', text: c }) + a);
-  s = s.replace(/`([^`\n]+)`/g, (_, c) => JSON.stringify({ type: 'code', text: c }));
-  try { return JSON.parse(s); } catch { return s; }
+  const tokenRe = /\*\*([^*\n]+)\*\*|`([^`\n]+)`|\*([^*\n]+)\*/g;
+  const parts = [];
+  let lastIndex = 0;
+  let m;
+  while ((m = tokenRe.exec(text)) !== null) {
+    if (m.index > lastIndex) parts.push(text.slice(lastIndex, m.index));
+    if (m[1] !== undefined) parts.push({ type: 'bold', text: m[1] });
+    else if (m[2] !== undefined) parts.push({ type: 'code', text: m[2] });
+    else parts.push({ type: 'italic', text: m[3] });
+    lastIndex = tokenRe.lastIndex;
+  }
+  if (lastIndex < text.length) parts.push(text.slice(lastIndex));
+  if (parts.length === 0) return text;
+  if (parts.length === 1 && typeof parts[0] === 'string') return parts[0];
+  return parts;
 }
 
 function messageToRichBlocks(text) {
