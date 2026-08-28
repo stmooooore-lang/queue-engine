@@ -276,10 +276,10 @@ async function fetchHistory(db, creatorId, currentTaskId, limit = 6) {
 // MarkdownV2 has no table syntax - a table is unreadable in a Telegram bot
 // message under any parse_mode, full stop. That one still needs telling.
 const TELEGRAM_FORMAT_HINT =
-  "Отвечаешь в Telegram-чат: **не используй markdown-таблицы, пиши списком** " +
-  "(таблицы там нечитаемы даже после конвертации). Простое форматирование " +
-  "(жирный, код) работает само. Длинный ответ — это нормально, " +
-  "он придёт несколькими сообщениями подряд.";
+  "Отвечаешь в Telegram-чат. Простое форматирование (жирный, курсив, код) " +
+  "работает само. Markdown-таблицы (|---|) тоже поддерживаются — " +
+  "конвертируются в нативный формат Telegram автоматически. Длинный ответ — " +
+  "это нормально, он придёт несколькими сообщениями подряд.";
 
 function buildPromptWithHistory(currentText, historyRows) {
   if (historyRows.length === 0) {
@@ -394,6 +394,18 @@ async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId) {
   return { success: false, message: truncate(`код ${code}: ${first}`) };
 }
 
+async function sendTypingAction(botToken, chatId) {
+  try {
+    await fetch(`https://api.telegram.org/bot${botToken}/sendChatAction`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, action: "typing" }),
+    });
+  } catch (err) {
+    console.log(`sendChatAction failed (non-fatal): ${err.message}`);
+  }
+}
+
 async function processTask(db, task, botToken, litellmMasterKey) {
   const taskId = task.id;
   const startTime = Date.now();
@@ -406,9 +418,17 @@ async function processTask(db, task, botToken, litellmMasterKey) {
     args: ["выполняется", `poller-${process.pid}-${Date.now()}`, taskId]
   });
 
-  // Execute work
+  // Execute work - keep typing visible for the whole duration, not just
+  // the Worker's one-shot send on receipt.
   const workStart = Date.now();
-  const result = await doWork(db, task.text, litellmMasterKey, task.creator_id, taskId);
+  await sendTypingAction(botToken, task.creator_id);
+  const typingInterval = setInterval(() => sendTypingAction(botToken, task.creator_id), 4000);
+  let result;
+  try {
+    result = await doWork(db, task.text, litellmMasterKey, task.creator_id, taskId);
+  } finally {
+    clearInterval(typingInterval);
+  }
   const workEnd = Date.now();
 
   // Update task - reuse exact same query as executor.mjs
@@ -422,7 +442,7 @@ async function processTask(db, task, botToken, litellmMasterKey) {
   });
 
   // Notify via Telegram to creator - reuse exact same logic as executor.mjs
-  await notifyTelegram(botToken, task.creator_id, `Задача ${taskId} ${status}: ${result.message}`);
+  await notifyTelegram(botToken, task.creator_id, result.message);
 
   console.log(`[${new Date().toISOString()}] Task ${taskId} completed with status: ${status}`);
 }
