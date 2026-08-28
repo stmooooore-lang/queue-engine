@@ -168,6 +168,32 @@ jobs:
             --command='if [ -d /home/runner/plexus-doc/.git ]; then cd /home/runner/plexus-doc && git fetch origin && git reset --hard origin/main; else git clone https://github.com/stmooooore-lang/plexus-doc.git /home/runner/plexus-doc; fi'
           echo "plexus-doc is live on the VM with a durable credential"
 
+      - name: restore LITELLM_MASTER_KEY on the VM poller, mechanically
+        # 2026-08-28: a manual VM fix session overwrote /run/secrets/poller.env
+        # wholesale (single-line `echo ... > file` while fixing the Telegram
+        # bot token), silently wiping TURSO_DATABASE_URL, TURSO_AUTH_TOKEN and
+        # LITELLM_MASTER_KEY - poller crash-looped on "Missing required
+        # secret: TURSO_DATABASE_URL" for a while before anyone noticed,
+        # because poller.service isn't monitored. TURSO_*/TELEGRAM_BOT_TOKEN
+        # are the founder's own to restore (he knows where they're kept);
+        # LITELLM_MASTER_KEY was only ever set up from this side, so this
+        # step upserts just that one line - plain bash, reusing the SSH
+        # session the credential step above already established, secret
+        # piped straight to a remote temp file and never appears in a
+        # --command string, a log line, or Cline's own env/output.
+        if: always()
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          LITELLM_MASTER_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$LITELLM_MASTER_KEY" | \
+            gcloud compute ssh runner@plexus-queue-vm --zone=us-central1-a --project="$GCP_PROJECT_ID" \
+            --command='cat > /tmp/litellm_master_key.txt'
+          gcloud compute ssh runner@plexus-queue-vm --zone=us-central1-a --project="$GCP_PROJECT_ID" \
+            --command='sudo bash -c "test -f /run/secrets/poller.env && grep -v \"^LITELLM_MASTER_KEY=\" /run/secrets/poller.env > /tmp/poller.env.tmp || true; echo \"LITELLM_MASTER_KEY=\$(cat /tmp/litellm_master_key.txt)\" >> /tmp/poller.env.tmp; mv /tmp/poller.env.tmp /run/secrets/poller.env; chmod 600 /run/secrets/poller.env; chown runner:runner /run/secrets/poller.env; rm -f /tmp/litellm_master_key.txt; echo LITELLM_MASTER_KEY_RESTORED"'
+          echo "LITELLM_MASTER_KEY upserted into /run/secrets/poller.env on the VM (value never logged)"
+
       - name: provider config, exact shape of a working one
         run: |
           mkdir -p ~/.cline/data/settings
