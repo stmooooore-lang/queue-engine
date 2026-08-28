@@ -18,7 +18,7 @@
 
 export default {
   async fetch(request, env) {
-    const { TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, GITHUB_TOKEN } = env;
+    const { TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID } = env;
 
     if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
 
@@ -45,7 +45,6 @@ export default {
       `env check: TELEGRAM_BOT_TOKEN len=${(TELEGRAM_BOT_TOKEN || '').length} ` +
       `TURSO_DATABASE_URL len=${(TURSO_DATABASE_URL || '').length} ` +
       `TURSO_AUTH_TOKEN len=${(TURSO_AUTH_TOKEN || '').length} ` +
-      `GITHUB_TOKEN len=${(GITHUB_TOKEN || '').length} ` +
       `ALLOWED_USER_ID len=${(TELEGRAM_ALLOWED_USER_ID || '').length} ` +
       `incoming userId=${userId} chatId=${chatId}`,
     );
@@ -63,7 +62,6 @@ export default {
       if (text.startsWith('/task ')) {
         const taskText = text.slice(6).trim();
         const taskId = await createTask(db, taskText, userId);
-        await triggerWorkflow(taskId, GITHUB_TOKEN);
         await sendMessage(TELEGRAM_BOT_TOKEN, chatId, `Задача создана с ID ${taskId}`);
       } else if (text === '/status') {
         const tasks = await getLastFiveTasks(db);
@@ -80,7 +78,6 @@ export default {
         // reply on purpose - that's the explicit, track-it-via-/status path.
         await sendTyping(TELEGRAM_BOT_TOKEN, chatId);
         const taskId = await createTask(db, text, userId);
-        await triggerWorkflow(taskId, GITHUB_TOKEN);
         console.log(`plain-text task created, id=${taskId}`);
       }
     } catch (err) {
@@ -175,20 +172,6 @@ async function getCurrentTask(db, userId) {
 
 async function addDialogMessage(db, taskId, message) {
   await execute(db, 'INSERT INTO dialog_messages (task_id, message_text) VALUES (?, ?)', [taskId, message]);
-}
-
-// --- GitHub, plain REST ---
-
-async function triggerWorkflow(taskId, githubToken) {
-  const res = await fetch(
-    'https://api.github.com/repos/stmooooore-lang/queue-engine/actions/workflows/executor.yml/dispatches',
-    {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${githubToken}`, Accept: 'application/vnd.github+json', 'User-Agent': 'plexus-queue-worker' },
-      body: JSON.stringify({ ref: 'main', inputs: { taskId: String(taskId) } }),
-    },
-  );
-  if (!res.ok) throw new Error(`github dispatch ${res.status}: ${await res.text()}`);
 }
 
 function formatTasks(tasks) {

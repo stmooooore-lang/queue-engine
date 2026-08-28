@@ -8,7 +8,6 @@
 | `TURSO_AUTH_TOKEN` | Database auth token | `npx wrangler secret put TURSO_AUTH_TOKEN` |
 | `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather | `npx wrangler secret put TELEGRAM_BOT_TOKEN` |
 | `TELEGRAM_ALLOWED_USER_ID` | Your Telegram user ID (numeric) | `npx wrangler secret put TELEGRAM_ALLOWED_USER_ID` |
-| `GITHUB_TOKEN` | GitHub PAT with `workflow` scope | `npx wrangler secret put GITHUB_TOKEN` |
 
 ## Deploy Worker
 
