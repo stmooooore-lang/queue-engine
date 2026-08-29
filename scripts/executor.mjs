@@ -12,10 +12,7 @@
  */
 
 import { createClient } from "@libsql/client";
-import { execFile as execFileCb } from "node:child_process";
-import { promisify } from "node:util";
-
-const execFile = promisify(execFileCb);
+import { spawn } from "node:child_process";
 
 const client = createClient({ url: process.env.TURSO_DATABASE_URL, authToken: process.env.TURSO_AUTH_TOKEN });
 
@@ -67,6 +64,85 @@ function truncate(s) {
 // eslint-disable-next-line no-control-regex
 const ANSI = /\x1b\[[0-9;]*m/g;
 
+// 2026-08-29: same fix as scripts/poller.mjs (docs/DECISIONS.md, SIGPIPE
+// incident) - execFile with maxBuffer:20MB buffers cline's entire stdout in
+// memory and kills the child the instant that total crosses the limit, mid-
+// task. Only the last run_result-typed line is ever needed; this collector
+// picks it out incrementally instead of holding everything in memory, so a
+// large task has no fixed ceiling - only the timeout bounds it.
+function makeStreamingCollector(tailMaxChars = 2000) {
+  let carry = "";
+  let lastResult = null;
+  let tail = "";
+  function consumeLine(line) {
+    const t = line.trim();
+    if (!t) return;
+    try {
+      const d = JSON.parse(t);
+      if (d.type === "run_result") lastResult = d;
+    } catch {
+      // non-JSON line (a warning, etc.) - skip
+    }
+  }
+  function push(chunk) {
+    tail = (tail + chunk).slice(-tailMaxChars);
+    carry += chunk;
+    const lines = carry.split("\n");
+    carry = lines.pop() ?? "";
+    for (const line of lines) consumeLine(line);
+  }
+  function finalize() {
+    if (carry) consumeLine(carry);
+    return { lastResult, tail };
+  }
+  return { push, finalize };
+}
+
+function runClineStreaming(args, { timeout }) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("cline", args);
+    const collector = makeStreamingCollector();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeout);
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => collector.push(chunk));
+    // draining stderr prevents the child from blocking on a full pipe -
+    // the same class of bug (a full, unread pipe) that produced the SIGPIPE.
+    child.stderr.resume();
+
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      const { lastResult, tail } = collector.finalize();
+      err.lastResult = lastResult;
+      err.outputTail = tail;
+      reject(err);
+    });
+
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      const { lastResult, tail } = collector.finalize();
+      if (code === 0 && !signal) {
+        resolve({ lastResult, tail });
+        return;
+      }
+      const err = new Error(
+        timedOut
+          ? `cline killed after ${timeout}ms timeout`
+          : `cline exited with code ${code}${signal ? `, signal ${signal}` : ""}`
+      );
+      err.code = code;
+      err.signal = signal;
+      err.lastResult = lastResult;
+      err.outputTail = tail;
+      reject(err);
+    });
+  });
+}
+
 /**
  * The task text becomes one Cline turn against plexus/ - not a shell command.
  * A task typed into the phone is meant to work like a task typed into
@@ -83,38 +159,20 @@ const ANSI = /\x1b\[[0-9;]*m/g;
 // Telegram message: measured on 2026-08-23, a plain-text run sent the whole
 // transcript - [thinking], tool calls, everything - which is unreadable in a
 // chat.
-function extractFinalAnswer(jsonLines) {
-  let last = null;
-  for (const line of jsonLines.split("\n")) {
-    const t = line.trim();
-    if (!t) continue;
-    try {
-      const d = JSON.parse(t);
-      if (d.type === "run_result") last = d;
-    } catch {
-      // a non-JSON line (a warning printed to stdout, e.g. the Node/CA one
-      // seen on 2026-08-23) - not the channel we read from, skip it
-    }
-  }
-  return last;
-}
-
 async function doWork(text) {
   try {
-    const { stdout } = await execFile(
-      "cline",
+    const { lastResult: result, tail } = await runClineStreaming(
       ["--cwd", WORKDIR, "-P", "openai-compatible", "-m", "plexus-act", "--compaction", "off", "--retries", "3", "--json", text],
-      { timeout: 25 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 },
+      { timeout: 25 * 60 * 1000 },
     );
-    const result = extractFinalAnswer(stdout);
     if (!result) {
-      return { success: false, message: truncate(`агент не вернул run_result\n${stdout.replace(ANSI, "").slice(-1500)}`) };
+      return { success: false, message: truncate(`агент не вернул run_result\n${tail.replace(ANSI, "").slice(-1500)}`) };
     }
     const ok = result.finishReason === "completed";
     const body = (result.text || "(агент ничего не ответил)").trim();
     return { success: ok, message: truncate(ok ? body : `${result.finishReason}: ${body}`) };
   } catch (err) {
-    const result = extractFinalAnswer(err.stdout || "");
+    const result = err.lastResult;
     if (result) return { success: false, message: truncate(`${result.finishReason}: ${(result.text || "").trim()}`) };
     const first = String(err.message || err).split("\n")[0];
     const code = err.code ?? err.signal ?? "?";
