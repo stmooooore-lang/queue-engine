@@ -14,12 +14,9 @@
  */
 
 import { createClient } from "@libsql/client";
-import { execFile as execFileCb } from "node:child_process";
+import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
-import { promisify } from "node:util";
 import { ensureTasksFile } from "./init-tasks-md.mjs";
-
-const execFile = promisify(execFileCb);
 
 // Poll interval in milliseconds (10 seconds)
 const POLL_INTERVAL_MS = 10000;
