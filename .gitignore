@@ -5,3 +5,7 @@ render-service/server.log
 .cline/
 __pycache__/
 *.pyc
+
+llmkey.txt
+project-*.json
+.DS_Store
