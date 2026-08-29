@@ -29,9 +29,129 @@ Edit CORE_RULES below, then:
     launchctl kickstart -k gui/$(id -u)/com.litellm.proxy
 """
 
+import os
 import re
 
 from litellm.integrations.custom_logger import CustomLogger
+
+# ---------------------------------------------------------------------------
+# GEMINI-FAMILY HISTORY SANITIZATION -- 2026-08-29
+#
+# WHY THIS EXISTS. litellm's proxy-level pre_call_hook fires ONCE per
+# incoming HTTP request, before the router's own internal fallback loop --
+# verified by reading litellm.proxy.utils.ProxyLogging.pre_call_hook
+# directly (its own docstring: "Allows users to modify/reject the incoming
+# request to the proxy... Covers: 1. /chat/completions"). So this hook only
+# ever sees the CLIENT-REQUESTED ALIAS ("plexus-act"), never which specific
+# deployment a fallback attempt resolves to. The fix below therefore cannot
+# be conditional on "this particular attempt is going to Gemini" -- it runs
+# unconditionally for any alias that COULD end up on a Gemini-family
+# deployment, whether by cross-group fallback (router_settings.fallbacks) or
+# by usage-based-routing spreading load across deployments inside the SAME
+# alias (e.g. plexus-judge: nvidia_nim + vertex_ai in one model_name).
+#
+# WHAT BREAKS WITHOUT THIS. Gemini's API requires a thought_signature on
+# every prior function-call turn in history. litellm only forwards one if it
+# already exists on the message -- it never fabricates one. When NVIDIA (or
+# any non-Gemini provider) has already served a turn including a tool call,
+# and the SAME conversation later lands on a Gemini-family deployment
+# (fallback, or load-balanced within one alias), the inherited turn has no
+# signature and Gemini's API rejects the whole request with a 400. Measured
+# five times on 2026-08-29 against plexus-act's gemini-lite fallback before
+# it was reverted (docs/DECISIONS.md in Continue MODELS integration has the
+# full account).
+#
+# WHY THE FILE IS READ AT IMPORT TIME, NOT HARDCODED. A hardcoded alias list
+# goes stale the moment a fallback chain changes and nobody remembers there
+# was a second copy of the same fact to update. This reads whichever config
+# file sits next to THIS file on disk -- config.yaml locally, cloud-
+# config.yaml (or its render-service copy) in queue-engine -- because every
+# deployment of this hook ships in the same directory as the config it
+# describes.
+def _load_gemini_family_aliases() -> set:
+    try:
+        import yaml
+    except Exception:
+        return set()
+    here = os.path.dirname(os.path.abspath(__file__))
+    for fname in ("config.yaml", "cloud-config.yaml"):
+        path = os.path.join(here, fname)
+        if os.path.isfile(path):
+            break
+    else:
+        return set()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh)
+    except Exception:
+        return set()
+    if not isinstance(cfg, dict):
+        return set()
+
+    def _is_gemini_family(deploy: dict) -> bool:
+        model = str((deploy.get("litellm_params") or {}).get("model") or "")
+        return model.startswith("gemini/") or model.startswith("vertex_ai/")
+
+    model_list = cfg.get("model_list") or []
+    gemini_group_names = set()
+    alias_has_gemini_deploy = set()
+    for entry in model_list:
+        name = entry.get("model_name")
+        if not name:
+            continue
+        if _is_gemini_family(entry):
+            gemini_group_names.add(name)
+            alias_has_gemini_deploy.add(name)
+
+    fallbacks = ((cfg.get("router_settings") or {}).get("fallbacks")) or []
+    alias_falls_back_to_gemini = set()
+    for chain_entry in fallbacks:
+        if not isinstance(chain_entry, dict):
+            continue
+        for alias, targets in chain_entry.items():
+            if any(t in gemini_group_names for t in (targets or [])):
+                alias_falls_back_to_gemini.add(alias)
+
+    return alias_has_gemini_deploy | alias_falls_back_to_gemini
+
+
+_GEMINI_RISK_ALIASES = _load_gemini_family_aliases()
+
+
+def _sanitize_foreign_tool_calls(messages: list) -> bool:
+    """Replace a historical assistant tool-call with a plain-text stand-in
+    when it carries no Gemini-style signature -- i.e. it was produced by a
+    different model. Surgical: a plain message with no tool call is left
+    exactly as it is. Returns True if anything was changed."""
+    changed = False
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        tool_calls = m.get("tool_calls")
+        if not tool_calls:
+            continue
+        provider_specific = m.get("provider_specific_fields")
+        has_signature = bool(
+            isinstance(provider_specific, dict)
+            and provider_specific.get("thought_signatures")
+        )
+        if has_signature:
+            continue
+        names = []
+        for tc in tool_calls:
+            fn = (tc or {}).get("function") or {}
+            if fn.get("name"):
+                names.append(fn["name"])
+        stand_in = (
+            "[Tool call(s) {} were made earlier in this conversation by a "
+            "different model; result omitted here, see conversation "
+            "history.]"
+        ).format(", ".join(names) or "unnamed")
+        m["tool_calls"] = None
+        existing_text = m.get("content") or ""
+        m["content"] = (existing_text + "\n" + stand_in).strip()
+        changed = True
+    return changed
 
 # Marker so a retry or a re-entrant call cannot append the block twice.
 MARKER = "[proxy-enforced: facts only]"
@@ -673,6 +793,14 @@ class PlexusRuleInjector(CustomLogger):
                 if isinstance(_m, dict) and "reasoning_content" in _m:
                     _m.pop("reasoning_content", None)
                     _note("STRIPPED reasoning_content from history")
+
+            # Same class of problem as reasoning_content above: a provider-
+            # specific history requirement that a DIFFERENT provider's turn
+            # cannot satisfy. See the block comment near the top of this file
+            # ("GEMINI-FAMILY HISTORY SANITIZATION") for the full mechanism.
+            if str(data.get("model") or "") in _GEMINI_RISK_ALIASES:
+                if _sanitize_foreign_tool_calls(messages):
+                    _note(f"SANITIZED foreign tool-call history for {data.get('model')}")
 
             # Environment-side corrections run first and independently of the
             # rule injection: they must still fire on a request that already
