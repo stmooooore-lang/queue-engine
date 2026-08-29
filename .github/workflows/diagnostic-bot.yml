@@ -49,3 +49,21 @@ jobs:
           cd "$GITHUB_WORKSPACE/worker" 2>/dev/null || { echo "no worker/ dir at repo root - skipping"; exit 0; }
           npm i -g wrangler@latest --silent
           wrangler deployments list 2>&1 | tail -30 || echo "wrangler deployments list failed - see output above"
+
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: Turso - most recent task, whatever its age
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          npm install --no-save @libsql/client --silent
+          node -e '
+            const { createClient } = require("@libsql/client");
+            const db = createClient({ url: process.env.TURSO_DATABASE_URL, authToken: process.env.TURSO_AUTH_TOKEN });
+            db.execute({ sql: "SELECT id, status, created_at, creator_id, lane FROM tasks ORDER BY created_at DESC LIMIT 5", args: [] })
+              .then(r => { console.log("server UTC now:", new Date().toISOString()); console.log(JSON.stringify(r.rows, null, 2)); })
+              .catch(e => { console.error("query failed:", e.message); process.exit(1); });
+          '
