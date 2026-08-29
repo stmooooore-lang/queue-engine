@@ -130,8 +130,13 @@ router_settings:
     - plexus-cheap
   - plexus-judge:
     - plexus-architect
+  # plexus-gemini-lite removed from this chain 2026-08-29: a real
+  # conversation that starts on NVIDIA and fails over to gemini-lite
+  # mid-conversation crashes with "Function call is missing a
+  # thought_signature" the instant Gemini is handed a tool-call turn NVIDIA
+  # produced. See docs/DECISIONS.md in Continue MODELS integration for the
+  # root cause and what a real fix needs.
   - plexus-act:
-    - plexus-gemini-lite
     - plexus-coder
     - plexus-cheap
   - plexus-plan:
