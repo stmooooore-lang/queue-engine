@@ -130,15 +130,21 @@ router_settings:
     - plexus-cheap
   - plexus-judge:
     - plexus-architect
-  # plexus-gemini-lite removed from this chain 2026-08-29: a real
-  # conversation that starts on NVIDIA and fails over to gemini-lite
-  # mid-conversation crashes with "Function call is missing a
-  # thought_signature" the instant Gemini is handed a tool-call turn NVIDIA
-  # produced. See docs/DECISIONS.md in Continue MODELS integration for the
-  # root cause and what a real fix needs.
+  # plexus-gemini-lite restored 2026-08-29 after plexus_hooks.py's history
+  # sanitizer landed (strips foreign tool-call turns before a Gemini-family
+  # deployment, see docs/DECISIONS.md). Removing it earlier the same day
+  # left plexus-act with only Groq (8000 tpm across two thin tiers) as real
+  # fallback capacity, and it ran out in production the same day: NVIDIA
+  # overloaded, coder exhausted, cheap exhausted, no fallback left for cheap
+  # at all -- total failure to a real user. The sanitizer makes gemini-lite
+  # safe again; the plexus-cheap fallback below is the other half of that
+  # same incident's fix.
   - plexus-act:
+    - plexus-gemini-lite
     - plexus-coder
     - plexus-cheap
+  - plexus-cheap:
+    - plexus-gemini-lite
   - plexus-plan:
     - plexus-architect
 
