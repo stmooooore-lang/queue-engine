@@ -9,9 +9,11 @@ FROM node:20-slim
 WORKDIR /app
 
 # Install docker CLI (to spawn plexus-render:latest containers from within)
+# Also install git for init-tasks-md.mjs's git pull at startup
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    git \
     gnupg \
     lsb-release \
     && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg \
@@ -25,8 +27,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # more predictable on real multi-paragraph Cline output).
 RUN npm install @libsql/client@0.14.0 --omit=dev
 
-# Copy poller script
+# Allow git to operate on the plexus-doc directory (system-level, survives HOME mount)
+RUN git config --system --add safe.directory /home/runner/plexus-doc
+
+# Copy poller scripts
 COPY scripts/poller.mjs /app/poller.mjs
+COPY scripts/init-tasks-md.mjs /app/init-tasks-md.mjs
 
 # Entry point
 ENTRYPOINT ["node", "poller.mjs"]
