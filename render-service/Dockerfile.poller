@@ -28,11 +28,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN npm install @libsql/client@0.14.0 --omit=dev
 
 # Allow git to operate on the plexus-doc directory (system-level, survives HOME mount)
-RUN git config --system --add safe.directory /home/runner/plexus-doc
+# and give it a commit identity - init-tasks-md.mjs commits as this container,
+# not as a human, and git refuses to commit with no identity configured at all.
+RUN git config --system --add safe.directory /home/runner/plexus-doc && \
+    git config --system user.email "poller@queue-engine" && \
+    git config --system user.name "queue-engine poller"
 
 # Copy poller scripts
 COPY scripts/poller.mjs /app/poller.mjs
 COPY scripts/init-tasks-md.mjs /app/init-tasks-md.mjs
+# LANE_CONFIG in poller.mjs reads these by relative path ("./prompts/<lane>.md")
+# from the process cwd, which is WORKDIR /app - missing this COPY crashed the
+# whole poll loop (not just one task) on the first message routed through the
+# lane-routing patch (STACK-04, commit 577cf00) with ENOENT, because nobody
+# rebuilt the image between that commit landing and a real message arriving.
+COPY scripts/prompts /app/prompts
 
 # Entry point
 ENTRYPOINT ["node", "poller.mjs"]
