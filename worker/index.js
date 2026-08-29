@@ -153,7 +153,7 @@ function rowsAsObjects(result) {
 }
 
 async function createTask(db, text, creatorId) {
-  const result = await execute(db, 'INSERT INTO tasks (text, status, creator_id) VALUES (?, ?, ?)', [text, 'ожидает', creatorId]);
+  const result = await execute(db, 'INSERT INTO tasks (text, status, creator_id, lane) VALUES (?, ?, ?, ?)', [text, 'ожидает', creatorId, 'architect']);
   return result.last_insert_rowid;
 }
 

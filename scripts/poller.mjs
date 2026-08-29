@@ -17,6 +17,7 @@ import { createClient } from "@libsql/client";
 import { execFile as execFileCb } from "node:child_process";
 import { promises as fs } from "node:fs";
 import { promisify } from "node:util";
+import { ensureTasksFile } from "./init-tasks-md.mjs";
 
 const execFile = promisify(execFileCb);
 
@@ -28,6 +29,19 @@ const MAX_CONCURRENT = 1;
 
 // Cline timeout (25 minutes, same as executor.yml)
 const CLINE_TIMEOUT_MS = 25 * 60 * 1000;
+
+// Lane → { model, promptFile }
+const LANE_CONFIG = {
+  architect: { model: "plexus-act", promptFile: "./prompts/architect.md" },
+  coder: { model: "plexus-coder", promptFile: "./prompts/coder.md" },
+  qa: { model: "plexus-judge", promptFile: "./prompts/qa.md" },
+};
+
+async function loadRolePrompt(lane) {
+  const cfg = LANE_CONFIG[lane] || LANE_CONFIG.architect;
+  const promptText = await fs.readFile(cfg.promptFile, "utf8");
+  return { model: cfg.model, systemPrompt: promptText };
+}
 
 // Safety cap against genuinely runaway output - not the normal path anymore.
 // Real answers now go through notifyTelegram's own chunking, which splits
@@ -268,13 +282,13 @@ async function notifyTelegram(botToken, chatId, message) {
   return lastBody;
 }
 
-async function fetchHistory(db, creatorId, currentTaskId, limit = 6) {
-  // Fetch last N completed/failed tasks for this creator_id, excluding current task
+export async function fetchHistory(db, creatorId, currentTaskId, lane, limit = 6) {
+  // Fetch last N completed/failed tasks for this creator_id AND lane, excluding current task
   const res = await db.execute({
     sql: `SELECT text, result FROM tasks 
-          WHERE creator_id = ? AND status IN (?, ?) AND id != ? 
+          WHERE creator_id = ? AND lane = ? AND status IN (?, ?) AND id != ? 
           ORDER BY created_at DESC LIMIT ?`,
-    args: [creatorId, "готова", "провал", currentTaskId, limit]
+    args: [creatorId, lane, "готова", "провал", currentTaskId, limit]
   });
   return res.rows;
 }
@@ -307,10 +321,13 @@ function buildPromptWithHistory(currentText, historyRows) {
   return prompt;
 }
 
-async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId) {
-  // Fetch history from Turso and build combined prompt
-  const historyRows = await fetchHistory(db, creatorId, currentTaskId, 6);
-  const combinedPrompt = buildPromptWithHistory(text, historyRows);
+async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane) {
+  // Load role-specific prompt and model for this lane
+  const { model, systemPrompt } = await loadRolePrompt(lane);
+  
+  // Fetch history from Turso (filtered by lane) and build combined prompt
+  const historyRows = await fetchHistory(db, creatorId, currentTaskId, lane, 6);
+  const combinedPrompt = `${systemPrompt}\n\n${buildPromptWithHistory(text, historyRows)}`;
 
   // Run Cline inside the prebuilt plexus-render:latest Docker image.
   // The image already has Cline, Node, and the providers.json pointing to
@@ -326,7 +343,7 @@ async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId) {
     "--data-dir", "/home/runner/.cline/data",
     "--cwd", "/home/runner/plexus-doc",
     "-P", "openai-compatible",
-    "-m", "plexus-act",
+    "-m", model,
     "--compaction", "off",
     "--retries", "3",
     "--json",
@@ -419,8 +436,9 @@ async function sendTypingAction(botToken, chatId) {
 async function processTask(db, task, botToken, litellmMasterKey) {
   const taskId = task.id;
   const startTime = Date.now();
+  const lane = task.lane || 'architect';
 
-  console.log(`[${new Date().toISOString()}] Processing task ${taskId}: ${task.text.slice(0, 80)}`);
+  console.log(`[${new Date().toISOString()}] Processing task ${taskId}: ${task.text.slice(0, 80)} [lane: ${lane}]`);
 
   // Mark as running - reuse exact same query as executor.mjs
   await db.execute({
@@ -435,7 +453,7 @@ async function processTask(db, task, botToken, litellmMasterKey) {
   const typingInterval = setInterval(() => sendTypingAction(botToken, task.creator_id), 4000);
   let result;
   try {
-    result = await doWork(db, task.text, litellmMasterKey, task.creator_id, taskId);
+    result = await doWork(db, task.text, litellmMasterKey, task.creator_id, taskId, lane);
   } finally {
     clearInterval(typingInterval);
   }
@@ -487,6 +505,8 @@ async function pollLoop(db, botToken, litellmMasterKey) {
 
 async function main() {
   console.log(`[${new Date().toISOString()}] Starting VM poller...`);
+
+  await ensureTasksFile();
 
   const secrets = await loadSecrets();
   console.log(`[${new Date().toISOString()}] Secrets loaded`);
