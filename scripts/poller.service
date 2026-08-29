@@ -12,6 +12,8 @@ WorkingDirectory=/home/runner
 ExecStart=/usr/bin/docker run --rm --name poller \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /run/secrets:/run/secrets:ro \
+  -v /home/runner/.gitconfig:/root/.gitconfig:ro \
+  -v /home/runner/.git-credentials:/root/.git-credentials:ro \
   -v /home/runner/.cline:/home/runner/.cline \
   -v /home/runner/plexus-doc:/home/runner/plexus-doc \
   --env-file /run/secrets/poller.env \
