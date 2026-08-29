@@ -109,7 +109,7 @@ const POLL_INTERVAL_MS = 10000;
 const MAX_CONCURRENT = 1;
 
 // Cline timeout (25 minutes, same as executor.yml)
-const CLINE_TIMEOUT_MS = 50 * 60 * 1000;
+const CLINE_TIMEOUT_MS = 120 * 60 * 1000;
 
 // Lane → { model, promptFile }
 const LANE_CONFIG = {

@@ -163,7 +163,7 @@ async function doWork(text) {
   try {
     const { lastResult: result, tail } = await runClineStreaming(
       ["--cwd", WORKDIR, "-P", "openai-compatible", "-m", "plexus-act", "--compaction", "off", "--retries", "3", "--json", text],
-      { timeout: 50 * 60 * 1000 },
+      { timeout: 120 * 60 * 1000 },
     );
     if (!result) {
       return { success: false, message: truncate(`агент не вернул run_result\n${tail.replace(ANSI, "").slice(-1500)}`) };
