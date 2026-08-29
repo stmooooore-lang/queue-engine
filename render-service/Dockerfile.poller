@@ -8,16 +8,20 @@ FROM node:20-slim
 
 WORKDIR /app
 
-# Install docker CLI (to spawn plexus-render:latest containers from within)
+# Install docker CLI (to spawn plexus-render:latest containers from within) and git (for init-tasks-md.mjs)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    git \
     gnupg \
     lsb-release \
     && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list \
     && apt-get update && apt-get install -y --no-install-recommends docker-ce-cli \
     && rm -rf /var/lib/apt/lists/*
+
+# Allow git to operate on /home/runner/plexus-doc (mounted from VM host with different UID)
+RUN git config --global --add safe.directory /home/runner/plexus-doc
 
 # @libsql/client: native module, node:20-slim has the build toolchain.
 # No markdown library needed - poller.mjs converts to Telegram HTML with a
@@ -27,6 +31,7 @@ RUN npm install @libsql/client@0.14.0 --omit=dev
 
 # Copy poller script
 COPY scripts/poller.mjs /app/poller.mjs
+COPY scripts/init-tasks-md.mjs /app/init-tasks-md.mjs
 
 # Entry point
 ENTRYPOINT ["node", "poller.mjs"]
