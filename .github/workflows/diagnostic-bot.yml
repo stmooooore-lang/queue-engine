@@ -53,7 +53,16 @@ jobs:
       - uses: actions/setup-node@v4
         with: {node-version: '22'}
 
-      - name: Turso - most recent task, whatever its age
+      - name: Turso - add the missing lane column, additive only
+        # Root cause found 2026-08-29: worker/index.js has inserted
+        # INSERT INTO tasks (..., lane) since STACK-04/05 landed on main,
+        # but migrate-add-lane.sql (the STACK-04 patch's own migration) was
+        # only ever a file - never run against the real database. Every
+        # message since the worker's next redeploy after that merge has
+        # been failing to insert at all ("no such column: lane") - this is
+        # the actual cause of "zero reaction". ADD COLUMN with a DEFAULT is
+        # additive and safe; it does not touch existing rows' other columns.
+        # Owner's explicit confirmation given before this ran.
         env:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
@@ -63,7 +72,20 @@ jobs:
           node -e '
             const { createClient } = require("@libsql/client");
             const db = createClient({ url: process.env.TURSO_DATABASE_URL, authToken: process.env.TURSO_AUTH_TOKEN });
-            db.execute({ sql: "SELECT id, status, created_at, creator_id, lane FROM tasks ORDER BY created_at DESC LIMIT 5", args: [] })
-              .then(r => { console.log("server UTC now:", new Date().toISOString()); console.log(JSON.stringify(r.rows, null, 2)); })
-              .catch(e => { console.error("query failed:", e.message); process.exit(1); });
+            (async () => {
+              const cols = await db.execute({ sql: "PRAGMA table_info(tasks)", args: [] });
+              const hasLane = cols.rows.some(r => r.name === "lane");
+              console.log("lane column present before migration:", hasLane);
+              if (!hasLane) {
+                await db.execute({ sql: "ALTER TABLE tasks ADD COLUMN lane TEXT NOT NULL DEFAULT \x27architect\x27", args: [] });
+                console.log("migration applied: lane column added");
+              } else {
+                console.log("nothing to do, column already exists");
+              }
+              const after = await db.execute({ sql: "PRAGMA table_info(tasks)", args: [] });
+              console.log("columns now:", after.rows.map(r => r.name).join(", "));
+              const recent = await db.execute({ sql: "SELECT id, status, created_at, lane FROM tasks ORDER BY created_at DESC LIMIT 5", args: [] });
+              console.log("server UTC now:", new Date().toISOString());
+              console.log(JSON.stringify(recent.rows, null, 2));
+            })().catch(e => { console.error("migration/query failed:", e.message); process.exit(1); });
           '
