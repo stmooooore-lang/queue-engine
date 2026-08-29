@@ -55,7 +55,7 @@ async function run() {
 const WORKDIR = "plexus";
 
 // Telegram caps a message at 4096 characters; keep well under it.
-const MAX_OUTPUT = 3500;
+const MAX_OUTPUT = 60000;
 
 function truncate(s) {
   return s.length > MAX_OUTPUT ? `${s.slice(0, MAX_OUTPUT)}\n… (обрезано)` : s;

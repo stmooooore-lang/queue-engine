@@ -129,7 +129,7 @@ async function loadRolePrompt(lane) {
 // at Telegram's actual per-message limit instead of silently discarding
 // everything past a much smaller cap (found 2026-08-24: a real retro answer
 // got cut mid-sentence at 3500 chars with no way to see the rest).
-const MAX_OUTPUT = 12000;
+const MAX_OUTPUT = 60000;
 
 function truncate(s) {
   return s.length > MAX_OUTPUT
