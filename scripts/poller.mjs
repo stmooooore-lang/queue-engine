@@ -515,6 +515,56 @@ async function sendTypingAction(botToken, chatId) {
   }
 }
 
+// Self-queuing hand-off, Architect lane only. Cline never receives Turso
+// credentials directly - the same lesson already learned the hard way with
+// a repo-push token (queue-engine-cloud-hosting-pattern.md pitfall #13): a
+// secret placed in an LLM's own environment leaks through routine commands
+// like `env`, no matter how firmly the prompt says not to run them. Instead
+// Architect writes plain-text requests to a file in the mount it already
+// shares with the poller (/home/runner/.cline, present in both
+// poller.service and the plexus-render container's own -v flags - no new
+// mount needed) and this trusted, non-LLM code does the actual INSERT.
+const QUEUE_REQUEST_PATH = "/home/runner/.cline/queue-request.jsonl";
+const VALID_LANES = new Set(["architect", "coder", "qa"]);
+
+async function processQueueRequests(db, creatorId, lane) {
+  if (lane !== "architect") return; // only the Architect role promotes work
+  let raw;
+  try {
+    raw = await fs.readFile(QUEUE_REQUEST_PATH, "utf8");
+  } catch {
+    return; // no requests this run - the common case
+  }
+  // Delete first: a malformed or half-written file must not be retried
+  // forever on every future Architect turn.
+  await fs.unlink(QUEUE_REQUEST_PATH).catch(() => {});
+
+  let queued = 0;
+  for (const line of raw.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    let req;
+    try {
+      req = JSON.parse(t);
+    } catch {
+      console.log(`[${new Date().toISOString()}] queue-request: skipped invalid JSON line: ${t.slice(0, 200)}`);
+      continue;
+    }
+    if (!VALID_LANES.has(req.lane) || typeof req.text !== "string" || !req.text.trim()) {
+      console.log(`[${new Date().toISOString()}] queue-request: skipped invalid entry (lane=${req.lane}): ${t.slice(0, 200)}`);
+      continue;
+    }
+    await db.execute({
+      sql: "INSERT INTO tasks (text, status, creator_id, lane) VALUES (?, ?, ?, ?)",
+      args: [req.text.trim(), "ожидает", creatorId, req.lane]
+    });
+    queued++;
+  }
+  if (queued > 0) {
+    console.log(`[${new Date().toISOString()}] queue-request: queued ${queued} new task(s) from Architect`);
+  }
+}
+
 async function processTask(db, task, botToken, litellmMasterKey) {
   const taskId = task.id;
   const startTime = Date.now();
@@ -540,6 +590,13 @@ async function processTask(db, task, botToken, litellmMasterKey) {
     clearInterval(typingInterval);
   }
   const workEnd = Date.now();
+
+  // Pick up any tasks Architect asked to queue during this run, before
+  // reporting back to Telegram - so a follow-up message the founder sends
+  // right after seeing the reply already finds the new rows in place.
+  await processQueueRequests(db, task.creator_id, lane).catch((err) => {
+    console.log(`[${new Date().toISOString()}] queue-request processing failed (non-fatal): ${err.message}`);
+  });
 
   // Update task - reuse exact same query as executor.mjs
   const status = result.success ? "готова" : "провал";
