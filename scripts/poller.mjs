@@ -14,12 +14,93 @@
  */
 
 import { createClient } from "@libsql/client";
-import { execFile as execFileCb } from "node:child_process";
+import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
-import { promisify } from "node:util";
 import { ensureTasksFile } from "./init-tasks-md.mjs";
 
-const execFile = promisify(execFileCb);
+// CHANGED 2026-08-29: this used to be execFile with maxBuffer: 20MB, which
+// buffers the ENTIRE stdout stream in memory and kills the child the
+// instant that total crosses the limit -- mid-task, not at a clean
+// stopping point. A real whole-repo-read task hit exactly this (SIGPIPE,
+// docs/DECISIONS.md has the incident). extractFinalAnswer only ever needs
+// the LAST run_result-typed line; everything else (every read_files
+// result, every thinking block) was being held in memory only to be
+// thrown away. This collector does the same selection incrementally, so
+// a huge task's tool-call volume no longer has a fixed ceiling -- only
+// CLINE_TIMEOUT_MS bounds it now, not memory.
+function makeStreamingCollector(tailMaxChars = 2000) {
+  let carry = "";      // an incomplete line spanning two chunks
+  let lastResult = null;
+  let tail = "";        // small, bounded window of raw output for error reports
+  function consumeLine(line) {
+    const t = line.trim();
+    if (!t) return;
+    try {
+      const d = JSON.parse(t);
+      if (d.type === "run_result") lastResult = d;
+    } catch {
+      // non-JSON line (a warning, etc.) - skip, same as the old code did
+    }
+  }
+  function push(chunk) {
+    tail = (tail + chunk).slice(-tailMaxChars);
+    carry += chunk;
+    const lines = carry.split("\n");
+    carry = lines.pop() ?? ""; // last element may be a partial line - keep it for the next chunk
+    for (const line of lines) consumeLine(line);
+  }
+  function finalize() {
+    if (carry) consumeLine(carry); // stream may end without a trailing newline
+    return { lastResult, tail };
+  }
+  return { push, finalize };
+}
+
+function runDockerStreaming(dockerArgs, { timeout, env }) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("docker", dockerArgs, { env });
+    const collector = makeStreamingCollector();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeout);
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => collector.push(chunk));
+    // stderr is not needed for the result, but draining it prevents the
+    // child from ever blocking on a full stderr pipe - the exact class of
+    // bug (a full, unread pipe) that produced the original SIGPIPE.
+    child.stderr.resume();
+
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      const { lastResult, tail } = collector.finalize();
+      err.lastResult = lastResult;
+      err.outputTail = tail;
+      reject(err);
+    });
+
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      const { lastResult, tail } = collector.finalize();
+      if (code === 0 && !signal) {
+        resolve({ lastResult, tail });
+        return;
+      }
+      const err = new Error(
+        timedOut
+          ? `docker killed after ${timeout}ms timeout`
+          : `docker exited with code ${code}${signal ? `, signal ${signal}` : ""}`
+      );
+      err.code = code;
+      err.signal = signal;
+      err.lastResult = lastResult;
+      err.outputTail = tail;
+      reject(err);
+    });
+  });
+}
 
 // Poll interval in milliseconds (10 seconds)
 const POLL_INTERVAL_MS = 10000;
@@ -361,20 +442,18 @@ async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      const { stdout } = await execFile("docker", dockerArgs, {
+      const { lastResult: result, tail } = await runDockerStreaming(dockerArgs, {
         timeout: CLINE_TIMEOUT_MS,
-        maxBuffer: 20 * 1024 * 1024,
         env: {
           ...process.env,
           LITELLM_MASTER_KEY: litellmMasterKey,
         }
       });
 
-      const result = extractFinalAnswer(stdout);
       if (!result) {
         return {
           success: false,
-          message: truncate(`агент не вернул run_result\n${stdout.replace(ANSI, "").slice(-1500)}`)
+          message: truncate(`агент не вернул run_result\n${tail.replace(ANSI, "").slice(-1500)}`)
         };
       }
 
@@ -411,13 +490,16 @@ async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane
 
   // If we got here, all retries exhausted or non-transient error
   const err = lastError;
-  const result = extractFinalAnswer(err.stdout || "");
+  const result = err.lastResult;
   if (result) {
     return { success: false, message: truncate(`${result.finishReason}: ${(result.text || "").trim()}`) };
   }
   const first = String(err.message || err).split("\n")[0];
   const code = err.code ?? err.signal ?? "?";
   console.log(`[${new Date().toISOString()}] Docker failed after ${MAX_ATTEMPTS} attempt(s), final exit code: ${code}`);
+  if (err.outputTail) {
+    console.log(`[${new Date().toISOString()}] Last ${err.outputTail.length} chars of output before failure:\n${err.outputTail}`);
+  }
   return { success: false, message: truncate(`код ${code}: ${first}`) };
 }
 
