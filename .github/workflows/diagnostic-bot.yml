@@ -1,0 +1,35 @@
+name: diagnostic-bot
+
+# Purely mechanical, no LLM involved - deliberately. TELEGRAM_BOT_TOKEN and
+# CLOUDFLARE_API_TOKEN are never given to the coding-agent step in
+# cloud-agent.yml on purpose (see CLOUD-KEYS.md / the secrets matrix in
+# docs/queue-engine-cloud-hosting-pattern.md - only the pieces that
+# actually need to talk to Telegram/Cloudflare get those tokens). Added
+# 2026-08-29 after cloud-agent.yml's own investigation ran into exactly
+# that wall trying to check webhook/Worker health from inside the agent
+# step. This workflow checks the same two things as a plain bash step
+# instead - deterministic, no secret ever reaches a model.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Telegram webhook status
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo" | python3 -m json.tool
+
+      - name: Cloudflare Worker - recent deployments
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/worker" 2>/dev/null || { echo "no worker/ dir at repo root - skipping"; exit 0; }
+          npm i -g wrangler@latest --silent
+          wrangler deployments list 2>&1 | tail -30 || echo "wrangler deployments list failed - see output above"
