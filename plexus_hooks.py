@@ -119,39 +119,51 @@ _GEMINI_RISK_ALIASES = _load_gemini_family_aliases()
 
 
 def _sanitize_foreign_tool_calls(messages: list) -> bool:
-    """Replace a historical assistant tool-call with a plain-text stand-in
-    when it carries no Gemini-style signature -- i.e. it was produced by a
-    different model. Surgical: a plain message with no tool call is left
-    exactly as it is. Returns True if anything was changed."""
-    changed = False
+    """Remove a historical assistant tool-call turn (and the tool-result
+    that answers it) when the call carries no Gemini-style signature --
+    i.e. it was produced by a different model.
+
+    CHANGED 2026-08-29, same day as the first version: the first version
+    replaced the offending turn's content with a narrative stand-in
+    sentence instead of deleting it. That sentence then showed up, twice,
+    as if it were the model's own real answer -- once to a real Telegram
+    user, once inside this project's own local queue log. Read literally,
+    a model handed a strange, out-of-place assistant-authored sentence in
+    its own context window has no way to know it is a system note rather
+    than something to react to or echo, and evidently sometimes echoed it.
+
+    The fix is to leave nothing to react to: delete the assistant turn AND
+    the tool-role message(s) that answer its tool_call_id(s) outright,
+    rather than replace them with text of any kind. A plain message with no
+    tool call, or one that already carries a signature, is untouched.
+    Mutates `messages` in place (list, not tuple) and returns True if
+    anything was removed."""
+    doomed_call_ids = set()
+    keep = []
     for m in messages:
-        if not isinstance(m, dict) or m.get("role") != "assistant":
-            continue
-        tool_calls = m.get("tool_calls")
-        if not tool_calls:
-            continue
-        provider_specific = m.get("provider_specific_fields")
-        has_signature = bool(
-            isinstance(provider_specific, dict)
-            and provider_specific.get("thought_signatures")
-        )
-        if has_signature:
-            continue
-        names = []
-        for tc in tool_calls:
-            fn = (tc or {}).get("function") or {}
-            if fn.get("name"):
-                names.append(fn["name"])
-        stand_in = (
-            "[Tool call(s) {} were made earlier in this conversation by a "
-            "different model; result omitted here, see conversation "
-            "history.]"
-        ).format(", ".join(names) or "unnamed")
-        m["tool_calls"] = None
-        existing_text = m.get("content") or ""
-        m["content"] = (existing_text + "\n" + stand_in).strip()
-        changed = True
-    return changed
+        if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls"):
+            provider_specific = m.get("provider_specific_fields")
+            has_signature = bool(
+                isinstance(provider_specific, dict)
+                and provider_specific.get("thought_signatures")
+            )
+            if not has_signature:
+                for tc in m["tool_calls"]:
+                    cid = (tc or {}).get("id")
+                    if cid:
+                        doomed_call_ids.add(cid)
+                continue  # drop the whole assistant turn
+        keep.append(m)
+
+    if not doomed_call_ids:
+        return False
+
+    final = [
+        m for m in keep
+        if not (isinstance(m, dict) and m.get("role") == "tool" and m.get("tool_call_id") in doomed_call_ids)
+    ]
+    messages[:] = final
+    return True
 
 # Marker so a retry or a re-entrant call cannot append the block twice.
 MARKER = "[proxy-enforced: facts only]"
