@@ -218,6 +218,7 @@ jobs:
           python3 -c "import json,os;d=json.load(open(os.path.expanduser('~/.cline/data/settings/providers.json')));print('baseUrl:',d['providers']['openai-compatible']['settings']['baseUrl'])"
 
       - name: run the agent
+        id: run_agent
         shell: bash
         env:
           PROMPT: ${{ inputs.prompt }}
@@ -251,6 +252,8 @@ jobs:
 
       - name: push whatever the agent committed
         if: always()
+        env:
+          AGENT_OUTCOME: ${{ steps.run_agent.outcome }}
         run: |
           cd "$GITHUB_WORKSPACE"
           # The agent may have already run its own `git commit` (it was asked
@@ -268,6 +271,16 @@ jobs:
           ahead=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)
           if [ "$ahead" = "0" ]; then
             echo "nothing to push"
+          elif [ "$AGENT_OUTCOME" != "success" ]; then
+            # 2026-08-29: this used to push straight to main even when the
+            # agent step itself failed/crashed - that's exactly how a broken
+            # push landed on main once already (see docs/DECISIONS.md). A
+            # failed run's own edits (however partial) go to a review branch
+            # instead, same pattern as the plexus-doc release-surface guard
+            # below.
+            branch="cloud-agent/review-$(date -u +%Y%m%d-%H%M%S)"
+            git push origin "HEAD:$branch"
+            echo "::warning::agent step outcome was '$AGENT_OUTCOME' - pushed $ahead commit(s) to $branch instead of main. Review before merging."
           else
             git push origin HEAD:main
             echo "pushed $ahead commit(s)"
@@ -275,6 +288,8 @@ jobs:
 
       - name: push whatever the agent changed in plexus-doc
         if: always()
+        env:
+          AGENT_OUTCOME: ${{ steps.run_agent.outcome }}
         run: |
           cd "$GITHUB_WORKSPACE/plexus-doc"
           if [ -n "$(git status --porcelain)" ]; then
@@ -286,6 +301,14 @@ jobs:
           ahead=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)
           if [ "$ahead" = "0" ]; then
             echo "nothing to push in plexus-doc"
+          # 2026-08-29: same fallback-push bug as the queue-engine push step
+          # above - a failed/crashed agent run must not land on plexus-doc's
+          # main either. Checked first, same review-branch pattern as the
+          # site/worker guard below.
+          elif [ "$AGENT_OUTCOME" != "success" ]; then
+            branch="cloud-agent/review-$(date -u +%Y%m%d-%H%M%S)"
+            git push origin "HEAD:$branch"
+            echo "::warning::agent step outcome was '$AGENT_OUTCOME' - pushed $ahead commit(s) in plexus-doc to $branch instead of main. Review before merging."
           # plexus-doc's own rule (CLAUDE.md): site/, worker/, wrangler.jsonc
           # auto-deploy the live trading site on merge to main. The cloud
           # agent may write freely everywhere else (canon/ additively,
