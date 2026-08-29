@@ -9,6 +9,13 @@ name: diagnostic-bot
 # that wall trying to check webhook/Worker health from inside the agent
 # step. This workflow checks the same two things as a plain bash step
 # instead - deterministic, no secret ever reaches a model.
+#
+# UPDATED same day: the GitHub-stored TELEGRAM_BOT_TOKEN secret is a dead,
+# unused copy - neither the Worker (deploys via Cloudflare's own wrangler
+# secret store) nor the poller (reads /run/secrets/poller.env on the VM)
+# ever consult it. The owner rotated the real token on the VM side
+# yesterday; this check now reads THAT copy over SSH instead, so it
+# reflects what the live bot actually uses.
 
 on:
   workflow_dispatch: {}
@@ -18,12 +25,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Telegram webhook status
+      - uses: actions/checkout@v4
+
+      - name: Telegram webhook status, using the VM's own current token
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         run: |
           set -euo pipefail
-          curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo" | python3 -m json.tool
+          printf '%s' "$GCP_SA_KEY" > /tmp/gcp-key.json
+          gcloud auth activate-service-account --key-file=/tmp/gcp-key.json --project="$GCP_PROJECT_ID"
+          # Token never leaves the VM in a log line or a --command string:
+          # the whole curl+parse happens inside the remote shell, and only
+          # the safe getWebhookInfo JSON (no secret in it) comes back.
+          gcloud compute ssh runner@plexus-queue-vm --zone=us-central1-a --project="$GCP_PROJECT_ID" \
+            --command='TOKEN=$(sudo grep "^TELEGRAM_BOT_TOKEN=" /run/secrets/poller.env | cut -d= -f2-); curl -fsS "https://api.telegram.org/bot${TOKEN}/getWebhookInfo" | python3 -m json.tool'
 
       - name: Cloudflare Worker - recent deployments
         env:
