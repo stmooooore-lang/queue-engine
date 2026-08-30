@@ -124,7 +124,16 @@ const LANE_CONFIG = {
 // them the same either hides a real transient wait behind a false failure,
 // or (worse, as tonight) drops the founder with silence and no path
 // forward. The VM poller never had this at all until now.
-const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|No deployments available|RateLimitError|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE/i;
+// 2026-08-30: two more shapes joined this list after being seen in the
+// wild without ever triggering a retry. (1) "proxy/HTTP error" is
+// sanitizeModelText's own label - a raw HTML/binary error page from Render
+// isn't a litellm exception, so none of the patterns above ever matched it,
+// and it went straight to the founder as if it were a real (if odd)
+// answer. (2) "hook dispatch failed" / "operation timed out" is a Cline
+// CLI-level hiccup, confirmed via queue-log/ going back to 2026-08-19 across
+// unrelated tasks/models/lanes with no correlation to task content - a
+// tooling glitch, not a real task failure, exactly like the others here.
+const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|No deployments available|RateLimitError|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|proxy\/HTTP error|hook dispatch failed|operation timed out/i;
 const CAPACITY_RETRY_MAX = 3;
 const CAPACITY_RETRY_DELAY_MS = 2 * 60 * 1000;
 
@@ -177,7 +186,12 @@ function sanitizeModelText(text) {
   // accidentally captured as "the answer".
   const hasHugeUnbrokenToken = /\S{500,}/.test(t);
   if (looksLikeHtmlPage || hasHugeUnbrokenToken) {
-    return `[proxy/HTTP error, not a model answer - looks like ${looksLikeHtmlPage ? "an HTML error page" : "a raw binary/encoded blob"}]\n${t.replace(/\s+/g, " ").slice(0, 300)}`;
+    // 2026-08-30: used to append a 300-char raw snippet "for debugging" -
+    // that snippet starts at char 0 of the same garbage this exists to
+    // hide, so the founder still received a base64/HTML fragment, just a
+    // shorter one. The raw text is still on stdout via the caller's own
+    // console.log before this runs; nothing is lost by not re-sending it.
+    return `[proxy/HTTP error, not a model answer - looks like ${looksLikeHtmlPage ? "an HTML error page" : "a raw binary/encoded blob"}]`;
   }
   return t;
 }
@@ -529,9 +543,19 @@ async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane
         };
       }
 
-      const ok = result.finishReason === "completed";
       const rawBody = (result.text || "").trim();
-      const body = rawBody ? sanitizeModelText(rawBody) : "(агент ничего не ответил)";
+      const sanitized = rawBody ? sanitizeModelText(rawBody) : "";
+      // sanitizeModelText only rewrites non-empty text when it detected an
+      // HTML error page or a raw binary/encoded blob - a real answer always
+      // comes back unchanged. Treat that case as a failure (not a garbage
+      // "success") so it enters the CAPACITY_RE retry loop in processTask()
+      // instead of reaching the founder as a completed task.
+      const isGarbage = rawBody !== "" && sanitized !== rawBody;
+      if (isGarbage) {
+        console.log(`[${new Date().toISOString()}] sanitizeModelText caught garbage output, raw (first 500 chars): ${rawBody.slice(0, 500)}`);
+      }
+      const body = rawBody ? sanitized : "(агент ничего не ответил)";
+      const ok = result.finishReason === "completed" && !isGarbage;
       if (attempt > 1) {
         console.log(`[${new Date().toISOString()}] Docker succeeded on attempt ${attempt}/${MAX_ATTEMPTS}`);
       }

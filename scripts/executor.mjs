@@ -71,7 +71,11 @@ function sanitizeModelText(text) {
   const looksLikeHtmlPage = /^<!DOCTYPE html/i.test(t) || /^<html[\s>]/i.test(t);
   const hasHugeUnbrokenToken = /\S{500,}/.test(t);
   if (looksLikeHtmlPage || hasHugeUnbrokenToken) {
-    return `[proxy/HTTP error, not a model answer - looks like ${looksLikeHtmlPage ? "an HTML error page" : "a raw binary/encoded blob"}]\n${t.replace(/\s+/g, " ").slice(0, 300)}`;
+    // 2026-08-30: dropped the 300-char raw snippet this used to append -
+    // it starts at char 0 of the same garbage this exists to hide, so the
+    // founder still received a base64/HTML fragment either way. See
+    // poller.mjs's sanitizeModelText for the full note.
+    return `[proxy/HTTP error, not a model answer - looks like ${looksLikeHtmlPage ? "an HTML error page" : "a raw binary/encoded blob"}]`;
   }
   return t;
 }
@@ -183,9 +187,14 @@ async function doWork(text) {
     if (!result) {
       return { success: false, message: truncate(`агент не вернул run_result\n${tail.replace(ANSI, "").slice(-1500)}`) };
     }
-    const ok = result.finishReason === "completed";
     const rawBody = (result.text || "").trim();
-    const body = rawBody ? sanitizeModelText(rawBody) : "(агент ничего не ответил)";
+    const sanitized = rawBody ? sanitizeModelText(rawBody) : "";
+    const isGarbage = rawBody !== "" && sanitized !== rawBody;
+    if (isGarbage) {
+      console.log(`[${new Date().toISOString()}] sanitizeModelText caught garbage output, raw (first 500 chars): ${rawBody.slice(0, 500)}`);
+    }
+    const body = rawBody ? sanitized : "(агент ничего не ответил)";
+    const ok = result.finishReason === "completed" && !isGarbage;
     return { success: ok, message: truncate(ok ? body : `${result.finishReason}: ${body}`) };
   } catch (err) {
     const result = err.lastResult;
