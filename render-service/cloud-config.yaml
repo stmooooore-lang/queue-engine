@@ -150,6 +150,19 @@ router_settings:
     - plexus-cheap
   - plexus-cheap:
     - plexus-gemini-lite
+  # ADDED 2026-08-30: litellm only follows ONE fallback hop per request
+  # unless the group it lands on has its own fallback entry - plexus-act's
+  # own list above already says "gemini-lite, then coder, then cheap," but
+  # without this a gemini-lite failure (a real Vertex 503 "high demand,"
+  # confirmed structural/documented on Google's own side, not our bug) was
+  # a dead end even though coder was sitting right there in the same list
+  # - this is what a founder's "gemini" retry button actually hit today.
+  # Deliberately NOT cheap here: plexus-cheap's own fallback (above)
+  # already points back to plexus-gemini-lite, so adding cheap would ping
+  # gemini-lite -> cheap -> gemini-lite again on the same failed provider
+  # instead of terminating - coder has no such loop back.
+  - plexus-gemini-lite:
+    - plexus-coder
   - plexus-plan:
     - plexus-architect
 
