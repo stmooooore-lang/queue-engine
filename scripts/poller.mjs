@@ -755,7 +755,22 @@ async function dispatchSelfQueueTask(githubDispatchToken, lane, text, creatorId)
   return true;
 }
 
-async function processQueueRequests(db, creatorId, lane, githubDispatchToken) {
+// 2026-08-30, reverted the same day: dispatching to GitHub Actions
+// (dispatchSelfQueueTask, still defined below, kept as an unused reserve -
+// see plexus-self-queue-task.yml's own header) turned out to trade one
+// real problem for another - GitHub Actions' free tier is 2000 minutes/
+// month, and a handful of long Coder/QA runs burns through that fast,
+// which conflicts with "everything free" as a standing rule, not a one-off
+// preference. The founder's own e2-micro VM has no such metered ceiling
+// (GCP Always Free, not billed per minute) and already runs 24/7
+// independent of any laptop - the actual fix for "self-queued work blocks
+// the founder's live chat" was never "move it to different hardware," it
+// was that PENDING_LANE_STATUS below makes a live message always jump a
+// self-queued one in the SAME queue, on the SAME VM. See pollLoop().
+const PENDING_STATUS = "ожидает";
+const PENDING_BACKGROUND_STATUS = "ожидает_фон";
+
+async function processQueueRequests(db, creatorId, lane) {
   if (lane !== "architect") return; // only the Architect role promotes work
   let raw;
   try {
@@ -782,11 +797,14 @@ async function processQueueRequests(db, creatorId, lane, githubDispatchToken) {
       console.log(`[${new Date().toISOString()}] queue-request: skipped invalid entry (lane=${req.lane}): ${t.slice(0, 200)}`);
       continue;
     }
-    const dispatched = await dispatchSelfQueueTask(githubDispatchToken, req.lane, req.text.trim(), creatorId);
-    if (dispatched) queued++;
+    await db.execute({
+      sql: "INSERT INTO tasks (text, status, creator_id, lane) VALUES (?, ?, ?, ?)",
+      args: [req.text.trim(), PENDING_BACKGROUND_STATUS, creatorId, req.lane]
+    });
+    queued++;
   }
   if (queued > 0) {
-    console.log(`[${new Date().toISOString()}] queue-request: dispatched ${queued} new task(s) from Architect to GitHub Actions`);
+    console.log(`[${new Date().toISOString()}] queue-request: queued ${queued} new background task(s) from Architect (low priority - see PENDING_BACKGROUND_STATUS)`);
   }
 }
 
@@ -890,7 +908,7 @@ async function processTask(db, task, botToken, litellmMasterKey, githubDispatchT
   // Pick up any tasks Architect asked to queue during this run, before
   // reporting back to Telegram - so a follow-up message the founder sends
   // right after seeing the reply already finds the new rows in place.
-  await processQueueRequests(db, task.creator_id, lane, githubDispatchToken).catch((err) => {
+  await processQueueRequests(db, task.creator_id, lane).catch((err) => {
     console.log(`[${new Date().toISOString()}] queue-request processing failed (non-fatal): ${err.message}`);
   });
 
@@ -954,10 +972,19 @@ async function pollLoop(db, botToken, litellmMasterKey, githubDispatchToken) {
     try {
       await notifyPendingSelfQueuedResults(db, botToken);
 
-      // Find pending tasks - reuse exact same query as executor.mjs
+      // 2026-08-30: a self-queued follow-up (PENDING_BACKGROUND_STATUS) is,
+      // by definition, something the Architect itself decided wasn't
+      // urgent enough to answer immediately - it should never make a
+      // founder's live incoming message (PENDING_STATUS) wait behind it.
+      // `status = ?` ordering puts PENDING_STATUS rows first regardless of
+      // which was created earlier; MAX_CONCURRENT=1 still means only one
+      // task runs at a time (the e2-micro VM's RAM doesn't allow more),
+      // but a background task in progress is never started AHEAD of a
+      // live message that was already waiting.
       const taskRes = await db.execute({
-        sql: "SELECT * FROM tasks WHERE status = ? ORDER BY created_at ASC LIMIT ?",
-        args: ["ожидает", MAX_CONCURRENT]
+        sql: `SELECT * FROM tasks WHERE status IN (?, ?)
+              ORDER BY (status = ?) DESC, created_at ASC LIMIT ?`,
+        args: [PENDING_STATUS, PENDING_BACKGROUND_STATUS, PENDING_STATUS, MAX_CONCURRENT]
       });
 
       const tasks = taskRes.rows;
