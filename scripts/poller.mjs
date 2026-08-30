@@ -118,6 +118,36 @@ const LANE_CONFIG = {
   qa: { model: "plexus-judge", promptFile: "./prompts/qa.md" },
 };
 
+// 2026-08-30: same class of error queue.sh's own CAPACITY_RE already
+// handles locally (docs/DECISIONS.md, 2026-08-21) - "the provider is busy
+// right now" is not the same fact as "this task is broken," and treating
+// them the same either hides a real transient wait behind a false failure,
+// or (worse, as tonight) drops the founder with silence and no path
+// forward. The VM poller never had this at all until now.
+const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|No deployments available|RateLimitError|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE/i;
+const CAPACITY_RETRY_MAX = 3;
+const CAPACITY_RETRY_DELAY_MS = 2 * 60 * 1000;
+
+// Button-tap-as-text: a Telegram reply keyboard sends its label as an
+// ordinary text message, indistinguishable at the Worker from anything the
+// founder typed by hand - recognized here, not in worker/index.js, so the
+// already-working message path there needs no changes at all.
+const BUTTON_RETRY = "Retry";
+const BUTTON_MODEL_MAP = { coder: "plexus-coder", cheap: "plexus-cheap", gemini: "plexus-gemini" };
+function detectButtonAction(text) {
+  const t = (text || "").trim().toLowerCase();
+  if (t === BUTTON_RETRY.toLowerCase()) return "retry";
+  if (Object.prototype.hasOwnProperty.call(BUTTON_MODEL_MAP, t)) return t;
+  return null;
+}
+function failureKeyboard() {
+  return {
+    keyboard: [[BUTTON_RETRY], Object.keys(BUTTON_MODEL_MAP)],
+    resize_keyboard: true,
+    one_time_keyboard: true,
+  };
+}
+
 async function loadRolePrompt(lane) {
   const cfg = LANE_CONFIG[lane] || LANE_CONFIG.architect;
   const promptText = await fs.readFile(cfg.promptFile, "utf8");
@@ -337,7 +367,7 @@ async function sendRichMessage(botToken, chatId, richBlocks) {
 }
 
 
-async function sendOneTelegramMessage(botToken, chatId, rawText) {
+async function sendOneTelegramMessage(botToken, chatId, rawText, replyMarkup) {
   const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
   let converted;
   try {
@@ -348,6 +378,7 @@ async function sendOneTelegramMessage(botToken, chatId, rawText) {
   }
   for (const [text, parse_mode] of converted ? [[converted, "HTML"], [rawText, undefined]] : [[rawText, undefined]]) {
     const body = parse_mode ? { chat_id: chatId, text, parse_mode } : { chat_id: chatId, text };
+    if (replyMarkup) body.reply_markup = replyMarkup;
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -363,9 +394,11 @@ async function sendOneTelegramMessage(botToken, chatId, rawText) {
   }
 }
 
-async function notifyTelegram(botToken, chatId, message) {
+async function notifyTelegram(botToken, chatId, message, replyMarkup) {
   // Check if message contains markdown table - if so, use sendRichMessage
-  if (containsMarkdownTable(message)) {
+  // (a keyboard on a rich message isn't supported by this path - if that
+  // combination is ever needed, it needs its own handling, not assumed here)
+  if (!replyMarkup && containsMarkdownTable(message)) {
     try {
       const richBlocks = messageToRichBlocks(message);
       return await sendRichMessage(botToken, chatId, richBlocks);
@@ -374,12 +407,15 @@ async function notifyTelegram(botToken, chatId, message) {
       // Fall through to regular sendMessage path
     }
   }
-  
+
   const chunks = splitForTelegram(message);
   let lastBody;
   for (let i = 0; i < chunks.length; i++) {
     const text = chunks.length > 1 ? `${chunks[i]}\n\n[${i + 1}/${chunks.length}]` : chunks[i];
-    lastBody = await sendOneTelegramMessage(botToken, chatId, text);
+    // The keyboard only makes sense attached to the last chunk - it is the
+    // one the founder sees right before deciding whether to tap a button.
+    const isLast = i === chunks.length - 1;
+    lastBody = await sendOneTelegramMessage(botToken, chatId, text, isLast ? replyMarkup : undefined);
   }
   return lastBody;
 }
@@ -423,10 +459,15 @@ function buildPromptWithHistory(currentText, historyRows) {
   return prompt;
 }
 
-async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane) {
-  // Load role-specific prompt and model for this lane
-  const { model, systemPrompt } = await loadRolePrompt(lane);
-  
+async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane, modelOverride) {
+  // Load role-specific prompt and model for this lane. An explicit
+  // modelOverride (from a "coder"/"cheap"/"gemini" button tap) bypasses the
+  // lane's own model choice but keeps its system prompt and history scope -
+  // the founder picked a different model for the same role, not a
+  // different role.
+  const { model: laneModel, systemPrompt } = await loadRolePrompt(lane);
+  const model = modelOverride || laneModel;
+
   // Fetch history from Turso (filtered by lane) and build combined prompt
   const historyRows = await fetchHistory(db, creatorId, currentTaskId, lane, 6);
   const combinedPrompt = `${systemPrompt}\n\n${buildPromptWithHistory(text, historyRows)}`;
@@ -587,12 +628,48 @@ async function processQueueRequests(db, creatorId, lane) {
   }
 }
 
+// A button tap arrives as plain text identical to its label - looked up
+// against the founder's own most recent failure, not tied to a specific
+// message via callback data, because that's the only state a plain reply
+// keyboard carries. Scoped to this creator_id only; lane is deliberately
+// not filtered here - a retry should find whatever actually just failed.
+async function findLastFailedTask(db, creatorId, excludeTaskId) {
+  const res = await db.execute({
+    sql: `SELECT id, text FROM tasks WHERE creator_id = ? AND status = ? AND id != ?
+          ORDER BY created_at DESC LIMIT 1`,
+    args: [creatorId, "провал", excludeTaskId]
+  });
+  return res.rows[0] || null;
+}
+
 async function processTask(db, task, botToken, litellmMasterKey) {
   const taskId = task.id;
   const startTime = Date.now();
   const lane = task.lane || 'architect';
 
   console.log(`[${new Date().toISOString()}] Processing task ${taskId}: ${task.text.slice(0, 80)} [lane: ${lane}]`);
+
+  // A tap on "Retry" / "coder" / "cheap" / "gemini" is indistinguishable
+  // from typed text at this point - detect it before treating this as a
+  // brand new request, and substitute the failed task's own text.
+  const buttonAction = detectButtonAction(task.text);
+  let effectiveText = task.text;
+  let modelOverride = null;
+  if (buttonAction) {
+    const prev = await findLastFailedTask(db, task.creator_id, taskId);
+    if (!prev) {
+      await db.execute({
+        sql: "UPDATE tasks SET status = ?, result = ? WHERE id = ?",
+        args: ["готова", "Nothing to retry - no recent failed task found.", taskId]
+      });
+      await notifyTelegram(botToken, task.creator_id, "Nothing to retry - no recent failed task found.");
+      console.log(`[${new Date().toISOString()}] Task ${taskId}: button "${task.text}" tapped, no prior failure to act on`);
+      return;
+    }
+    effectiveText = prev.text;
+    if (buttonAction !== "retry") modelOverride = BUTTON_MODEL_MAP[buttonAction];
+    console.log(`[${new Date().toISOString()}] Task ${taskId}: button action "${buttonAction}" -> replaying task ${prev.id}${modelOverride ? ` on ${modelOverride}` : ""}`);
+  }
 
   // Mark as running - reuse exact same query as executor.mjs
   await db.execute({
@@ -601,13 +678,31 @@ async function processTask(db, task, botToken, litellmMasterKey) {
   });
 
   // Execute work - keep typing visible for the whole duration, not just
-  // the Worker's one-shot send on receipt.
+  // the Worker's one-shot send on receipt. Includes any capacity-retry
+  // waits below, so the indicator stays honest about "still working."
   const workStart = Date.now();
   await sendTypingAction(botToken, task.creator_id);
   const typingInterval = setInterval(() => sendTypingAction(botToken, task.creator_id), 4000);
   let result;
   try {
-    result = await doWork(db, task.text, litellmMasterKey, task.creator_id, taskId, lane);
+    // A provider being busy right now is not the same fact as this task
+    // being broken - retry the same request a few times, spaced out,
+    // before treating it as a real failure. Loop lives here (inside one
+    // processTask call), not across poll iterations, so no persisted
+    // retry-count state is needed.
+    let attempt = 0;
+    do {
+      attempt++;
+      result = await doWork(db, effectiveText, litellmMasterKey, task.creator_id, taskId, lane, modelOverride);
+      if (result.success || !CAPACITY_RE.test(result.message) || attempt >= CAPACITY_RETRY_MAX) break;
+      if (attempt === 1) {
+        await notifyTelegram(
+          botToken, task.creator_id,
+          `Провайдер занят, попробую снова через 2 минуты (попытка ${attempt} из ${CAPACITY_RETRY_MAX})...`
+        );
+      }
+      await new Promise(r => setTimeout(r, CAPACITY_RETRY_DELAY_MS));
+    } while (attempt < CAPACITY_RETRY_MAX);
   } finally {
     clearInterval(typingInterval);
   }
@@ -630,8 +725,11 @@ async function processTask(db, task, botToken, litellmMasterKey) {
     args: [status, result.message, `poller-${process.pid}-${Date.now()}`, secondsToFirstWork, minutesUsed, taskId]
   });
 
-  // Notify via Telegram to creator - reuse exact same logic as executor.mjs
-  await notifyTelegram(botToken, task.creator_id, result.message);
+  // Notify via Telegram to creator - reuse exact same logic as executor.mjs.
+  // A real (non-capacity, or capacity exhausted 3 times) failure offers a
+  // way forward instead of a dead end: retry, or try a different model on
+  // the same request.
+  await notifyTelegram(botToken, task.creator_id, result.message, result.success ? undefined : failureKeyboard());
 
   console.log(`[${new Date().toISOString()}] Task ${taskId} completed with status: ${status}`);
 }
