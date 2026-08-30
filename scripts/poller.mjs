@@ -301,6 +301,12 @@ async function loadSecrets() {
     TURSO_AUTH_TOKEN: "/run/secrets/TURSO_AUTH_TOKEN",
     TELEGRAM_BOT_TOKEN: "/run/secrets/TELEGRAM_BOT_TOKEN",
     LITELLM_MASTER_KEY: "/run/secrets/LITELLM_MASTER_KEY",
+    // 2026-08-30: not in `required` below - self-queue-to-GitHub dispatch
+    // (processQueueRequests) degrades to "logged, not sent" without it
+    // instead of taking the whole poller down, since it's provisioned
+    // separately from the secrets this service already needed to run at
+    // all.
+    GITHUB_DISPATCH_TOKEN: "/run/secrets/GITHUB_DISPATCH_TOKEN",
   };
 
   for (const [key, path] of Object.entries(secretFiles)) {
@@ -717,7 +723,39 @@ async function sendTypingAction(botToken, chatId) {
 const QUEUE_REQUEST_PATH = "/home/runner/.cline/queue-request.jsonl";
 const VALID_LANES = new Set(["architect", "coder", "qa"]);
 
-async function processQueueRequests(db, creatorId, lane) {
+// 2026-08-30: this used to INSERT a new "ожидает" row for each self-queued
+// item, which the VM's own pollLoop would then pick up and run itself -
+// exactly the thing that blocks the founder's live chat, since this VM is
+// MAX_CONCURRENT=1 (e2-micro, 1 GB RAM). Now it dispatches
+// `plexus-self-queue-task.yml` on its own GitHub Actions runner instead -
+// a self-queued item never touches this VM's execution slot at all. See
+// that workflow file for how results get back into Turso and notified.
+async function dispatchSelfQueueTask(githubDispatchToken, lane, text, creatorId) {
+  if (!githubDispatchToken) {
+    console.log(`[${new Date().toISOString()}] queue-request: GITHUB_DISPATCH_TOKEN not provisioned yet - cannot dispatch lane=${lane}, task left undone: ${text.slice(0, 200)}`);
+    return false;
+  }
+  const res = await fetch(
+    "https://api.github.com/repos/stmooooore-lang/queue-engine/actions/workflows/plexus-self-queue-task.yml/dispatches",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${githubDispatchToken}`,
+        Accept: "application/vnd.github+json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ ref: "main", inputs: { lane, text, creator_id: String(creatorId) } }),
+    }
+  );
+  if (!res.ok) {
+    const errBody = await res.text();
+    console.log(`[${new Date().toISOString()}] queue-request: GitHub dispatch failed (${res.status}) for lane=${lane}: ${errBody.slice(0, 300)}`);
+    return false;
+  }
+  return true;
+}
+
+async function processQueueRequests(db, creatorId, lane, githubDispatchToken) {
   if (lane !== "architect") return; // only the Architect role promotes work
   let raw;
   try {
@@ -744,14 +782,11 @@ async function processQueueRequests(db, creatorId, lane) {
       console.log(`[${new Date().toISOString()}] queue-request: skipped invalid entry (lane=${req.lane}): ${t.slice(0, 200)}`);
       continue;
     }
-    await db.execute({
-      sql: "INSERT INTO tasks (text, status, creator_id, lane) VALUES (?, ?, ?, ?)",
-      args: [req.text.trim(), "ожидает", creatorId, req.lane]
-    });
-    queued++;
+    const dispatched = await dispatchSelfQueueTask(githubDispatchToken, req.lane, req.text.trim(), creatorId);
+    if (dispatched) queued++;
   }
   if (queued > 0) {
-    console.log(`[${new Date().toISOString()}] queue-request: queued ${queued} new task(s) from Architect`);
+    console.log(`[${new Date().toISOString()}] queue-request: dispatched ${queued} new task(s) from Architect to GitHub Actions`);
   }
 }
 
@@ -769,7 +804,7 @@ async function findLastFailedTask(db, creatorId, excludeTaskId) {
   return res.rows[0] || null;
 }
 
-async function processTask(db, task, botToken, litellmMasterKey) {
+async function processTask(db, task, botToken, litellmMasterKey, githubDispatchToken) {
   const taskId = task.id;
   const startTime = Date.now();
   const lane = task.lane || 'architect';
@@ -855,7 +890,7 @@ async function processTask(db, task, botToken, litellmMasterKey) {
   // Pick up any tasks Architect asked to queue during this run, before
   // reporting back to Telegram - so a follow-up message the founder sends
   // right after seeing the reply already finds the new rows in place.
-  await processQueueRequests(db, task.creator_id, lane).catch((err) => {
+  await processQueueRequests(db, task.creator_id, lane, githubDispatchToken).catch((err) => {
     console.log(`[${new Date().toISOString()}] queue-request processing failed (non-fatal): ${err.message}`);
   });
 
@@ -885,9 +920,40 @@ async function processTask(db, task, botToken, litellmMasterKey) {
   console.log(`[${new Date().toISOString()}] Task ${taskId} completed with status: ${status}`);
 }
 
-async function pollLoop(db, botToken, litellmMasterKey) {
+// 2026-08-30: a self-queued task finishes on a GitHub Actions runner, not
+// here, and that runner has no TELEGRAM_BOT_TOKEN (deliberately - kept in
+// exactly one place). It writes its outcome to Turso with a transient
+// marker status instead of the real final one; this notices that marker
+// every poll cycle, sends the founder's notification the same way any
+// other task result would be delivered, then flips the row to its real
+// final status so it behaves normally to every other query from here on
+// (fetchHistory, findLastFailedTask, etc. never see the marker).
+async function notifyPendingSelfQueuedResults(db, botToken) {
+  const res = await db.execute({
+    sql: "SELECT id, status, result, creator_id FROM tasks WHERE status IN (?, ?) ORDER BY created_at ASC LIMIT 5",
+    args: ["уведомить_готова", "уведомить_провал"]
+  });
+  for (const row of res.rows) {
+    const success = row.status === "уведомить_готова";
+    const finalStatus = success ? "готова" : "провал";
+    try {
+      await notifyTelegram(botToken, row.creator_id, row.result, success ? undefined : failureKeyboard());
+    } catch (err) {
+      console.log(`[${new Date().toISOString()}] self-queue notify failed for task ${row.id} (will retry next poll): ${err.message}`);
+      continue; // leave the marker status in place, try again next cycle
+    }
+    await db.execute({
+      sql: "UPDATE tasks SET status = ? WHERE id = ?",
+      args: [finalStatus, row.id]
+    });
+  }
+}
+
+async function pollLoop(db, botToken, litellmMasterKey, githubDispatchToken) {
   while (true) {
     try {
+      await notifyPendingSelfQueuedResults(db, botToken);
+
       // Find pending tasks - reuse exact same query as executor.mjs
       const taskRes = await db.execute({
         sql: "SELECT * FROM tasks WHERE status = ? ORDER BY created_at ASC LIMIT ?",
@@ -903,7 +969,7 @@ async function pollLoop(db, botToken, litellmMasterKey) {
 
       // Process tasks sequentially (MAX_CONCURRENT=1 for e2-micro)
       for (const task of tasks) {
-        await processTask(db, task, botToken, litellmMasterKey);
+        await processTask(db, task, botToken, litellmMasterKey, githubDispatchToken);
       }
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Poll loop error:`, err.message);
@@ -937,7 +1003,7 @@ async function main() {
   }
 
   // Start polling
-  await pollLoop(db, secrets.TELEGRAM_BOT_TOKEN, secrets.LITELLM_MASTER_KEY);
+  await pollLoop(db, secrets.TELEGRAM_BOT_TOKEN, secrets.LITELLM_MASTER_KEY, secrets.GITHUB_DISPATCH_TOKEN);
 }
 
 main().catch(err => {

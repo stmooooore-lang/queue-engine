@@ -1,0 +1,162 @@
+name: plexus-self-queue-task
+
+# 2026-08-30. Runs a task the Architect self-queued (via queue-request.jsonl)
+# on its own GitHub Actions runner instead of the VM poller - the VM is
+# MAX_CONCURRENT=1 (e2-micro, 1 GB RAM), so any self-queued follow-up work
+# that ran there blocked the founder's live chat until it finished. This
+# workflow talks directly to the already-running, already-correctly-scoped
+# Render proxy (same one the VM poller uses) instead of spinning up its own
+# local proxy the way cloud-agent.yml does - no provider keys (Gemini/Groq/
+# Mistral/NVIDIA) need to exist in GitHub Actions secrets for this path at
+# all, only LITELLM_MASTER_KEY (the proxy's own gatekeeper token, already a
+# secret) and Turso's credentials.
+#
+# Result delivery: this job cannot send Telegram messages itself (no
+# TELEGRAM_BOT_TOKEN here, deliberately - keeping that token in exactly one
+# place, the VM, rather than duplicating it). It writes its outcome to Turso
+# with a transient marker status ("уведомить_готова"/"уведомить_провал")
+# instead of the real final one; the VM poller's own poll loop notices that
+# marker, sends the founder's Telegram notification, then flips the row to
+# the real final status ("готова"/"провал"). See poller.mjs's pollLoop().
+
+on:
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: 'architect, coder, or qa'
+        required: true
+        type: string
+      text:
+        description: 'The task text'
+        required: true
+        type: string
+      creator_id:
+        description: 'Telegram chat id to notify on completion'
+        required: true
+        type: string
+
+jobs:
+  run-self-queued-task:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+
+      - name: install cline
+        run: npm i -g cline
+
+      - name: install Turso client for the result-write step
+        run: npm install
+        working-directory: scripts
+
+      - name: provider config, pointed at the real Render proxy
+        run: |
+          mkdir -p ~/.cline/data/settings
+          python3 - <<'PY'
+          import json, os, datetime
+          cfg = {
+            "version": 1,
+            "lastUsedProvider": "openai-compatible",
+            "providers": {"openai-compatible": {
+                "settings": {
+                    "provider": "openai-compatible",
+                    "apiKey": os.environ["LITELLM_MASTER_KEY"],
+                    "model": "plexus-act",
+                    "baseUrl": "https://render-service-srws.onrender.com/v1",
+                    "headers": {}},
+                "updatedAt": datetime.datetime.utcnow().isoformat() + "Z",
+                "tokenSource": "migration"}}}
+          p = os.path.expanduser("~/.cline/data/settings/providers.json")
+          open(p, "w").write(json.dumps(cfg))
+          os.chmod(p, 0o600)
+          PY
+        env:
+          LITELLM_MASTER_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
+
+      - name: run the self-queued task
+        id: run_task
+        shell: bash
+        env:
+          LANE: ${{ inputs.lane }}
+          TASK_TEXT: ${{ inputs.text }}
+          LITELLM_MASTER_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
+        run: |
+          set -o pipefail
+          case "$LANE" in
+            architect) MODEL="plexus-act"; PROMPT_FILE="scripts/prompts/architect.md" ;;
+            coder)     MODEL="plexus-coder"; PROMPT_FILE="scripts/prompts/coder.md" ;;
+            qa)        MODEL="plexus-judge"; PROMPT_FILE="scripts/prompts/qa.md" ;;
+            *) echo "unknown lane: $LANE" >&2; exit 1 ;;
+          esac
+          SYSTEM_PROMPT="$(cat "$PROMPT_FILE")"
+          FULL_PROMPT="$(printf '%s\n\n%s' "$SYSTEM_PROMPT" "$TASK_TEXT")"
+          cline --cwd "$GITHUB_WORKSPACE" -P openai-compatible \
+            -m "$MODEL" \
+            --compaction off --retries 3 --json "$FULL_PROMPT" 2>&1 | tee agent-output.txt
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+
+      - name: extract final answer from the cline json stream
+        id: extract
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os
+          text = ""
+          finish_reason = "unknown"
+          try:
+              with open("agent-output.txt", encoding="utf-8") as fh:
+                  for line in fh:
+                      line = line.strip()
+                      if not line:
+                          continue
+                      try:
+                          d = json.loads(line)
+                      except Exception:
+                          continue
+                      if d.get("type") == "run_result":
+                          text = d.get("text") or ""
+                          finish_reason = d.get("finishReason") or "unknown"
+          except FileNotFoundError:
+              pass
+          out_path = os.environ["GITHUB_OUTPUT"]
+          with open(out_path, "a", encoding="utf-8") as gh:
+              delim = "EOF_ANSWER_9f3a1c"
+              gh.write(f"finish_reason={finish_reason}\n")
+              gh.write(f"answer<<{delim}\n{text}\n{delim}\n")
+          PY
+
+      - name: write result to Turso with a pending-notification marker
+        if: always()
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          LANE: ${{ inputs.lane }}
+          TASK_TEXT: ${{ inputs.text }}
+          CREATOR_ID: ${{ inputs.creator_id }}
+          FINISH_REASON: ${{ steps.extract.outputs.finish_reason }}
+          ANSWER: ${{ steps.extract.outputs.answer }}
+          JOB_STATUS: ${{ job.status }}
+        working-directory: scripts
+        run: |
+          node --input-type=module -e '
+          import { createClient } from "@libsql/client";
+          const db = createClient({ url: process.env.TURSO_DATABASE_URL, authToken: process.env.TURSO_AUTH_TOKEN });
+          const ok = process.env.JOB_STATUS === "success" && process.env.FINISH_REASON === "completed" && process.env.ANSWER.trim() !== "";
+          const status = ok ? "уведомить_готова" : "уведомить_провал";
+          const message = process.env.ANSWER.trim() || `самопоставленная задача не вернула ответ (job status: ${process.env.JOB_STATUS}, finishReason: ${process.env.FINISH_REASON})`;
+          await db.execute({
+            sql: "INSERT INTO tasks (text, status, creator_id, lane, result, actions_run_id) VALUES (?, ?, ?, ?, ?, ?)",
+            args: [process.env.TASK_TEXT, status, process.env.CREATOR_ID, process.env.LANE, message, `github-actions-${process.env.GITHUB_RUN_ID}`]
+          });
+          console.log(`wrote status=${status}`);
+          '
+
+      - name: no key may leave in an artifact
+        if: always()
+        run: |
+          grep -qE '[0-9]{8,10}:[A-Za-z0-9_-]{35}' agent-output.txt 2>/dev/null && { echo "KEY LEAKED"; exit 1; }
+          grep -qE 'gsk_[A-Za-z0-9]{20,}|nvapi-[A-Za-z0-9_-]{20,}' agent-output.txt 2>/dev/null && { echo "KEY LEAKED"; exit 1; }
+          echo "no key in output"
