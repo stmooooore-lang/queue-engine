@@ -469,8 +469,25 @@ async function sendOneTelegramMessage(botToken, chatId, rawText, replyMarkup) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (res.ok) return await res.text();
+    if (res.ok) {
+      const okBody = await res.text();
+      // 2026-08-30: a founder reported a reply-keyboard message ("Отмена"
+      // during a mid-retry notice) arriving with no visible keyboard,
+      // despite the exact same code path working for failureKeyboard() on
+      // the same chat minutes later. Nothing was logged either way to
+      // check against - log the actual API response whenever a keyboard
+      // was requested, success or not, so the next occurrence has real
+      // evidence instead of re-reading source for a bug that may not be
+      // in this file at all (could be a Telegram client quirk).
+      if (replyMarkup) {
+        console.log(`[${new Date().toISOString()}] sendMessage with reply_markup succeeded (${res.status}): ${okBody.slice(0, 300)}`);
+      }
+      return okBody;
+    }
     const errBody = await res.text();
+    if (replyMarkup) {
+      console.log(`[${new Date().toISOString()}] sendMessage with reply_markup FAILED (${res.status}): ${errBody.slice(0, 300)}`);
+    }
     if (parse_mode) {
       console.log(`sendMessage with HTML failed (${res.status}), retrying plain: ${errBody.slice(0, 200)}`);
       continue;
