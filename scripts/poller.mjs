@@ -157,6 +157,27 @@ function classifyRetryReason(message) {
   return "Провайдер сейчас перегружен";
 }
 
+// 2026-08-30: the FINAL failure notice (the one attached to failureKeyboard,
+// after retries are exhausted or on an immediate non-capacity failure) was
+// still sending the raw result.message - things like "код 137: ..." or
+// "completed: (агент ничего не ответил)" - so the Retry/coder/cheap/gemini
+// buttons showed up next to unreadable technical text instead of an actual
+// explanation. classifyRetryReason() alone doesn't cover this: it assumes
+// CAPACITY_RE already matched, which isn't true for a same-attempt failure
+// that broke the retry loop on its first try.
+function classifyFinalReason(message) {
+  if (CAPACITY_RE.test(message)) {
+    return `${classifyRetryReason(message)}, и это не исправилось за ${CAPACITY_RETRY_MAX} попытки`;
+  }
+  if (/агент не вернул run_result/i.test(message)) {
+    return "Не удалось получить ответ от ассистента";
+  }
+  if (/код -?\d+:/i.test(message)) {
+    return "Техническая ошибка при выполнении задачи";
+  }
+  return "Произошла техническая ошибка при обработке запроса";
+}
+
 // Button-tap-as-text: a Telegram reply keyboard sends its label as an
 // ordinary text message, indistinguishable at the Worker from anything the
 // founder typed by hand - recognized here, not in worker/index.js, so the
@@ -834,8 +855,15 @@ async function processTask(db, task, botToken, litellmMasterKey) {
   // Notify via Telegram to creator - reuse exact same logic as executor.mjs.
   // A real (non-capacity, or capacity exhausted 3 times) failure offers a
   // way forward instead of a dead end: retry, or try a different model on
-  // the same request.
-  await notifyTelegram(botToken, task.creator_id, result.message, result.success ? undefined : failureKeyboard());
+  // the same request. The raw result.message still goes into the DB above
+  // (for debugging/history) but the founder gets a human sentence, not
+  // "код 137: ..." next to a Retry button - cancelled is already a clean
+  // sentence and skips the classifier so it isn't reworded into something
+  // that sounds like an error.
+  const founderMessage = result.success || result.message === "Отменено по запросу."
+    ? result.message
+    : `${classifyFinalReason(result.message)}. Задача не потерялась - выбери действие ниже.`;
+  await notifyTelegram(botToken, task.creator_id, founderMessage, result.success ? undefined : failureKeyboard());
 
   console.log(`[${new Date().toISOString()}] Task ${taskId} completed with status: ${status}`);
 }
