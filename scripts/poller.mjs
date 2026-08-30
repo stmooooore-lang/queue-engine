@@ -770,6 +770,16 @@ async function dispatchSelfQueueTask(githubDispatchToken, lane, text, creatorId)
 const PENDING_STATUS = "ожидает";
 const PENDING_BACKGROUND_STATUS = "ожидает_фон";
 
+// 2026-08-31: a second poller instance ("backlog mode") runs on the same
+// VM to chew through the local architect's STACK/AUDIT backlog without
+// ever touching PENDING_STATUS/PENDING_BACKGROUND_STATUS rows - those stay
+// exclusively the live instance's job. This is a temporary arrangement:
+// once the local queue moves onto GitHub Actions (blocked on the org's free
+// minutes resetting), this backlog instance's whole purpose goes away and
+// the VM goes back to running just the one live poller.
+const BACKLOG_STATUS = "ожидает_бэклог";
+const POLL_MODE = process.env.POLL_MODE === "backlog" ? "backlog" : "live";
+
 async function processQueueRequests(db, creatorId, lane) {
   if (lane !== "architect") return; // only the Architect role promotes work
   let raw;
@@ -970,7 +980,12 @@ async function notifyPendingSelfQueuedResults(db, botToken) {
 async function pollLoop(db, botToken, litellmMasterKey, githubDispatchToken) {
   while (true) {
     try {
-      await notifyPendingSelfQueuedResults(db, botToken);
+      // Only the live instance owns self-queue notification - two pollers
+      // both calling this would race on the same rows and could double-send
+      // the same Telegram message.
+      if (POLL_MODE !== "backlog") {
+        await notifyPendingSelfQueuedResults(db, botToken);
+      }
 
       // 2026-08-30: a self-queued follow-up (PENDING_BACKGROUND_STATUS) is,
       // by definition, something the Architect itself decided wasn't
@@ -981,11 +996,16 @@ async function pollLoop(db, botToken, litellmMasterKey, githubDispatchToken) {
       // task runs at a time (the e2-micro VM's RAM doesn't allow more),
       // but a background task in progress is never started AHEAD of a
       // live message that was already waiting.
-      const taskRes = await db.execute({
-        sql: `SELECT * FROM tasks WHERE status IN (?, ?)
-              ORDER BY (status = ?) DESC, created_at ASC LIMIT ?`,
-        args: [PENDING_STATUS, PENDING_BACKGROUND_STATUS, PENDING_STATUS, MAX_CONCURRENT]
-      });
+      const taskRes = POLL_MODE === "backlog"
+        ? await db.execute({
+            sql: `SELECT * FROM tasks WHERE status = ? ORDER BY created_at ASC LIMIT ?`,
+            args: [BACKLOG_STATUS, MAX_CONCURRENT]
+          })
+        : await db.execute({
+            sql: `SELECT * FROM tasks WHERE status IN (?, ?)
+                  ORDER BY (status = ?) DESC, created_at ASC LIMIT ?`,
+            args: [PENDING_STATUS, PENDING_BACKGROUND_STATUS, PENDING_STATUS, MAX_CONCURRENT]
+          });
 
       const tasks = taskRes.rows;
       if (tasks.length === 0) {
