@@ -1,6 +1,13 @@
 model_list:
 - model_name: plexus-judge
   litellm_params:
+    model: vertex_ai/gemini-2.5-pro
+    rpm: 10
+    vertex_project: os.environ/VERTEX_PROJECT
+    vertex_location: us-central1
+    vertex_credentials: os.environ/VERTEX_CREDENTIALS_JSON
+- model_name: plexus-judge
+  litellm_params:
     model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
     rpm: 40
     api_key: os.environ/NVIDIA_API_KEY
@@ -30,6 +37,13 @@ model_list:
     tpm: 8000
     max_tokens: 8000
     api_key: os.environ/GROQ_API_KEY
+- model_name: plexus-pro
+  litellm_params:
+    model: vertex_ai/gemini-2.5-pro
+    rpm: 10
+    vertex_project: os.environ/VERTEX_PROJECT
+    vertex_location: us-central1
+    vertex_credentials: os.environ/VERTEX_CREDENTIALS_JSON
 - model_name: plexus-gemini
   litellm_params:
     model: gemini/gemini-3.7-flash
@@ -130,15 +144,6 @@ router_settings:
     - plexus-cheap
   - plexus-judge:
     - plexus-architect
-  # plexus-gemini-lite restored 2026-08-29 after plexus_hooks.py's history
-  # sanitizer landed (strips foreign tool-call turns before a Gemini-family
-  # deployment, see docs/DECISIONS.md). Removing it earlier the same day
-  # left plexus-act with only Groq (8000 tpm across two thin tiers) as real
-  # fallback capacity, and it ran out in production the same day: NVIDIA
-  # overloaded, coder exhausted, cheap exhausted, no fallback left for cheap
-  # at all -- total failure to a real user. The sanitizer makes gemini-lite
-  # safe again; the plexus-cheap fallback below is the other half of that
-  # same incident's fix.
   - plexus-act:
     - plexus-gemini-lite
     - plexus-coder
