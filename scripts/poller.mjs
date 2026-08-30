@@ -421,12 +421,22 @@ async function notifyTelegram(botToken, chatId, message, replyMarkup) {
 }
 
 export async function fetchHistory(db, creatorId, currentTaskId, lane, limit = 6) {
-  // Fetch last N completed/failed tasks for this creator_id AND lane, excluding current task
+  // 2026-08-30: this used to pull "провал" rows into history too - a failed
+  // task's own `result` is a raw error string (a docker command line with
+  // real host paths, a litellm exception, a SIGKILL/SIGPIPE code, once even
+  // a leaked sanitizer stand-in like "[Tool call(s) read_files were made
+  // earlier...]"), never a real answer. Replaying that as "Ассистент: <raw
+  // error>" in a prior turn hands the model garbage dressed up as its own
+  // past words - a plausible contributor to it answering with nothing at
+  // all, or (observed the same night, in a cloud-agent run) emitting
+  // malformed tool-call-shaped tokens. Only a genuine answer belongs in
+  // replayed history; a failure's own record stays in Turso for
+  // diagnostics, it just does not get fed back in as false context.
   const res = await db.execute({
-    sql: `SELECT text, result FROM tasks 
-          WHERE creator_id = ? AND lane = ? AND status IN (?, ?) AND id != ? 
+    sql: `SELECT text, result FROM tasks
+          WHERE creator_id = ? AND lane = ? AND status = ? AND id != ?
           ORDER BY created_at DESC LIMIT ?`,
-    args: [creatorId, lane, "готова", "провал", currentTaskId, limit]
+    args: [creatorId, lane, "готова", currentTaskId, limit]
   });
   return res.rows;
 }
