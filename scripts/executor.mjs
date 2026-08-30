@@ -194,7 +194,9 @@ async function doWork(text) {
       console.log(`[${new Date().toISOString()}] sanitizeModelText caught garbage output, raw (first 500 chars): ${rawBody.slice(0, 500)}`);
     }
     const body = rawBody ? sanitized : "(агент ничего не ответил)";
-    const ok = result.finishReason === "completed" && !isGarbage;
+    // 2026-08-30: same fix as poller.mjs - an empty text at finishReason
+    // "completed" is a failure, not a silent success.
+    const ok = result.finishReason === "completed" && !isGarbage && rawBody !== "";
     return { success: ok, message: truncate(ok ? body : `${result.finishReason}: ${body}`) };
   } catch (err) {
     const result = err.lastResult;

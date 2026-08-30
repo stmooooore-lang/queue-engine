@@ -133,9 +133,29 @@ const LANE_CONFIG = {
 // CLI-level hiccup, confirmed via queue-log/ going back to 2026-08-19 across
 // unrelated tasks/models/lanes with no correlation to task content - a
 // tooling glitch, not a real task failure, exactly like the others here.
-const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|No deployments available|RateLimitError|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|proxy\/HTTP error|hook dispatch failed|operation timed out/i;
+// 2026-08-30: "агент ничего не ответил" joined this list after task 63
+// completed with finishReason "completed" and empty text - doWork() now
+// treats that as a failure too (see the isGarbage/rawBody check below), and
+// it needs the same retry-with-recovery-path treatment as everything else
+// here rather than a silent false "готова".
+const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|No deployments available|RateLimitError|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|proxy\/HTTP error|hook dispatch failed|operation timed out|агент ничего не ответил/i;
 const CAPACITY_RETRY_MAX = 3;
 const CAPACITY_RETRY_DELAY_MS = 2 * 60 * 1000;
+
+// Human-readable reason for the mid-retry notice - the founder sees this,
+// not the regex that triggered it.
+function classifyRetryReason(message) {
+  if (/агент ничего не ответил/i.test(message)) {
+    return "Ассистент не прислал текстовый ответ, хотя поработал";
+  }
+  if (/proxy\/HTTP error/i.test(message)) {
+    return "Провайдер вернул техническую ошибку вместо ответа";
+  }
+  if (/hook dispatch failed|operation timed out/i.test(message)) {
+    return "Техническая заминка в обработке запроса";
+  }
+  return "Провайдер сейчас перегружен";
+}
 
 // Button-tap-as-text: a Telegram reply keyboard sends its label as an
 // ordinary text message, indistinguishable at the Worker from anything the
@@ -143,6 +163,36 @@ const CAPACITY_RETRY_DELAY_MS = 2 * 60 * 1000;
 // already-working message path there needs no changes at all.
 const BUTTON_RETRY = "Retry";
 const BUTTON_MODEL_MAP = { coder: "plexus-coder", cheap: "plexus-cheap", gemini: "plexus-gemini" };
+// 2026-08-30: separate from failureKeyboard() below - this one shows up
+// mid-retry (task still "выполняется"), before there's any failed task for
+// Retry/coder/cheap/gemini to replay. Its only job is to let the founder
+// stop an unwanted retry early instead of watching it play out to the end.
+const BUTTON_CANCEL = "Отмена";
+function cancelKeyboard() {
+  return {
+    keyboard: [[BUTTON_CANCEL]],
+    resize_keyboard: true,
+    one_time_keyboard: true,
+  };
+}
+// Checked between retry-wait slices (see processTask). A tap lands as an
+// ordinary new "ожидает" row - same mechanism as Retry/coder/cheap/gemini -
+// but nothing else ever consumes it, so it would otherwise sit there until
+// this processTask() call returns and the poll loop finally reaches it,
+// well after the retries it was meant to stop had already finished.
+async function checkForCancel(db, creatorId) {
+  const res = await db.execute({
+    sql: `SELECT id FROM tasks WHERE creator_id = ? AND status = ? AND text = ?
+          ORDER BY created_at DESC LIMIT 1`,
+    args: [creatorId, "ожидает", BUTTON_CANCEL]
+  });
+  if (res.rows.length === 0) return false;
+  await db.execute({
+    sql: "UPDATE tasks SET status = ?, result = ? WHERE id = ?",
+    args: ["готова", "Отмена учтена.", res.rows[0].id]
+  });
+  return true;
+}
 function detectButtonAction(text) {
   const t = (text || "").trim().toLowerCase();
   if (t === BUTTON_RETRY.toLowerCase()) return "retry";
@@ -555,7 +605,12 @@ async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane
         console.log(`[${new Date().toISOString()}] sanitizeModelText caught garbage output, raw (first 500 chars): ${rawBody.slice(0, 500)}`);
       }
       const body = rawBody ? sanitized : "(агент ничего не ответил)";
-      const ok = result.finishReason === "completed" && !isGarbage;
+      // 2026-08-30: task 63 finished with finishReason "completed" and an
+      // empty text - counted as success, delivered to Telegram as a silent
+      // "готова" with nothing in it. rawBody !== "" closes that: an empty
+      // answer is now a failure like any other, eligible for the same
+      // retry-with-recovery-path as everything else in this function.
+      const ok = result.finishReason === "completed" && !isGarbage && rawBody !== "";
       if (attempt > 1) {
         console.log(`[${new Date().toISOString()}] Docker succeeded on attempt ${attempt}/${MAX_ATTEMPTS}`);
       }
@@ -725,6 +780,7 @@ async function processTask(db, task, botToken, litellmMasterKey) {
     // processTask call), not across poll iterations, so no persisted
     // retry-count state is needed.
     let attempt = 0;
+    let cancelled = false;
     do {
       attempt++;
       result = await doWork(db, effectiveText, litellmMasterKey, task.creator_id, taskId, lane, modelOverride);
@@ -732,11 +788,27 @@ async function processTask(db, task, botToken, litellmMasterKey) {
       if (attempt === 1) {
         await notifyTelegram(
           botToken, task.creator_id,
-          `Провайдер занят, попробую снова через 2 минуты (попытка ${attempt} из ${CAPACITY_RETRY_MAX})...`
+          `${classifyRetryReason(result.message)}, пробую ещё раз (попытка ${attempt} из ${CAPACITY_RETRY_MAX}). Если не нужно - нажми «${BUTTON_CANCEL}».`,
+          cancelKeyboard()
         );
       }
-      await new Promise(r => setTimeout(r, CAPACITY_RETRY_DELAY_MS));
+      // Waited in short slices, not one setTimeout for the full 2 minutes,
+      // so a tap on "Отмена" is caught before the NEXT attempt fires -
+      // otherwise the founder has no way to stop an unwanted retry short of
+      // waiting out all CAPACITY_RETRY_MAX attempts.
+      const sliceMs = 15000;
+      for (let waited = 0; waited < CAPACITY_RETRY_DELAY_MS; waited += sliceMs) {
+        await new Promise(r => setTimeout(r, Math.min(sliceMs, CAPACITY_RETRY_DELAY_MS - waited)));
+        if (await checkForCancel(db, task.creator_id)) {
+          cancelled = true;
+          break;
+        }
+      }
+      if (cancelled) break;
     } while (attempt < CAPACITY_RETRY_MAX);
+    if (cancelled) {
+      result = { success: false, message: "Отменено по запросу." };
+    }
   } finally {
     clearInterval(typingInterval);
   }
