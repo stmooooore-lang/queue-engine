@@ -61,6 +61,21 @@ function truncate(s) {
   return s.length > MAX_OUTPUT ? `${s.slice(0, MAX_OUTPUT)}\n… (обрезано)` : s;
 }
 
+// Same guard as poller.mjs (2026-08-30): a raw HTML error page from the
+// proxy must not be forwarded as if it were model text - see poller.mjs's
+// sanitizeModelText for the incident (16 Telegram messages of an
+// unbroken base64 font blob from a Render 502).
+function sanitizeModelText(text) {
+  const t = (text || "").trim();
+  if (!t) return t;
+  const looksLikeHtmlPage = /^<!DOCTYPE html/i.test(t) || /^<html[\s>]/i.test(t);
+  const hasHugeUnbrokenToken = /\S{500,}/.test(t);
+  if (looksLikeHtmlPage || hasHugeUnbrokenToken) {
+    return `[proxy/HTTP error, not a model answer - looks like ${looksLikeHtmlPage ? "an HTML error page" : "a raw binary/encoded blob"}]\n${t.replace(/\s+/g, " ").slice(0, 300)}`;
+  }
+  return t;
+}
+
 // eslint-disable-next-line no-control-regex
 const ANSI = /\x1b\[[0-9;]*m/g;
 
@@ -169,11 +184,12 @@ async function doWork(text) {
       return { success: false, message: truncate(`агент не вернул run_result\n${tail.replace(ANSI, "").slice(-1500)}`) };
     }
     const ok = result.finishReason === "completed";
-    const body = (result.text || "(агент ничего не ответил)").trim();
+    const rawBody = (result.text || "").trim();
+    const body = rawBody ? sanitizeModelText(rawBody) : "(агент ничего не ответил)";
     return { success: ok, message: truncate(ok ? body : `${result.finishReason}: ${body}`) };
   } catch (err) {
     const result = err.lastResult;
-    if (result) return { success: false, message: truncate(`${result.finishReason}: ${(result.text || "").trim()}`) };
+    if (result) return { success: false, message: truncate(`${result.finishReason}: ${sanitizeModelText(result.text)}`) };
     const first = String(err.message || err).split("\n")[0];
     const code = err.code ?? err.signal ?? "?";
     return { success: false, message: truncate(`код ${code}: ${first}`) };

@@ -131,6 +131,27 @@ async function loadRolePrompt(lane) {
 // got cut mid-sentence at 3500 chars with no way to see the rest).
 const MAX_OUTPUT = 60000;
 
+// 2026-08-30: a Render 502 returned a raw HTML error page (complete with
+// inline <style> and base64-encoded font data) instead of JSON. Nothing in
+// the pipeline distinguished that from a real model answer - it went
+// through truncate() and Telegram's own chunker as if it were text, and
+// arrived as 16 messages, the tail end of which is one unbroken base64
+// token with no spaces: it reads as noise regardless of whether HTML tags
+// survive Telegram's rendering. Catch this before it reaches truncate().
+function sanitizeModelText(text) {
+  const t = (text || "").trim();
+  if (!t) return t;
+  const looksLikeHtmlPage = /^<!DOCTYPE html/i.test(t) || /^<html[\s>]/i.test(t);
+  // A run of 500+ characters with no whitespace is never legitimate model
+  // prose - it is exactly the shape of a base64 blob or a minified asset
+  // accidentally captured as "the answer".
+  const hasHugeUnbrokenToken = /\S{500,}/.test(t);
+  if (looksLikeHtmlPage || hasHugeUnbrokenToken) {
+    return `[proxy/HTTP error, not a model answer - looks like ${looksLikeHtmlPage ? "an HTML error page" : "a raw binary/encoded blob"}]\n${t.replace(/\s+/g, " ").slice(0, 300)}`;
+  }
+  return t;
+}
+
 function truncate(s) {
   return s.length > MAX_OUTPUT
     ? `${s.slice(0, MAX_OUTPUT)}\n… (обрезано, ответ был необычно длинным)`
@@ -458,7 +479,8 @@ async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane
       }
 
       const ok = result.finishReason === "completed";
-      const body = (result.text || "(агент ничего не ответил)").trim();
+      const rawBody = (result.text || "").trim();
+      const body = rawBody ? sanitizeModelText(rawBody) : "(агент ничего не ответил)";
       if (attempt > 1) {
         console.log(`[${new Date().toISOString()}] Docker succeeded on attempt ${attempt}/${MAX_ATTEMPTS}`);
       }
@@ -492,7 +514,7 @@ async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane
   const err = lastError;
   const result = err.lastResult;
   if (result) {
-    return { success: false, message: truncate(`${result.finishReason}: ${(result.text || "").trim()}`) };
+    return { success: false, message: truncate(`${result.finishReason}: ${sanitizeModelText(result.text)}`) };
   }
   const first = String(err.message || err).split("\n")[0];
   const code = err.code ?? err.signal ?? "?";
