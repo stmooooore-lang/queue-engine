@@ -736,8 +736,13 @@ async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane
     // 2026-08-31: was "off" - same fix as the local repo's queue.sh, kept
     // consistent on purpose. Cline's own compaction is its designed
     // mitigation for cline#5842 (context loss, restarts analysis), not
-    // just a cost toggle.
-    "--compaction", "on",
+    // just a cost toggle. NOTE: cline's actual CLI only accepts
+    // agentic|basic|off (confirmed via `cline --help`) - "on" is not a
+    // valid mode and made every single task fail instantly with a CLI
+    // argument error for ~10-15 min until caught. "agentic" is cline's
+    // own default (compaction already on by default) - set explicitly
+    // here so the intent stays documented.
+    "--compaction", "agentic",
     "--retries", "3",
     "--json",
     combinedPrompt
