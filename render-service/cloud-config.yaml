@@ -118,6 +118,14 @@ model_list:
     reasoning_effort: low
     rpm: 5
     api_key: os.environ/GEMINI_API_KEY
+# plexus-gemini-lite: four models measured 2026-08-28 to hold a two-step
+# tool call without a thought_signature error. The other five plexus-gemini
+# entries above were quota-exhausted the day of that measurement and were
+# never tested - unknown, not confirmed-good, not confirmed-bad. Do not
+# widen this group until the local repo's STACK-12 task actually measures
+# them and passes - same rule and same 9-vs-4 shape as
+# `Continue MODELS integration/config.yaml` (kept in sync 2026-08-31; widen
+# both configs together, never just one).
 - model_name: plexus-gemini-lite
   litellm_params:
     model: gemini/gemini-3.1-flash-lite-preview
