@@ -622,9 +622,18 @@ async function triageCheck(db, text, litellmMasterKey, creatorId, currentTaskId)
   // 2026-08-31, founder's own observation, kept consistent with the local
   // repo's queue.sh version of this same check.
   const stepMatches = text.match(/^\s*\d+\.\s/gm) || [];
-  const backtickItems = new Set(text.match(/`[^`]+`/g) || []);
   const looksLikeForEach = /for each|для кажд/i.test(text);
-  if (stepMatches.length <= TRIAGE_STEP_THRESHOLD && !(looksLikeForEach && backtickItems.size >= 3)) return null;
+  // 2026-08-31: dropped the "≥3 backtick-quoted items" requirement - task
+  // id=82 ("для каждой модели..." listing 5 models as a plain
+  // comma-separated list, no backticks) sailed through this gate
+  // untouched, ran as one un-split cloud task. The backtick count was only
+  // ever a cheap proxy for "there's a real list here" to avoid an LLM call
+  // on every trivial task; the actual split/no-split judgment is already
+  // made correctly by the triage LLM call below, so the phrase alone is
+  // enough to justify asking it - a false positive here costs one cheap
+  // plexus-gemini-lite call, a false negative silently skips
+  // decomposition entirely (worse, and exactly what happened).
+  if (stepMatches.length <= TRIAGE_STEP_THRESHOLD && !looksLikeForEach) return null;
   try {
     const triageQ = `Задача ниже написана как ОДНА единица работы для агента, но выглядит большой. Оцени честно: это реально одна связная единица, или несколько независимых шагов, каждый из которых можно сделать и проверить отдельно? Дробить нужно и в случае "сделай X, потом Y, потом Z" (разные шаги), И в случае "сделай одну и ту же процедуру для каждого из N похожих элементов" (например, проверить одно и то же поведение на N разных моделях по очереди) - во втором случае каждый элемент списка становится своей подзадачей.
 
