@@ -635,28 +635,31 @@ ${text}`;
     const parsed = JSON.parse(jsonMatch[0]);
     if (!parsed.split || !Array.isArray(parsed.subtasks) || parsed.subtasks.length === 0) return null;
 
-    const queued = [];
-    const manual = [];
+    // 2026-08-31: founder's own call - auto-queue dev pieces too (lane=coder),
+    // accepting that a piece about OUR infra (queue-engine/local project)
+    // lands as a branch in plexus-doc (coder's repo) instead of the right
+    // one. coder never pushes to main/release or self-approves acceptance
+    // (coder.md) - worst case is a branch in the wrong repo, cheap to move
+    // by hand, not an auto-deploy or any other real risk.
+    const queuedArchitect = [];
+    const queuedCoder = [];
     for (const st of parsed.subtasks) {
       const title = (st.title || "").trim();
       const kind = (st.kind || "dev").trim();
       const ctx = (st.context || "").trim();
       if (!title || !ctx) continue;
-      if (kind === "research") {
-        await db.execute({
-          sql: "INSERT INTO tasks (text, status, creator_id, lane) VALUES (?, ?, ?, ?)",
-          args: [ctx, PENDING_BACKGROUND_STATUS, creatorId, "architect"],
-        });
-        queued.push(title);
-      } else {
-        manual.push(title);
-      }
+      const lane = kind === "research" ? "architect" : "coder";
+      await db.execute({
+        sql: "INSERT INTO tasks (text, status, creator_id, lane) VALUES (?, ?, ?, ?)",
+        args: [ctx, PENDING_BACKGROUND_STATUS, creatorId, lane],
+      });
+      (lane === "architect" ? queuedArchitect : queuedCoder).push(title);
     }
-    if (queued.length === 0 && manual.length === 0) return null;
+    if (queuedArchitect.length === 0 && queuedCoder.length === 0) return null;
 
     let msg = "ТРИАЖ: задача похожа на несколько независимых шагов, а не один.\n";
-    if (queued.length > 0) msg += `\nАвтоматически поставлено в фоновую очередь (architect):\n${queued.map((t) => `- ${t}`).join("\n")}\n`;
-    if (manual.length > 0) msg += `\nЭто требует кода/репозитория, не ставлю автоматически (не тот репозиторий) - нужно направить вручную:\n${manual.map((t) => `- ${t}`).join("\n")}\n`;
+    if (queuedArchitect.length > 0) msg += `\nАвтоматически поставлено в фоновую очередь (architect):\n${queuedArchitect.map((t) => `- ${t}`).join("\n")}\n`;
+    if (queuedCoder.length > 0) msg += `\nАвтоматически поставлено в фоновую очередь (coder) - если задача была про НАШУ инфраструктуру, а не продукт Плексуса, ветка появится в repo plexus-doc и её нужно будет вручную перенести:\n${queuedCoder.map((t) => `- ${t}`).join("\n")}\n`;
     return msg;
   } catch (err) {
     console.log(`[${new Date().toISOString()}] triageCheck failed (non-fatal, proceeding as one task): ${err.message}`);
