@@ -108,8 +108,17 @@ const POLL_INTERVAL_MS = 10000;
 // Max concurrent tasks (e2-micro has limited RAM)
 const MAX_CONCURRENT = 1;
 
-// Cline timeout (25 minutes, same as executor.yml)
-const CLINE_TIMEOUT_MS = 120 * 60 * 1000;
+// Cline timeout - was 120 min despite this comment already saying 25;
+// 2026-08-31: fixed to actually match queue.sh's TASK_TIMEOUT_MIN=25
+// (same cline#5842 rationale - no legitimate task run needs 120 min, a
+// stuck one has no reason to keep the VM's one MAX_CONCURRENT slot that
+// long). NOTE: poller.mjs still has no equivalent of queue.sh's
+// REPEAT_CALL_THRESHOLD tool-call-repetition detector - that part of the
+// "apply to both stacks" mitigation was never actually ported here
+// despite AGENT-RULES.md #15 saying it was. Porting it needs cline's
+// --json tool-call event schema confirmed first (not yet done, cut short
+// to control cost) - flagged as a follow-up, not silently claimed done.
+const CLINE_TIMEOUT_MS = 25 * 60 * 1000;
 
 // Lane → { model, promptFile }
 const LANE_CONFIG = {
