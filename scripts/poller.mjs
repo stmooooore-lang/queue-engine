@@ -733,7 +733,11 @@ async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane
     "--cwd", "/home/runner/plexus-doc",
     "-P", "openai-compatible",
     "-m", model,
-    "--compaction", "off",
+    // 2026-08-31: was "off" - same fix as the local repo's queue.sh, kept
+    // consistent on purpose. Cline's own compaction is its designed
+    // mitigation for cline#5842 (context loss, restarts analysis), not
+    // just a cost toggle.
+    "--compaction", "on",
     "--retries", "3",
     "--json",
     combinedPrompt

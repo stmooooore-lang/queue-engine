@@ -11,6 +11,18 @@ model_list:
     model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
     rpm: 40
     api_key: os.environ/NVIDIA_API_KEY
+# 2026-08-31: same deployment/credential as plexus-judge above, SAME
+# trial-credit pool (Vertex billing is per-project, not per litellm
+# model_name). rpm kept at 5, lower than judge's 10, so research bursts
+# cannot outrun judge's own reserved share of the credit. Kept consistent
+# with the identical addition in the local repo's config.yaml.
+- model_name: plexus-research
+  litellm_params:
+    model: vertex_ai/gemini-2.5-pro
+    rpm: 5
+    vertex_project: os.environ/VERTEX_PROJECT
+    vertex_location: us-central1
+    vertex_credentials: os.environ/VERTEX_CREDENTIALS_JSON
 - model_name: plexus-architect
   litellm_params:
     model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
