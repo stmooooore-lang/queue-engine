@@ -23,6 +23,19 @@ model_list:
     vertex_project: os.environ/VERTEX_PROJECT
     vertex_location: us-central1
     vertex_credentials: os.environ/VERTEX_CREDENTIALS_JSON
+# 2026-08-31: same addition as local config.yaml - two independent
+# outside-expert reviews ranked Claude as the most loop-resistant family
+# for long agentic Cline sessions. Confirmed live in this GCP project
+# (`gcloud ai model-garden models list`, CAN_PREDICT: Yes for
+# claude-sonnet-5@default). Same Vertex project/creds as every other
+# Vertex entry here, but a separate cost line from the Gemini trial
+# credit - Anthropic-on-Vertex bills independently.
+- model_name: plexus-claude
+  litellm_params:
+    model: vertex_ai/claude-sonnet-5@default
+    vertex_project: os.environ/VERTEX_PROJECT
+    vertex_location: us-central1
+    vertex_credentials: os.environ/VERTEX_CREDENTIALS_JSON
 - model_name: plexus-architect
   litellm_params:
     model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
