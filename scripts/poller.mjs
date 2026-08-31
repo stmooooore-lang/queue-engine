@@ -166,6 +166,14 @@ function classifyRetryReason(message) {
 // CAPACITY_RE already matched, which isn't true for a same-attempt failure
 // that broke the retry loop on its first try.
 function classifyFinalReason(message) {
+  // 2026-08-31: the ONE case where the raw message itself IS the useful
+  // content, not something to classify away - the triage decomposition
+  // proposal (see triageCheck()) needs to actually reach the founder, or
+  // the whole feature is silently pointless (the founder would just see
+  // "technical error" and never learn a split was suggested).
+  if (/^ТРИАЖ:/.test(message)) {
+    return message;
+  }
   if (CAPACITY_RE.test(message)) {
     return `${classifyRetryReason(message)}, и это не исправилось за ${CAPACITY_RETRY_MAX} попытки`;
   }
@@ -577,7 +585,50 @@ function buildPromptWithHistory(currentText, historyRows) {
   return prompt;
 }
 
+// 2026-08-31: same finding as the local repo's queue.sh, same fix, kept
+// consistent on purpose - open-ended multi-step tasks (investigation +
+// build + infra in one prompt) repeatedly get Cline stuck re-reading
+// context in a loop instead of making progress, on both the local queue
+// and here. Checks BEFORE the docker/cline invocation starts, via a
+// plain HTTP completion (never cline - that is the exact machinery that
+// gets stuck). Fails SAFE on any error: returns null, doWork() proceeds
+// exactly as before. Detector only, never an auto-splitter - writing a
+// real follow-up task with an actual acceptance check is a reviewed step,
+// not something an unsupervised cheap model should do unattended.
+const TRIAGE_STEP_THRESHOLD = 4;
+async function triageCheck(text, litellmMasterKey) {
+  const stepMatches = text.match(/^\s*\d+\.\s/gm) || [];
+  if (stepMatches.length <= TRIAGE_STEP_THRESHOLD) return null;
+  try {
+    const triageQ = `Задача ниже написана как ОДНА единица работы для агента. Оцени честно: это реально одна связная единица, или несколько независимых шагов, каждый из которых можно сделать и проверить отдельно? Если несколько - перечисли их короткими заголовками, каждый на новой строке, начиная с "ПОДЗАДАЧА: ", и в конце строки в квадратных скобках укажи её характер - [research] для расследования/измерения, [dev] для написания/деплоя кода (это определяет, какая модель её будет исполнять). Если это правда одна связная единица (даже большая) - ответь ровно "ОДНА ЕДИНИЦА", без пояснений.\n\n---\n${text}`;
+    const res = await fetch("https://render-service-srws.onrender.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${litellmMasterKey}` },
+      body: JSON.stringify({ model: "plexus-gemini-lite", messages: [{ role: "user", content: triageQ }], max_tokens: 600 }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const content = data?.choices?.[0]?.message?.content;
+    if (!content || content.includes("ОДНА ЕДИНИЦА")) return null;
+    const proposal = content.split("\n").filter((l) => l.trim().startsWith("ПОДЗАДАЧА:")).join("\n");
+    return proposal || null;
+  } catch (err) {
+    console.log(`[${new Date().toISOString()}] triageCheck failed (non-fatal, proceeding as one task): ${err.message}`);
+    return null;
+  }
+}
+
 async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane, modelOverride) {
+  const triageProposal = await triageCheck(text, litellmMasterKey);
+  if (triageProposal) {
+    console.log(`[${new Date().toISOString()}] ТРИАЖ: похоже на несколько единиц работы:\n${triageProposal}`);
+    return {
+      success: false,
+      message: `ТРИАЖ: задача похожа на несколько независимых шагов, а не один — предлагаю разбить перед выполнением, вместо того чтобы гнать всё целиком:\n\n${triageProposal}\n\nЕсли всё же нужно выполнить как есть — нажми Retry.`,
+    };
+  }
+
   // Load role-specific prompt and model for this lane. An explicit
   // modelOverride (from a "coder"/"cheap"/"gemini" button tap) bypasses the
   // lane's own model choice but keeps its system prompt and history scope -
