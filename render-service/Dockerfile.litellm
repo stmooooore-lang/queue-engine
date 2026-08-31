@@ -15,6 +15,14 @@ FROM python:3.12-slim-bookworm
 # refuses outright.
 RUN pip3 install --break-system-packages --no-cache-dir "litellm[proxy]==1.83.9"
 
+# 2026-08-31: Anthropic-on-Vertex (plexus-claude) needs the full
+# google-cloud-aiplatform SDK's `vertexai` submodule - litellm's Gemini
+# path never needed it (lighter REST call), so this was never installed
+# before. Without it: "vertexai import failed ... No module named
+# 'vertexai'" on every plexus-claude call, masked behind a fallback error
+# that looked unrelated.
+RUN pip3 install --break-system-packages --no-cache-dir "google-cloud-aiplatform>=1.38"
+
 WORKDIR /app
 
 # Copy LiteLLM config and hooks
