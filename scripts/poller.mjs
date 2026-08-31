@@ -592,27 +592,72 @@ function buildPromptWithHistory(currentText, historyRows) {
 // and here. Checks BEFORE the docker/cline invocation starts, via a
 // plain HTTP completion (never cline - that is the exact machinery that
 // gets stuck). Fails SAFE on any error: returns null, doWork() proceeds
-// exactly as before. Detector only, never an auto-splitter - writing a
-// real follow-up task with an actual acceptance check is a reviewed step,
-// not something an unsupervised cheap model should do unattended.
+// exactly as before.
+//
+// Auto-splits "research" pieces (self-queued as new architect-lane tasks,
+// same PENDING_BACKGROUND_STATUS mechanism as processQueueRequests below -
+// pure text/discussion, no repo dependency, safe to run unattended). Does
+// NOT auto-queue "dev" pieces as lane=coder: coder's repo is
+// `/home/runner/plexus-doc` (Plexus's OWN product repo) - a dev-shaped
+// piece from a task about THIS infrastructure (queue-engine, the local
+// Continue-MODELS-integration project) would silently run against the
+// wrong codebase if auto-queued the same way. Dev pieces are named in the
+// reply instead, for the founder to route by hand (local queue.sh has its
+// own, now-automated, triage for exactly this - see AGENT-RULES.md #14).
 const TRIAGE_STEP_THRESHOLD = 4;
-async function triageCheck(text, litellmMasterKey) {
+async function triageCheck(db, text, litellmMasterKey, creatorId) {
   const stepMatches = text.match(/^\s*\d+\.\s/gm) || [];
   if (stepMatches.length <= TRIAGE_STEP_THRESHOLD) return null;
   try {
-    const triageQ = `Задача ниже написана как ОДНА единица работы для агента. Оцени честно: это реально одна связная единица, или несколько независимых шагов, каждый из которых можно сделать и проверить отдельно? Если несколько - перечисли их короткими заголовками, каждый на новой строке, начиная с "ПОДЗАДАЧА: ", и в конце строки в квадратных скобках укажи её характер - [research] для расследования/измерения, [dev] для написания/деплоя кода (это определяет, какая модель её будет исполнять). Если это правда одна связная единица (даже большая) - ответь ровно "ОДНА ЕДИНИЦА", без пояснений.\n\n---\n${text}`;
+    const triageQ = `Задача ниже написана как ОДНА единица работы для агента, но выглядит большой. Оцени честно: это реально одна связная единица, или несколько независимых шагов, каждый из которых можно сделать и проверить отдельно?
+
+Если ОДНА связная единица (даже большая) - ответь ровно: {"split": false}
+
+Если НЕСКОЛЬКО - ответь JSON строго такой формы, без пояснений вокруг:
+{"split": true, "subtasks": [{"title": "короткий заголовок", "kind": "research или dev", "context": "самодостаточный текст задачи для этого шага - его увидит агент БЕЗ доступа к этому разговору, пиши так, чтобы он сам всё понял"}]}
+
+kind=research - расследование/обсуждение/текст, без правки кода и файлов. kind=dev - написание кода, деплой, работа с репозиторием. Оцени каждый шаг честно по отдельности.
+
+---
+${text}`;
     const res = await fetch("https://render-service-srws.onrender.com/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${litellmMasterKey}` },
-      body: JSON.stringify({ model: "plexus-gemini-lite", messages: [{ role: "user", content: triageQ }], max_tokens: 600 }),
-      signal: AbortSignal.timeout(30000),
+      body: JSON.stringify({ model: "plexus-gemini-lite", messages: [{ role: "user", content: triageQ }], max_tokens: 1500 }),
+      signal: AbortSignal.timeout(40000),
     });
     if (!res.ok) return null;
     const data = await res.json();
     const content = data?.choices?.[0]?.message?.content;
-    if (!content || content.includes("ОДНА ЕДИНИЦА")) return null;
-    const proposal = content.split("\n").filter((l) => l.trim().startsWith("ПОДЗАДАЧА:")).join("\n");
-    return proposal || null;
+    if (!content) return null;
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (!parsed.split || !Array.isArray(parsed.subtasks) || parsed.subtasks.length === 0) return null;
+
+    const queued = [];
+    const manual = [];
+    for (const st of parsed.subtasks) {
+      const title = (st.title || "").trim();
+      const kind = (st.kind || "dev").trim();
+      const ctx = (st.context || "").trim();
+      if (!title || !ctx) continue;
+      if (kind === "research") {
+        await db.execute({
+          sql: "INSERT INTO tasks (text, status, creator_id, lane) VALUES (?, ?, ?, ?)",
+          args: [ctx, PENDING_BACKGROUND_STATUS, creatorId, "architect"],
+        });
+        queued.push(title);
+      } else {
+        manual.push(title);
+      }
+    }
+    if (queued.length === 0 && manual.length === 0) return null;
+
+    let msg = "ТРИАЖ: задача похожа на несколько независимых шагов, а не один.\n";
+    if (queued.length > 0) msg += `\nАвтоматически поставлено в фоновую очередь (architect):\n${queued.map((t) => `- ${t}`).join("\n")}\n`;
+    if (manual.length > 0) msg += `\nЭто требует кода/репозитория, не ставлю автоматически (не тот репозиторий) - нужно направить вручную:\n${manual.map((t) => `- ${t}`).join("\n")}\n`;
+    return msg;
   } catch (err) {
     console.log(`[${new Date().toISOString()}] triageCheck failed (non-fatal, proceeding as one task): ${err.message}`);
     return null;
@@ -620,12 +665,12 @@ async function triageCheck(text, litellmMasterKey) {
 }
 
 async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane, modelOverride) {
-  const triageProposal = await triageCheck(text, litellmMasterKey);
-  if (triageProposal) {
-    console.log(`[${new Date().toISOString()}] ТРИАЖ: похоже на несколько единиц работы:\n${triageProposal}`);
+  const triageMsg = await triageCheck(db, text, litellmMasterKey, creatorId);
+  if (triageMsg) {
+    console.log(`[${new Date().toISOString()}] ${triageMsg}`);
     return {
       success: false,
-      message: `ТРИАЖ: задача похожа на несколько независимых шагов, а не один — предлагаю разбить перед выполнением, вместо того чтобы гнать всё целиком:\n\n${triageProposal}\n\nЕсли всё же нужно выполнить как есть — нажми Retry.`,
+      message: `${triageMsg}\nЕсли всё же нужно выполнить как есть — нажми Retry.`,
     };
   }
 
