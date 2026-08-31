@@ -605,7 +605,7 @@ function buildPromptWithHistory(currentText, historyRows) {
 // reply instead, for the founder to route by hand (local queue.sh has its
 // own, now-automated, triage for exactly this - see AGENT-RULES.md #14).
 const TRIAGE_STEP_THRESHOLD = 4;
-async function triageCheck(db, text, litellmMasterKey, creatorId) {
+async function triageCheck(db, text, litellmMasterKey, creatorId, currentTaskId) {
   // Two different shapes miss each other otherwise: a numbered list of
   // distinct steps, and "do the same procedure for each of N similar
   // items" (one sentence, but N items to process one at a time - not
@@ -649,6 +649,20 @@ ${text}`;
     // one. coder never pushes to main/release or self-approves acceptance
     // (coder.md) - worst case is a branch in the wrong repo, cheap to move
     // by hand, not an auto-deploy or any other real risk.
+    // 2026-08-31: children inherit the PARENT's own created_at instead of
+    // getting a fresh "now" timestamp - pollLoop's query orders background
+    // tasks by created_at ASC, so a fresh timestamp always sorts a split's
+    // children behind every other already-pending background task, no
+    // matter how urgent the parent was. Founder's own catch (mirrored from
+    // the same fix in the local repo's queue.sh, kept consistent). Falls
+    // back to "now" if the parent row can't be read, rather than failing
+    // the whole split over a missing timestamp.
+    let inheritedCreatedAt = null;
+    try {
+      const parentRow = await db.execute({ sql: "SELECT created_at FROM tasks WHERE id = ?", args: [currentTaskId] });
+      inheritedCreatedAt = parentRow.rows[0]?.created_at || null;
+    } catch { /* fall through to "now" below */ }
+
     const queuedArchitect = [];
     const queuedCoder = [];
     for (const st of parsed.subtasks) {
@@ -657,10 +671,17 @@ ${text}`;
       const ctx = (st.context || "").trim();
       if (!title || !ctx) continue;
       const lane = kind === "research" ? "architect" : "coder";
-      await db.execute({
-        sql: "INSERT INTO tasks (text, status, creator_id, lane) VALUES (?, ?, ?, ?)",
-        args: [ctx, PENDING_BACKGROUND_STATUS, creatorId, lane],
-      });
+      if (inheritedCreatedAt) {
+        await db.execute({
+          sql: "INSERT INTO tasks (text, status, creator_id, lane, created_at) VALUES (?, ?, ?, ?, ?)",
+          args: [ctx, PENDING_BACKGROUND_STATUS, creatorId, lane, inheritedCreatedAt],
+        });
+      } else {
+        await db.execute({
+          sql: "INSERT INTO tasks (text, status, creator_id, lane) VALUES (?, ?, ?, ?)",
+          args: [ctx, PENDING_BACKGROUND_STATUS, creatorId, lane],
+        });
+      }
       (lane === "architect" ? queuedArchitect : queuedCoder).push(title);
     }
     if (queuedArchitect.length === 0 && queuedCoder.length === 0) return null;
@@ -676,7 +697,7 @@ ${text}`;
 }
 
 async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane, modelOverride) {
-  const triageMsg = await triageCheck(db, text, litellmMasterKey, creatorId);
+  const triageMsg = await triageCheck(db, text, litellmMasterKey, creatorId, currentTaskId);
   if (triageMsg) {
     console.log(`[${new Date().toISOString()}] ${triageMsg}`);
     return {
