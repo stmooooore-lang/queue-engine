@@ -998,11 +998,24 @@ async function processTask(db, task, botToken, litellmMasterKey, githubDispatchT
     console.log(`[${new Date().toISOString()}] Task ${taskId}: button action "${buttonAction}" -> replaying task ${prev.id}${modelOverride ? ` on ${modelOverride}` : ""}`);
   }
 
-  // Mark as running - reuse exact same query as executor.mjs
-  await db.execute({
-    sql: "UPDATE tasks SET status = ?, actions_run_id = ? WHERE id = ?",
-    args: ["выполняется", `poller-${process.pid}-${Date.now()}`, taskId]
+  // Mark as running - claim is guarded by the row's own pre-fetch status
+  // (2026-08-31: found task id=81 stuck showing "выполняется" forever
+  // despite `result` already holding a real terminal error - this UPDATE
+  // had no WHERE guard, so a second poller instance racing on the same
+  // SELECT could re-claim a row another instance had already finalized,
+  // flipping status back to "running" over a completed result. Guarding
+  // on task.status (the value this row had when SELECTed) turns the claim
+  // into a compare-and-swap: if another process already moved it,
+  // rowsAffected is 0 and this instance backs off instead of re-running
+  // doWork() and overwriting a real outcome.
+  const claim = await db.execute({
+    sql: "UPDATE tasks SET status = ?, actions_run_id = ? WHERE id = ? AND status = ?",
+    args: ["выполняется", `poller-${process.pid}-${Date.now()}`, taskId, task.status]
   });
+  if (claim.rowsAffected === 0) {
+    console.log(`[${new Date().toISOString()}] Task ${taskId}: claim lost to another poller instance, skipping`);
+    return;
+  }
 
   // Execute work - keep typing visible for the whole duration, not just
   // the Worker's one-shot send on receipt. Includes any capacity-retry
