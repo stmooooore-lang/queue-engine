@@ -606,12 +606,20 @@ function buildPromptWithHistory(currentText, historyRows) {
 // own, now-automated, triage for exactly this - see AGENT-RULES.md #14).
 const TRIAGE_STEP_THRESHOLD = 4;
 async function triageCheck(db, text, litellmMasterKey, creatorId) {
+  // Two different shapes miss each other otherwise: a numbered list of
+  // distinct steps, and "do the same procedure for each of N similar
+  // items" (one sentence, but N items to process one at a time - not
+  // caught by counting numbered steps, since there's only one).
+  // 2026-08-31, founder's own observation, kept consistent with the local
+  // repo's queue.sh version of this same check.
   const stepMatches = text.match(/^\s*\d+\.\s/gm) || [];
-  if (stepMatches.length <= TRIAGE_STEP_THRESHOLD) return null;
+  const backtickItems = new Set(text.match(/`[^`]+`/g) || []);
+  const looksLikeForEach = /for each|для кажд/i.test(text);
+  if (stepMatches.length <= TRIAGE_STEP_THRESHOLD && !(looksLikeForEach && backtickItems.size >= 3)) return null;
   try {
-    const triageQ = `Задача ниже написана как ОДНА единица работы для агента, но выглядит большой. Оцени честно: это реально одна связная единица, или несколько независимых шагов, каждый из которых можно сделать и проверить отдельно?
+    const triageQ = `Задача ниже написана как ОДНА единица работы для агента, но выглядит большой. Оцени честно: это реально одна связная единица, или несколько независимых шагов, каждый из которых можно сделать и проверить отдельно? Дробить нужно и в случае "сделай X, потом Y, потом Z" (разные шаги), И в случае "сделай одну и ту же процедуру для каждого из N похожих элементов" (например, проверить одно и то же поведение на N разных моделях по очереди) - во втором случае каждый элемент списка становится своей подзадачей.
 
-Если ОДНА связная единица (даже большая) - ответь ровно: {"split": false}
+Если ОДНА связная единица (даже большая, даже с одним элементом в списке) - ответь ровно: {"split": false}
 
 Если НЕСКОЛЬКО - ответь JSON строго такой формы, без пояснений вокруг:
 {"split": true, "subtasks": [{"title": "короткий заголовок", "kind": "research или dev", "context": "самодостаточный текст задачи для этого шага - его увидит агент БЕЗ доступа к этому разговору, пиши так, чтобы он сам всё понял"}]}
