@@ -763,6 +763,7 @@ async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane
     "--compaction", "agentic",
     "--retries", "3",
     "--json",
+    "--verbose",
     combinedPrompt
   ];
 
