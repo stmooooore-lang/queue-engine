@@ -649,7 +649,13 @@ ${text}`;
     const res = await fetch("https://render-service-srws.onrender.com/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${litellmMasterKey}` },
-      body: JSON.stringify({ model: "plexus-gemini-lite", messages: [{ role: "user", content: triageQ }], max_tokens: 1500 }),
+      // 2026-08-31: was "plexus-gemini-lite". Founder's own call: freed
+      // up plexus-architect (still nemotron-3-ultra-550b) specifically
+      // for this - "receiving tasks and routing to different roles" is
+      // this triage/decomposition judgment, and it's a role in its own
+      // right now that plexus-act moved to a smaller reasoning model for
+      // the live conversational role.
+      body: JSON.stringify({ model: "plexus-architect", messages: [{ role: "user", content: triageQ }], max_tokens: 1500 }),
       signal: AbortSignal.timeout(40000),
     });
     if (!res.ok) return null;

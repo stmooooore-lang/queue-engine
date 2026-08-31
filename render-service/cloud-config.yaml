@@ -191,7 +191,17 @@ model_list:
     api_key: os.environ/MISTRAL_API_KEY
 - model_name: plexus-act
   litellm_params:
-    model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
+    # 2026-08-31: was nemotron-3-ultra-550b (same as plexus-architect
+    # below). Founder's own call: this is the model actually serving the
+    # live interactive Architect role in the Telegram chat (LANE_CONFIG
+    # in poller.mjs maps lane "architect" to model group "plexus-act",
+    # NOT to the separate "plexus-architect" entry below - that one is
+    # freed up for triage/routing instead, see plexus_hooks.py/poller.mjs
+    # triageCheck()). This lane's real job is creative, context-holding
+    # judgment in a live conversation, not strict reliability - a
+    # reasoning-first model fits better here, even if less "safe" than a
+    # bigger plain model. Same model as local queue.sh's plexus-act.
+    model: nvidia_nim/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning
     rpm: 40
     api_key: os.environ/NVIDIA_API_KEY
 router_settings:
