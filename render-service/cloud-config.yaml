@@ -34,7 +34,10 @@ model_list:
   litellm_params:
     model: vertex_ai/claude-sonnet-5@default
     vertex_project: os.environ/VERTEX_PROJECT
-    vertex_location: us-central1
+    # 2026-08-31: same fix as local config.yaml - Claude on Vertex has no
+    # real quota bucket in us-central1 at all; us-east5 is the
+    # best-evidenced region (`gcloud alpha services quota list`).
+    vertex_location: us-east5
     vertex_credentials: os.environ/VERTEX_CREDENTIALS_JSON
 - model_name: plexus-architect
   litellm_params:
