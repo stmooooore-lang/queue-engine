@@ -31,18 +31,24 @@ model_list:
 # in Plexus's own local config.yaml for the same model_name - restoring
 # them here gives plexus-coder a non-Groq path so it stops sharing fate
 # with plexus-cheap on every Groq throttle.
-- model_name: plexus-coder
-  litellm_params:
-    model: mistral/devstral-2512
-    rpm: 50
-    tpm: 50000
-    api_key: os.environ/MISTRAL_API_KEY
-- model_name: plexus-coder
-  litellm_params:
-    model: mistral/mistral-medium-2508
-    rpm: 50
-    tpm: 50000
-    api_key: os.environ/MISTRAL_API_KEY
+# [mistral quota policy 2026-08-31, resets 2026-09-01] - HTTP 402 "Check
+# your subscription" confirmed live (not a guess): Free-plan $10/mo API
+# credit fully spent, page showed it in orange/warning, resets at month
+# boundary not a rolling window. No fallback existed for plexus-coder when
+# this hit (AUDIT-08 fixes that separately). Re-enable after 2026-09-01 -
+# a scheduled job should do this automatically, see AUDIT-09.
+# - model_name: plexus-coder
+#   litellm_params:
+#     model: mistral/devstral-2512
+#     rpm: 50
+#     tpm: 50000
+#     api_key: os.environ/MISTRAL_API_KEY
+# - model_name: plexus-coder
+#   litellm_params:
+#     model: mistral/mistral-medium-2508
+#     rpm: 50
+#     tpm: 50000
+#     api_key: os.environ/MISTRAL_API_KEY
 - model_name: plexus-cheap
   litellm_params:
     model: groq/qwen/qwen3.6-27b
