@@ -613,27 +613,18 @@ function buildPromptWithHistory(currentText, historyRows) {
 // wrong codebase if auto-queued the same way. Dev pieces are named in the
 // reply instead, for the founder to route by hand (local queue.sh has its
 // own, now-automated, triage for exactly this - see AGENT-RULES.md #14).
-const TRIAGE_STEP_THRESHOLD = 4;
 async function triageCheck(db, text, litellmMasterKey, creatorId, currentTaskId) {
-  // Two different shapes miss each other otherwise: a numbered list of
-  // distinct steps, and "do the same procedure for each of N similar
-  // items" (one sentence, but N items to process one at a time - not
-  // caught by counting numbered steps, since there's only one).
-  // 2026-08-31, founder's own observation, kept consistent with the local
-  // repo's queue.sh version of this same check.
-  const stepMatches = text.match(/^\s*\d+\.\s/gm) || [];
-  const looksLikeForEach = /for each|для кажд/i.test(text);
-  // 2026-08-31: dropped the "≥3 backtick-quoted items" requirement - task
-  // id=82 ("для каждой модели..." listing 5 models as a plain
-  // comma-separated list, no backticks) sailed through this gate
-  // untouched, ran as one un-split cloud task. The backtick count was only
-  // ever a cheap proxy for "there's a real list here" to avoid an LLM call
-  // on every trivial task; the actual split/no-split judgment is already
-  // made correctly by the triage LLM call below, so the phrase alone is
-  // enough to justify asking it - a false positive here costs one cheap
-  // plexus-gemini-lite call, a false negative silently skips
-  // decomposition entirely (worse, and exactly what happened).
-  if (stepMatches.length <= TRIAGE_STEP_THRESHOLD && !looksLikeForEach) return null;
+  // 2026-09-01: removed the step-count/for-each gate entirely (was: skip
+  // the judge call below if the task listed <= TRIAGE_STEP_THRESHOLD
+  // numbered steps and had no "for each" phrase), mirroring the same
+  // removal in the local repo's queue.sh. Founder's own call: a task's
+  // step COUNT was never the real risk - how much real provider-side
+  // compute one queued unit costs is, and line-counting cannot see that
+  // (a tidy 3-step task can still hide a lot of real work in step 1
+  // alone). Every task now goes through the same judge call below, every
+  // time; the judge's own ~5-minute-per-unit instruction (five lines
+  // down) is what actually enforces the size ceiling, not a pre-filter
+  // that can wave a large-but-short-looking task through unchecked.
   try {
     const triageQ = `Задача ниже написана как ОДНА единица работы для агента, но выглядит большой. Оцени честно: это реально одна связная единица, или несколько независимых шагов, каждый из которых можно сделать и проверить отдельно? Дробить нужно и в случае "сделай X, потом Y, потом Z" (разные шаги), И в случае "сделай одну и ту же процедуру для каждого из N похожих элементов" (например, проверить одно и то же поведение на N разных моделях по очереди) - во втором случае каждый элемент списка становится своей подзадачей.
 
