@@ -148,6 +148,33 @@ const LANE_CONFIG = {
 // it needs the same retry-with-recovery-path treatment as everything else
 // here rather than a silent false "готова".
 const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|No deployments available|RateLimitError|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|proxy\/HTTP error|hook dispatch failed|operation timed out|агент ничего не ответил/i;
+// 2026-09-03: CAPACITY_RE нельзя применять к ОТВЕТУ МОДЕЛИ - только к
+// конверту ошибки. У локальной очереди тот же шаблон ловил собственную
+// прозу задачи: подзадача «добавить в CAPACITY_RE термины
+// ServiceUnavailableError, high demand, UNAVAILABLE» написала эти слова в
+// свой вывод, детектор решил, что провайдер занят, и очередь простояла
+// шесть часов на одной задаче (см. DECISIONS.md стека, 2026-09-03).
+//
+// Здесь риск уже: `result.success ||` стоит первым, так что у успешной
+// задачи текст не проверяется вовсе. Но у ПРОВАЛЬНОЙ в message попадает
+// `${finishReason}: ${текст модели}` - и задача, которая обсуждает эти
+// термины и падает, уйдёт в ложное ожидание провайдера на три попытки по
+// две минуты.
+//
+// Конверт - это finishReason плюс НАШИ СОБСТВЕННЫЕ метки, которые в текст
+// подставляет наш же код (`proxy/HTTP error` из sanitizeModelText,
+// `(агент ничего не ответил)` вместо пустого ответа). Слова самой модели
+// в конверт не входят.
+const OUR_OWN_MARKERS = /proxy\/HTTP error|агент ничего не ответил/i;
+function errorEnvelope(finishReason, text) {
+  const t = String(text || "");
+  return OUR_OWN_MARKERS.test(t) ? `${finishReason}: ${t}` : String(finishReason || "");
+}
+// Что проверять на нехватку ёмкости: конверт, если он посчитан, иначе всё
+// сообщение (пути с ошибками CLI и докера - это и есть канал ошибок).
+function capacityText(result) {
+  return result && result.capacitySource != null ? result.capacitySource : (result ? result.message : "");
+}
 const CAPACITY_RETRY_MAX = 3;
 const CAPACITY_RETRY_DELAY_MS = 2 * 60 * 1000;
 
@@ -815,7 +842,8 @@ async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane
       }
       return {
         success: ok,
-        message: truncate(ok ? body : `${result.finishReason}: ${body}`)
+        message: truncate(ok ? body : `${result.finishReason}: ${body}`),
+        capacitySource: ok ? "" : errorEnvelope(result.finishReason, body)
       };
     } catch (err) {
       lastError = err;
@@ -843,7 +871,12 @@ async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane
   const err = lastError;
   const result = err.lastResult;
   if (result) {
-    return { success: false, message: truncate(`${result.finishReason}: ${sanitizeModelText(result.text)}`) };
+    const sanitizedText = sanitizeModelText(result.text);
+    return {
+      success: false,
+      message: truncate(`${result.finishReason}: ${sanitizedText}`),
+      capacitySource: errorEnvelope(result.finishReason, sanitizedText)
+    };
   }
   const first = String(err.message || err).split("\n")[0];
   const code = err.code ?? err.signal ?? "?";
@@ -1053,7 +1086,7 @@ async function processTask(db, task, botToken, litellmMasterKey, githubDispatchT
     do {
       attempt++;
       result = await doWork(db, effectiveText, litellmMasterKey, task.creator_id, taskId, lane, modelOverride);
-      if (result.success || !CAPACITY_RE.test(result.message) || attempt >= CAPACITY_RETRY_MAX) break;
+      if (result.success || !CAPACITY_RE.test(capacityText(result)) || attempt >= CAPACITY_RETRY_MAX) break;
       if (attempt === 1) {
         await notifyTelegram(
           botToken, task.creator_id,
