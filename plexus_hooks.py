@@ -962,8 +962,29 @@ class PlexusRuleInjector(CustomLogger):
                     continue
                 content = getattr(msg, "content", None)
                 reasoning = getattr(msg, "reasoning_content", None)
+                has_tool_calls = bool(getattr(msg, "tool_calls", None))
 
-                if (not content) and reasoning:
+                # 2026-09-04, ported from the local "Continue MODELS
+                # integration" stack (same hook, same bug, found there
+                # first): this rescue never checked whether tool_calls was
+                # ALREADY present. When it is, an empty content is the
+                # CORRECT OpenAI shape (finish_reason=tool_calls means
+                # content is null by convention) - not something to
+                # rescue. Copying reasoning into it anyway duplicates the
+                # whole reasoning trace into a field a tool-calling client
+                # does not expect populated on that turn.
+                #
+                # Applies here too, not dsh-specific: this file's own
+                # comment a few lines down already establishes Cline 4.x
+                # "uses NATIVE tool calling: attempt_completion arrives as
+                # a structured tool call, not as an XML tag in the text" -
+                # cline depends on the same real tool_calls field dsh
+                # does, so the same duplication would confuse it the same
+                # way (measured on dsh as: a reasoning model given a real
+                # tool got stuck circling instead of ever calling it, once
+                # this hook had already populated content alongside a
+                # genuine tool_calls array).
+                if (not content) and reasoning and not has_tool_calls:
                     msg.content = reasoning
                     try:
                         del msg.reasoning_content
