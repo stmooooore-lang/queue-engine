@@ -220,6 +220,21 @@ router_settings:
     - plexus-gemini-lite
     - plexus-coder
     - plexus-cheap
+  # 2026-09-04: coder/pro/research/gemini/claude had NO fallback at all -
+  # found live comparing against this local project's own config.yaml
+  # (Continue MODELS integration), which already has coder covered.
+  # Wired as their OWN isolated linear chain, deliberately NOT feeding
+  # back into gemini-lite/coder/act/cheap above - those four already
+  # form a cycle-risk core (coder->act->gemini-lite->coder would loop
+  # if coder fed back into any of them). This chain terminates - safe.
+  - plexus-coder:
+    - plexus-pro
+  - plexus-pro:
+    - plexus-research
+  - plexus-research:
+    - plexus-gemini
+  - plexus-gemini:
+    - plexus-claude
   - plexus-cheap:
     - plexus-gemini-lite
   # ADDED 2026-08-30: litellm only follows ONE fallback hop per request
