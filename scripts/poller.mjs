@@ -233,7 +233,17 @@ const BUTTON_MODEL_MAP = { coder: "plexus-coder", cheap: "plexus-cheap", gemini:
 // Retry/coder/cheap/gemini to replay. Its only job is to let the founder
 // stop an unwanted retry early instead of watching it play out to the end.
 const BUTTON_CANCEL = "Отмена";
+// 2026-09-04, founder's own call: this VM/Telegram-chat pattern is being
+// replaced by the Cloud Run rebuild, and until then he wants plain-text
+// status only in the chat (the same reporting style as this project's own
+// admin channel), not an interactive keyboard. NOT a removal - the exact
+// same buttons return on Cloud Run, so this is a single flag flip back to
+// `true`, not a rewrite. Both keyboard functions below return `undefined`
+// while this is `false`, so every call site (`notifyTelegram`'s
+// `replyMarkup` argument) naturally sends plain text with no keyboard.
+const REPLY_BUTTONS_ENABLED = false;
 function cancelKeyboard() {
+  if (!REPLY_BUTTONS_ENABLED) return undefined;
   return {
     keyboard: [[BUTTON_CANCEL]],
     resize_keyboard: true,
@@ -265,6 +275,7 @@ function detectButtonAction(text) {
   return null;
 }
 function failureKeyboard() {
+  if (!REPLY_BUTTONS_ENABLED) return undefined;
   return {
     keyboard: [[BUTTON_RETRY], Object.keys(BUTTON_MODEL_MAP)],
     resize_keyboard: true,
