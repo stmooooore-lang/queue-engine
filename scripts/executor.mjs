@@ -83,7 +83,16 @@ const PROVIDER_CONFIG = {
 
 // Capacity-shaped failure detector - same real pattern used throughout this
 // project's own local queue.sh and the parallel GHQ work tonight.
-const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|No deployments available|RateLimitError|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|hook dispatch failed|operation timed out/i;
+//
+// 2026-09-12: real gap found via plexus-doc-ce's first real (non-trivial)
+// task - dsh's own direct-provider error shape for Groq's rate limit is
+// `RATE_LIMIT: 429: {...,"code":"rate_limit_exceeded"}`, not the
+// `RateLimitError` string this regex already had (that shape came from
+// litellm, which dsh doesn't use) - so a genuine capacity failure exited
+// immediately on the first provider instead of rotating to NVIDIA/Mistral.
+// Added both the dsh-native tag and the JSON body's own code field so
+// either shape matches.
+const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|No deployments available|RateLimitError|RATE_LIMIT|rate_limit_exceeded|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|hook dispatch failed|operation timed out/i;
 
 function nextProvider(current, tried) {
   const remaining = PROVIDER_ORDER.filter((p) => !tried.has(p));
@@ -153,7 +162,6 @@ async function runDshOnce(provider, text) {
       child.stderr.on("data", (d) => { if (err.length < 4000) err += d; });
       child.on("close", (code) => {
         clearTimeout(timer);
-        console.error(`TEMP DEBUG dsh close: code=${code} out.length=${out.length} err.length=${err.length} out=${JSON.stringify(out)} err=${JSON.stringify(err)}`);
         const trimmed = out.trim();
         if (code === 0 && trimmed === "" && err.trim() !== "") {
           reject(new Error(`dsh exited 0 with empty stdout, stderr: ${err.slice(-1500)}`));
