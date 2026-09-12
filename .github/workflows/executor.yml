@@ -51,10 +51,14 @@ jobs:
           dsh --help 2>&1 | head -20; echo "exit: $?"
           echo "--- TTY check: is stdout a tty right now? ---"
           node -e "console.log('isTTY:', process.stdout.isTTY)"
-          echo "--- dsh --version under a real pty (script -qec) ---"
-          script -qec "dsh --version" /tmp/script-out.txt 2>&1; echo "script exit: $?"
-          echo "--- script-out.txt content ---"
-          cat /tmp/script-out.txt || true
+          echo "--- dsh --version under a real pty (python pty.spawn, no controlling terminal needed) ---"
+          python3 -c "
+import pty, sys
+rc = pty.spawn(['dsh', '--version'])
+print('pty.spawn rc:', rc)
+"
+          echo "--- dsh with DEBUG/verbose env vars, plain pipe (last resort) ---"
+          DEBUG=* NODE_DEBUG=* dsh --version 2>&1 | head -50; echo "exit: $?"
 
       # 2026-09-12: real bug hunt, three dead ends before the actual fix -
       # keeping the record since the true cause was non-obvious.
