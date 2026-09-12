@@ -162,14 +162,23 @@ async function runDshOnce(provider, text) {
       child.stderr.on("data", (d) => { if (err.length < 4000) err += d; });
       child.on("close", (code) => {
         clearTimeout(timer);
-        console.error(`TEMP DEBUG2 dsh close: code=${code} out=${JSON.stringify(out)} err=${JSON.stringify(err)}`);
         const trimmed = out.trim();
         if (code === 0 && trimmed === "" && err.trim() !== "") {
           reject(new Error(`dsh exited 0 with empty stdout, stderr: ${err.slice(-1500)}`));
         } else if (code === 0) {
           resolve(trimmed);
         } else {
-          reject(new Error(`dsh exited ${code}: ${(out || err).slice(-1500)}`));
+          // 2026-09-12: real bug found via plexus-doc-ce's captured output -
+          // `out` can be a non-empty but USELESS string (dsh's own
+          // reasoning trace sometimes leaves a stray trailing "\n" on
+          // stdout even on failure) - a bare `out || err` picks that
+          // truthy-but-empty `out` over the real error text in `err`,
+          // discarding the actual RATE_LIMIT/etc. message before
+          // CAPACITY_RE ever sees it, so rotation silently never
+          // triggered. Prefer the TRIMMED content, falling back to err
+          // only when out is genuinely empty.
+          const body = trimmed !== "" ? out : err;
+          reject(new Error(`dsh exited ${code}: ${body.slice(-1500)}`));
         }
       });
       child.on("error", (err) => { clearTimeout(timer); reject(err); });
