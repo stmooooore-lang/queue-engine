@@ -136,6 +136,7 @@ async function runDshOnce(provider, text) {
         env: { ...process.env, DSH_PERMISSION_MODE: "danger-full-access", DSH_PROXY_DUMMY_KEY: "unused" },
       });
       let out = "";
+      let err = "";
       // Job-level cap in executor.yml is 30 min total (checkout + install +
       // settings write leaves ~27 min of work budget). Up to 3 providers can
       // be tried in rotation, so each single attempt gets 8 min, not the
@@ -145,11 +146,21 @@ async function runDshOnce(provider, text) {
       const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("dsh timed out after 8min")); }, 8 * 60 * 1000);
       child.stdout.setEncoding("utf8");
       child.stdout.on("data", (d) => (out += d));
-      child.stderr.resume(); // reasoning stream, not the answer - drain, don't hold
+      // 2026-09-12: was `child.stderr.resume()` (discard) - real bug found
+      // this way needed the actual stderr content to diagnose, so it's
+      // captured (bounded) instead of thrown away.
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (d) => { if (err.length < 4000) err += d; });
       child.on("close", (code) => {
         clearTimeout(timer);
-        if (code === 0) resolve(out.trim());
-        else reject(new Error(`dsh exited ${code}: ${out.slice(-1500)}`));
+        const trimmed = out.trim();
+        if (code === 0 && trimmed === "" && err.trim() !== "") {
+          reject(new Error(`dsh exited 0 with empty stdout, stderr: ${err.slice(-1500)}`));
+        } else if (code === 0) {
+          resolve(trimmed);
+        } else {
+          reject(new Error(`dsh exited ${code}: ${(out || err).slice(-1500)}`));
+        }
       });
       child.on("error", (err) => { clearTimeout(timer); reject(err); });
     });
