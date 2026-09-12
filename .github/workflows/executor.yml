@@ -37,26 +37,37 @@ jobs:
       - name: install dsh
         run: npm install -g @deepseek-ai/dsh --silent
 
-      - name: TEMP diagnostic - Landlock sandbox probe (live hypothesis)
+      - name: TEMP diagnostic - Landlock probe (fixed path) + REAL profile invocation
         run: |
           echo "--- kernel version ---"
           uname -r
-          echo "--- direct landlock-run probe() call ---"
-          node -e "
-          import('@deepseek-ai/node-addon-system/landlock-run').then(async (m) => {
-            console.log('module keys:', Object.keys(m));
-            try {
-              const result = await m.probe();
-              console.log('PROBE RESULT:', JSON.stringify(result));
-            } catch (e) {
-              console.log('PROBE THREW:', e && e.stack || e);
-            }
-          }).catch((e) => console.log('IMPORT FAILED:', e && e.stack || e));
-          "
-          echo "--- dsh call wrapped in explicit top-level catch (see if an error is being swallowed) ---"
-          cat > /tmp/wrap-dsh.mjs << 'WRAP'
+          echo "--- direct landlock-run probe() call, resolved from dsh's own install dir ---"
+          DSH_DIR="$(dirname "$(dirname "$(which dsh)")")/lib/node_modules/@deepseek-ai/dsh"
+          echo "DSH_DIR=$DSH_DIR"
+          cat > /tmp/probe-landlock.mjs << 'PROBE'
+          import { createRequire } from "node:module";
+          const req = createRequire(process.env.DSH_DIR + "/package.json");
+          const m = await import(req.resolve("@deepseek-ai/node-addon-system/landlock-run"));
+          console.log("module keys:", Object.keys(m));
+          try {
+            const result = await m.probe();
+            console.log("PROBE RESULT:", JSON.stringify(result));
+          } catch (e) {
+            console.log("PROBE THREW:", (e && e.stack) || e);
+          }
+          PROBE
+          DSH_DIR="$DSH_DIR" node /tmp/probe-landlock.mjs || echo "probe script itself failed: $?"
+          echo "--- REAL profile invocation, same shape as executor.mjs's runDshOnce ---"
+          cat > /tmp/diag-patch2.yml << 'PATCH'
+          - id: agent-default-model
+            config:
+              provider: groq
+              model: openai/gpt-oss-120b
+          PATCH
+          cat > /tmp/wrap-dsh2.mjs << 'WRAP'
           import { spawn } from "node:child_process";
-          const child = spawn("dsh", ["--profile", "headless", "--version"], {
+          const child = spawn("dsh", ["--profile", "headless", "--patch", "/tmp/diag-patch2.yml", "reply with just the word OK"], {
+            cwd: "plexus",
             env: { ...process.env, DSH_PERMISSION_MODE: "danger-full-access", DSH_PROXY_DUMMY_KEY: "unused" },
           });
           let out = "", err = "";
@@ -69,7 +80,9 @@ jobs:
             console.log("STDERR bytes:", err.length, JSON.stringify(err));
           });
           WRAP
-          node /tmp/wrap-dsh.mjs
+          GROQ_API_KEY="${GROQ_API_KEY}" node /tmp/wrap-dsh2.mjs
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
 
       # 2026-09-12: real bug hunt, three dead ends before the actual fix -
       # keeping the record since the true cause was non-obvious.
