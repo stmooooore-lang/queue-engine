@@ -27,59 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: install the database client
-        run: npm install --no-save @libsql/client
-
-      - name: install dsh
-        run: npm install -g @deepseek-ai/dsh --silent
-
-      - name: TEMP diagnostic - import.meta.main under Node 20 (live hypothesis)
-        run: |
-          echo "--- node version right now ---"
-          node --version
-          echo "--- import.meta.main value on this node ---"
-          node -e "console.log('import.meta.main:', import.meta.main)" --input-type=module 2>&1 || \
-            (echo "console.log('import.meta.main:', import.meta.main);" > /tmp/meta-check.mjs && node /tmp/meta-check.mjs)
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-
-      - name: TEMP diagnostic - REAL profile invocation under Node 24 (the actual fix, if hypothesis holds)
-        run: |
-          echo "--- node version now ---"
-          node --version
-          cat > /tmp/diag-patch3.yml << 'PATCH'
-          - id: agent-default-model
-            config:
-              provider: groq
-              model: openai/gpt-oss-120b
-          PATCH
-          cat > /tmp/wrap-dsh3.mjs << 'WRAP'
-          import { spawn } from "node:child_process";
-          const child = spawn("dsh", ["--profile", "headless", "--patch", "/tmp/diag-patch3.yml", "reply with just the word OK"], {
-            cwd: "plexus",
-            env: { ...process.env, DSH_PERMISSION_MODE: "danger-full-access", DSH_PROXY_DUMMY_KEY: "unused" },
-          });
-          let out = "", err = "";
-          child.stdout.on("data", (d) => (out += d));
-          child.stderr.on("data", (d) => (err += d));
-          child.on("error", (e) => console.log("SPAWN ERROR EVENT:", e));
-          child.on("close", (code, signal) => {
-            console.log("CLOSE code:", code, "signal:", signal);
-            console.log("STDOUT bytes:", out.length, JSON.stringify(out));
-            console.log("STDERR bytes:", err.length, JSON.stringify(err));
-          });
-          WRAP
-          node /tmp/wrap-dsh3.mjs
-        env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-
-      # 2026-09-12: real bug hunt, three dead ends before the actual fix -
+      # 2026-09-12: real bug hunt, FOUR dead ends before the actual fix -
       # keeping the record since the true cause was non-obvious.
       # 1) First guess (via plexus-doc-ce's first live dispatch, task 95):
       #    assumed the "headless" profile just needed its 3 metadata files
@@ -87,23 +35,42 @@ jobs:
       #    Wrong AND unnecessary - a follow-up attempt to `npm install` the
       #    bundle packages into the profile dir also failed outright (404
       #    on a private, unpublished transitive dep, @deepseek-ai/dsh-bash-env).
-      # 2) Real cause, confirmed by actually reading dsh's own shipped
-      #    README (`npm root -g`/@deepseek-ai/dsh/README.md - never checked
-      #    it until told to): "web/headless/sdk/sdk-minimal/acp profiles
-      #    auto-initialize on first use from shipped templates" - dsh is
-      #    supposed to build the ENTIRE profile itself on first run,
-      #    including a real, heavy dependency install
-      #    (~/.dsh/profiles/node_modules - confirmed locally it pulls in
-      #    dozens of packages, some native: sharp, koffi, node-pty).
-      #    Hand-writing the 3 metadata files made dsh think the profile
-      #    already existed and SKIP that real auto-init - leaving a
-      #    profile that looked structurally correct under --dump-config
-      #    but had none of the actual runtime dependencies, so the real
-      #    agent boot silently produced nothing (exit 0, empty stdout AND
-      #    stderr - confirmed locally with a byte-for-byte matching setup;
-      #    key validity, NVIDIA/Mistral validity, and profile structure
-      #    were all separately ruled out first).
-      # Real fix: don't touch ~/.dsh/profiles at all. Let dsh auto-init it.
+      # 2) Assumed dsh's own auto-init of the headless profile (real, shipped
+      #    behavior per its README) needed to be left alone - true in
+      #    general, but NOT this bug's cause: reverting to pure auto-init
+      #    still produced the exact same symptom on real CI re-tests.
+      # 3) Investigated Linux-specific sandboxing (Landlock) as the cause,
+      #    since dsh ships a real `@deepseek-ai/node-addon-system` Landlock
+      #    launcher for Linux with none of that on macOS (where the same
+      #    command worked). Directly disproven: calling the launcher's own
+      #    `probe()` on the real CI runner returned `"full"` - the sandbox
+      #    backend works fine there, it was never the blocker.
+      # 4) REAL ROOT CAUSE, confirmed directly: dsh's `bin.js` gates its
+      #    entire CLI dispatch on `if (import.meta.main) await runCli();` -
+      #    a real Node.js feature that only exists from Node 24 onward.
+      #    This workflow pinned `actions/setup-node@v4` to `node-version:
+      #    '20'`. On Node 20, `import.meta.main` is simply `undefined`
+      #    (confirmed live on the actual runner) - so `runCli()` is NEVER
+      #    called, dsh's imports all resolve correctly (confirmed via a
+      #    `NODE_DEBUG=esm` trace) but the process does nothing and exits
+      #    0 with zero bytes on stdout AND stderr, on every invocation
+      #    (`--version`, `--help`, and a real `--profile headless` call
+      #    all failed identically). Confirmed as the real, complete fix by
+      #    re-running the exact same real `--profile headless` call on
+      #    Node 24 on the SAME runner: it produced real output for the
+      #    first time (`dsh: NO_ADAPTER: no adapter registered for
+      #    provider "groq"` - a normal, expected error at that point since
+      #    the diagnostic ran before provider settings were written -
+      #    proving dsh's own CLI dispatch now actually executes).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: install the database client
+        run: npm install --no-save @libsql/client
+
+      - name: install dsh
+        run: npm install -g @deepseek-ai/dsh --silent
 
       # dsh reads a fixed global path, ~/.dsh/settings.yaml - no CLI flag
       # selects it. Same registry shape as this repo's own worker uses
@@ -135,14 +102,6 @@ jobs:
                   - id: mistral-medium-3-5
           SETTINGS
 
-      # TEMP DIAGNOSTIC, 2026-09-12: real dsh call, straight from bash, no
-      # JS layer in between - executor.mjs's own dsh call has been
-      # returning empty stdout+stderr with exit 0 on this exact runner
-      # shape (confirmed: same command reproduces fine locally on macOS
-      # with a fresh ~/.dsh, so the difference is something about THIS
-      # Linux runner specifically - auto-init failing silently is the live
-      # hypothesis). This step proves or disproves that directly, printed
-      # straight into the Actions log, before removing it.
       - name: run the task
         env:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
