@@ -52,11 +52,7 @@ jobs:
           echo "--- TTY check: is stdout a tty right now? ---"
           node -e "console.log('isTTY:', process.stdout.isTTY)"
           echo "--- dsh --version under a real pty (python pty.spawn, no controlling terminal needed) ---"
-          python3 -c "
-import pty, sys
-rc = pty.spawn(['dsh', '--version'])
-print('pty.spawn rc:', rc)
-"
+          python3 -c "import pty; rc = pty.spawn(['dsh', '--version']); print('pty.spawn rc:', rc)"
           echo "--- dsh with DEBUG/verbose env vars, plain pipe (last resort) ---"
           DEBUG=* NODE_DEBUG=* dsh --version 2>&1 | head -50; echo "exit: $?"
 
