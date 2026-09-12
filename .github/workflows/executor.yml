@@ -37,6 +37,47 @@ jobs:
       - name: install dsh
         run: npm install -g @deepseek-ai/dsh --silent
 
+      # 2026-09-12 real bug, found via plexus-doc-ce's first live dispatch
+      # (task 95): dsh's "headless" profile is not just a CLI flag - on a
+      # real dsh install it's a whole real directory
+      # (~/.dsh/profiles/headless/) with its own package.json (bundles
+      # @deepseek-ai/dsh-base + @deepseek-ai/dsh-headless), cordis.yml, and
+      # a cordis.patch.yml carrying a real, deliberate setting (restrict
+      # agent-instructions to AGENTS.md only, so a background task never
+      # picks up CLAUDE.md's admin-channel rules). None of that existed on
+      # a fresh runner - executor.yml only ever wrote settings.yaml, so
+      # `--profile headless` resolved to nothing and dsh exited 0 with
+      # empty stdout, no error, no retry - looked like "success" in
+      # Actions while doing nothing at all.
+      - name: provision the real headless dsh profile
+        run: |
+          mkdir -p ~/.dsh/profiles/headless
+          cat > ~/.dsh/profiles/headless/package.json << 'PKG'
+          {
+            "name": "dsh-profile-headless",
+            "private": true,
+            "dependencies": {},
+            "dsh": {
+              "profile": {
+                "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless"],
+                "patchReload": "startup"
+              }
+            }
+          }
+          PKG
+          echo '[]' > ~/.dsh/profiles/headless/cordis.yml
+          cat > ~/.dsh/profiles/headless/cordis.patch.yml << 'PATCH'
+          - id: agent-default-model
+            config:
+              provider: groq
+              model: openai/gpt-oss-120b
+          - id: agent-instructions
+            config:
+              maxBytes: 65536
+              instructionFileCandidates: ["AGENTS.md"]
+          PATCH
+          npm install --prefix ~/.dsh/profiles/headless --no-save @deepseek-ai/dsh-base @deepseek-ai/dsh-headless
+
       # dsh reads a fixed global path, ~/.dsh/settings.yaml - no CLI flag
       # selects it. Same registry shape as this repo's own worker uses
       # locally (real, curl-confirmed model ids - no litellm routing
