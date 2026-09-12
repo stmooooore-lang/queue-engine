@@ -222,6 +222,7 @@ async function doWork(text) {
   const tried = new Set();
   let provider = PROVIDER_ORDER[0];
   let lastErr = null;
+  let attemptLog = "";
   for (let attempt = 0; attempt < PROVIDER_ORDER.length; attempt++) {
     tried.add(provider);
     try {
@@ -234,8 +235,11 @@ async function doWork(text) {
     } catch (err) {
       lastErr = err;
       const msg = String(err.message || err);
+      attemptLog += `--- attempt on ${provider} ---\n${msg}\n\n`;
       if (!CAPACITY_RE.test(msg)) {
-        return { success: false, message: truncate(`код ${err.code ?? "?"}: ${msg.split("\n")[0]}`) };
+        const diag = await diagnose(text, attemptLog).catch(() => null);
+        const base = `код ${err.code ?? "?"}: ${msg.split("\n")[0]}`;
+        return { success: false, message: truncate(diag ? `${base}\n\n${diag}` : base) };
       }
       const next = nextProvider(provider, tried);
       if (next === null) break;
@@ -244,7 +248,9 @@ async function doWork(text) {
     }
   }
   const msg = String(lastErr?.message || lastErr || "unknown error");
-  return { success: false, message: truncate(`код ${lastErr?.code ?? "?"}: ${msg.split("\n")[0]}`) };
+  const diag = await diagnose(text, attemptLog).catch(() => null);
+  const base = `код ${lastErr?.code ?? "?"}: ${msg.split("\n")[0]}`;
+  return { success: false, message: truncate(diag ? `${base}\n\n${diag}` : base) };
 }
 
 async function notifyTelegram(chatId, message) {
@@ -355,6 +361,107 @@ async function triageSplit(parentTask, decision) {
     ids.push(Number(res.lastInsertRowid));
   }
   return ids;
+}
+
+// ============================================================================
+// Diagnost (2026-09-13, ported from this project's own local queue.sh /
+// queue-diagnose.py - founder's own instruction: a failed task should
+// tell you WHY it failed, not just that it did, and the local queue
+// already has exactly this real, tested mechanism. NOT reused as-is:
+// the local script calls a LOCAL litellm proxy (127.0.0.1:4000) that
+// doesn't exist on a GitHub Actions runner - ported the real prompt/
+// verdict-list/parsing logic to JS, using the same direct-provider call
+// as triageCheck() instead. Deliberately NOT ported: the local script's
+// docs/queue-failure-playbook.md pattern-matching (a whole separate,
+// project-local learned-patterns file this repo has no equivalent of
+// yet) - this always reports "no known pattern", same as a fresh/empty
+// playbook locally. Advisory only, same as the original: this only
+// classifies and explains, it never changes what actually ran.
+// ============================================================================
+
+const DIAGNOSE_VERDICTS = {
+  no_address: "бриф просит прочитать/использовать то, адрес чего в нём не назван",
+  no_access: "нужный факт существует, но у модели нет доступа (нет ключа, нет CLI, нет прав)",
+  impossible_as_written: "бриф просит действие, для которого нет механизма (не построено/не подключено)",
+  provider_down: "провайдер действительно не ответил",
+  model_looped: "модель действительно ходила по кругу, имея всё необходимое",
+  brief_conflicts_rules: "бриф противоречит правилам стека, модель встала между двумя указаниями",
+  unclear: "по логу причину назвать нельзя",
+};
+
+const DIAGNOSE_PROMPT = `Ниже лог провалившейся попытки выполнить задачу и сам бриф задачи (в этой очереди бриф - это просто текст задачи, без отдельного файла).
+
+Ответь СТРОГО в этом формате, четыре строки, ничего больше:
+
+VERDICT: <одна метка из списка>
+FACT: <какого КОНКРЕТНОГО факта не хватило, одной строкой; или NONE>
+EVIDENCE: <дословная цитата из лога, доказывающая вердикт, одной строкой>
+
+Допустимые метки VERDICT и что каждая значит:
+{verdicts}
+
+Правила:
+- VERDICT ровно одна метка и ровно из списка. Свои не придумывай.
+- FACT - это недостающий факт (путь к файлу, имя модели, команда), а не пересказ задачи. Если ничего не не хватало - NONE.
+- EVIDENCE - настоящая строка из лога, не твой пересказ.
+- Не предлагай, что делать. Только диагноз.
+
+БРИФ:
+---
+{brief}
+---
+
+ЛОГ ПРОВАЛИВШЕЙСЯ ПОПЫТКИ:
+---
+{log}
+---
+`;
+
+function parseDiagnosis(answer) {
+  const out = {};
+  for (const key of ["VERDICT", "FACT", "EVIDENCE"]) {
+    const m = new RegExp(`^${key}:\\s*(.+)$`, "m").exec(answer || "");
+    out[key] = m ? m[1].trim() : "";
+  }
+  return out;
+}
+
+// Same direct-provider call as triageCheck() - a cheap classification
+// call, not dsh/tool-use. Fails safe (returns null) on any error, same
+// as the original script's exit-2 "не смог отработать" - never treated
+// as a real verdict.
+async function diagnose(brief, log) {
+  const provider = PROVIDER_ORDER[0];
+  const cfg = PROVIDER_CONFIG[provider];
+  const apiKey = process.env[cfg.apiKeyEnv];
+  if (!apiKey) return null;
+  const verdictList = Object.entries(DIAGNOSE_VERDICTS)
+    .map(([k, v]) => `- ${k}: ${v}`)
+    .join("\n");
+  const prompt = DIAGNOSE_PROMPT
+    .replace("{verdicts}", verdictList)
+    .replace("{brief}", brief.slice(0, 6000))
+    .replace("{log}", log.slice(-8000));
+  try {
+    const res = await fetch(`${cfg.baseURL.replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model: cfg.model, messages: [{ role: "user", content: prompt }] }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const answer = (data?.choices?.[0]?.message?.content || "").trim();
+    const got = parseDiagnosis(answer);
+    if (!(got.VERDICT in DIAGNOSE_VERDICTS)) return null;
+    let line = `ДИАГНОЗ: ${got.VERDICT} - ${DIAGNOSE_VERDICTS[got.VERDICT]}`;
+    if (got.FACT && got.FACT.toUpperCase() !== "NONE") line += `\n  не хватило: ${got.FACT.slice(0, 300)}`;
+    if (got.EVIDENCE) line += `\n  из лога: ${got.EVIDENCE.slice(0, 300)}`;
+    line += "\n  (диагност только предполагает; правку в бриф вносит человек)";
+    return line;
+  } catch {
+    return null;
+  }
 }
 
 run().catch(console.error);
