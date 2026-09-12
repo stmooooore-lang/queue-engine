@@ -37,57 +37,31 @@ jobs:
       - name: install dsh
         run: npm install -g @deepseek-ai/dsh --silent
 
-      # 2026-09-12 real bug, found via plexus-doc-ce's first live dispatch
-      # (task 95): dsh's "headless" profile is not just a CLI flag - on a
-      # real dsh install it's a whole real directory
-      # (~/.dsh/profiles/headless/) with its own package.json (bundles
-      # @deepseek-ai/dsh-base + @deepseek-ai/dsh-headless), cordis.yml, and
-      # a cordis.patch.yml carrying a real, deliberate setting (restrict
-      # agent-instructions to AGENTS.md only, so a background task never
-      # picks up CLAUDE.md's admin-channel rules). None of that existed on
-      # a fresh runner - executor.yml only ever wrote settings.yaml, so
-      # `--profile headless` resolved to nothing and dsh exited 0 with
-      # empty stdout, no error, no retry - looked like "success" in
-      # Actions while doing nothing at all.
-      #
-      # Correction, same day: an earlier version of this step also ran
-      # `npm install` for the two bundle packages into the profile dir -
-      # wrong and unnecessary. `npm install -g @deepseek-ai/dsh` above
-      # already installs dsh-base/dsh-headless/etc. as ITS OWN direct
-      # dependencies (confirmed: they're listed in the installed dsh
-      # package's own package.json) - a second, separate install for one
-      # of them (dsh-headless) tried to pull a private, unpublished
-      # transitive dep (@deepseek-ai/dsh-bash-env) straight from the
-      # public registry and got a real 404. Just the 3 metadata files
-      # below are needed; dsh resolves the bundles from its own already-
-      # installed node_modules.
-      - name: provision the real headless dsh profile
-        run: |
-          mkdir -p ~/.dsh/profiles/headless
-          cat > ~/.dsh/profiles/headless/package.json << 'PKG'
-          {
-            "name": "dsh-profile-headless",
-            "private": true,
-            "dependencies": {},
-            "dsh": {
-              "profile": {
-                "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless"],
-                "patchReload": "startup"
-              }
-            }
-          }
-          PKG
-          echo '[]' > ~/.dsh/profiles/headless/cordis.yml
-          cat > ~/.dsh/profiles/headless/cordis.patch.yml << 'PATCH'
-          - id: agent-default-model
-            config:
-              provider: groq
-              model: openai/gpt-oss-120b
-          - id: agent-instructions
-            config:
-              maxBytes: 65536
-              instructionFileCandidates: ["AGENTS.md"]
-          PATCH
+      # 2026-09-12: real bug hunt, three dead ends before the actual fix -
+      # keeping the record since the true cause was non-obvious.
+      # 1) First guess (via plexus-doc-ce's first live dispatch, task 95):
+      #    assumed the "headless" profile just needed its 3 metadata files
+      #    (package.json/cordis.yml/cordis.patch.yml) hand-written here.
+      #    Wrong AND unnecessary - a follow-up attempt to `npm install` the
+      #    bundle packages into the profile dir also failed outright (404
+      #    on a private, unpublished transitive dep, @deepseek-ai/dsh-bash-env).
+      # 2) Real cause, confirmed by actually reading dsh's own shipped
+      #    README (`npm root -g`/@deepseek-ai/dsh/README.md - never checked
+      #    it until told to): "web/headless/sdk/sdk-minimal/acp profiles
+      #    auto-initialize on first use from shipped templates" - dsh is
+      #    supposed to build the ENTIRE profile itself on first run,
+      #    including a real, heavy dependency install
+      #    (~/.dsh/profiles/node_modules - confirmed locally it pulls in
+      #    dozens of packages, some native: sharp, koffi, node-pty).
+      #    Hand-writing the 3 metadata files made dsh think the profile
+      #    already existed and SKIP that real auto-init - leaving a
+      #    profile that looked structurally correct under --dump-config
+      #    but had none of the actual runtime dependencies, so the real
+      #    agent boot silently produced nothing (exit 0, empty stdout AND
+      #    stderr - confirmed locally with a byte-for-byte matching setup;
+      #    key validity, NVIDIA/Mistral validity, and profile structure
+      #    were all separately ruled out first).
+      # Real fix: don't touch ~/.dsh/profiles at all. Let dsh auto-init it.
 
       # dsh reads a fixed global path, ~/.dsh/settings.yaml - no CLI flag
       # selects it. Same registry shape as this repo's own worker uses
