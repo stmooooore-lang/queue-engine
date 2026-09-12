@@ -69,8 +69,31 @@ jobs:
       - name: install the database client
         run: npm install --no-save @libsql/client
 
+      # GHQ-EXEC-CACHE, 2026-09-12 (founder's own instruction - this was
+      # blocked on "Plexus's queue going live", which just happened
+      # tonight): real measurement showed `npm install -g
+      # @deepseek-ai/dsh` alone was 65 of every 86s (75%) of a task run,
+      # before any model call even started. Caches the global npm
+      # install dir, keyed on a PINNED dsh version (0.1.5-rc.1 - the
+      # exact version this whole session's dsh work was tested against
+      # tonight, see docs/DECISIONS.md) rather than "latest", so the
+      # cache never goes stale silently AND a future dsh release can't
+      # silently change behavior underneath already-verified work - a
+      # version bump becomes a deliberate, visible edit to this file.
+      - name: get npm global root
+        id: npm-global
+        run: echo "root=$(npm root -g)" >> "$GITHUB_OUTPUT"
+
+      - name: cache dsh global install
+        id: dsh-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.npm-global.outputs.root }}
+          key: dsh-global-${{ runner.os }}-node24-0.1.5-rc.1
+
       - name: install dsh
-        run: npm install -g @deepseek-ai/dsh --silent
+        if: steps.dsh-cache.outputs.cache-hit != 'true'
+        run: npm install -g @deepseek-ai/dsh@0.1.5-rc.1 --silent
 
       # dsh reads a fixed global path, ~/.dsh/settings.yaml - no CLI flag
       # selects it. Same registry shape as this repo's own worker uses
