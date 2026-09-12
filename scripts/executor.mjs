@@ -169,15 +169,17 @@ async function runDshOnce(provider, text) {
           resolve(trimmed);
         } else {
           // 2026-09-12: real bug found via plexus-doc-ce's captured output -
-          // `out` can be a non-empty but USELESS string (dsh's own
-          // reasoning trace sometimes leaves a stray trailing "\n" on
-          // stdout even on failure) - a bare `out || err` picks that
-          // truthy-but-empty `out` over the real error text in `err`,
-          // discarding the actual RATE_LIMIT/etc. message before
-          // CAPACITY_RE ever sees it, so rotation silently never
-          // triggered. Prefer the TRIMMED content, falling back to err
-          // only when out is genuinely empty.
-          const body = trimmed !== "" ? out : err;
+          // `out` can be a non-empty but USELESS string (a stray "\n", or
+          // dsh's own verbose reasoning trace) - a bare `out || err` (or
+          // even a "prefer non-empty out" rule) can pick that over the
+          // real structured error sitting in `err`, discarding the actual
+          // RATE_LIMIT/etc. message before CAPACITY_RE ever sees it, so
+          // rotation silently never triggered. Confirmed against two real
+          // ground-truth failures (Groq 413, Mistral 429) that the
+          // authoritative error text is reliably in `err`, not `out` -
+          // prefer `err` whenever it has real content, `out` only as a
+          // last-resort fallback if `err` is genuinely empty too.
+          const body = err.trim() !== "" ? err : out;
           reject(new Error(`dsh exited ${code}: ${body.slice(-1500)}`));
         }
       });
