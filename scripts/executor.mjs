@@ -153,6 +153,7 @@ async function runDshOnce(provider, text) {
       child.stderr.on("data", (d) => { if (err.length < 4000) err += d; });
       child.on("close", (code) => {
         clearTimeout(timer);
+        console.error(`TEMP DEBUG dsh close: code=${code} out.length=${out.length} err.length=${err.length} out=${JSON.stringify(out)} err=${JSON.stringify(err)}`);
         const trimmed = out.trim();
         if (code === 0 && trimmed === "" && err.trim() !== "") {
           reject(new Error(`dsh exited 0 with empty stdout, stderr: ${err.slice(-1500)}`));
