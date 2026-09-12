@@ -42,6 +42,29 @@ async function run() {
   // Mark as running
   await client.execute({ sql: 'UPDATE tasks SET status = ?, actions_run_id = ? WHERE id = ?', args: ['выполняется', process.env.GITHUB_RUN_ID, taskId] });
 
+  // Triage: is this genuinely one unit of work, or several that should
+  // run as independent, smaller dsh calls? (founder's own repeated
+  // instruction, 2026-09-12 - see the triageCheck/triageSplit block
+  // below for why this isn't just the local project's existing
+  // worker/triage.js reused as-is.) Fail-safe: any error here just
+  // proceeds to doWork() as one unit, same as before this existed.
+  const triageDecision = await triageCheck(task.text);
+  if (triageDecision.split) {
+    const subtaskIds = await triageSplit(task, triageDecision).catch((err) => {
+      console.log(`[${new Date().toISOString()}] triage split failed (${err.message}), proceeding as one unit instead`);
+      return null;
+    });
+    if (subtaskIds && subtaskIds.length > 0) {
+      const note = `ТРИАЖ: разбита на ${subtaskIds.length} подзадач: ${subtaskIds.join(", ")}`;
+      await client.execute({
+        sql: 'UPDATE tasks SET status = ?, result = ? WHERE id = ?',
+        args: ['готова', note, taskId],
+      });
+      await notifyTelegram(task.creator_id, `Задача ${taskId} ${note}`);
+      return;
+    }
+  }
+
   // Execute work
   const workStart = Date.now();
   const result = await doWork(task.text);
@@ -231,6 +254,105 @@ async function notifyTelegram(chatId, message) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chat_id: chatId, text: message })
   });
+}
+
+// ============================================================================
+// Triage/decomposition (2026-09-12, founder's own repeated instruction -
+// provider rotation alone isn't an escalation path for a task that's
+// genuinely too big for any single provider's context/TPM ceiling, e.g.
+// real Groq 8000 TPM + Mistral 429 + a still-unclear NVIDIA failure all on
+// the SAME oversized prompt, task 1, same day).
+//
+// This project already has a triageCheck()/triageSplit() pair
+// (worker/triage-check.js, worker/triage.js) built and tested during
+// tonight's GHQ-h-h work, but it targets a different, superseded
+// architecture entirely (Cloud Run + Docker, a checked-out `plexus-doc`
+// git repo, file-based `.md` task briefs matching the LOCAL queue.sh
+// convention). This queue's own `tasks.text` column is plain, self-
+// contained natural-language text with no file-path convention at all -
+// dropping that code in as-is would create subtask rows whose `text` is
+// a nonexistent file path, which dsh would receive as a literal (garbage)
+// prompt. Reusing the real, tested CLASSIFICATION prompt/logic below, but
+// writing a new, plain-text-only split function matching this queue's
+// real shape.
+// ============================================================================
+
+const TRIAGE_PROMPT = `Задача ниже написана как ОДНА единица работы для агента, но выглядит большой или упоминает несколько разных файлов/шагов. Оцени честно: это реально одна связная единица, или несколько независимых шагов, каждый из которых можно сделать и проверить отдельно?
+
+Целевой размер каждой подзадачи - то, что один вызов модели может реально выполнить без превышения лимита провайдера по токенам (ориентир - несколько тысяч токенов на весь промпт, не десятки тысяч).
+
+Если ОДНА связная единица (даже большая) - ответь ровно: {"split": false}
+
+Если НЕСКОЛЬКО - ответь JSON строго такой формы, без пояснений вокруг:
+{"split": true, "subtasks": [{"title": "короткий заголовок", "text": "самодостаточный текст этой подзадачи - ВСЁ, что нужно агенту знать, включая любые конкретные пути/файлы из исходной задачи, повторённые явно, не только в первой подзадаче"}]}
+
+КАЖДАЯ подзадача выполняется ОТДЕЛЬНЫМ процессом без общей памяти с другими подзадачами - если один шаг узнаёт путь к файлу, следующий шаг про этот же файл должен получить этот путь явно в своём собственном "text", а не полагаться на то, что предыдущий шаг его "запомнил".
+
+---
+`;
+
+function extractTriageJson(text) {
+  const trimmed = (text || "").trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const m = trimmed.match(/\{[\s\S]*\}/);
+    if (!m) return null;
+    try {
+      return JSON.parse(m[0]);
+    } catch {
+      return null;
+    }
+  }
+}
+
+// Cheap, plain chat-completion call for classification only - no dsh, no
+// tool use, no provider rotation needed here (if the classifier call
+// itself hits a real capacity failure, fail safe and just run the task
+// as one unit rather than risk never processing it at all).
+async function triageCheck(text) {
+  const provider = PROVIDER_ORDER[0];
+  const cfg = PROVIDER_CONFIG[provider];
+  const apiKey = process.env[cfg.apiKeyEnv];
+  if (!apiKey) return { split: false };
+  try {
+    const res = await fetch(`${cfg.baseURL.replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model: cfg.model, messages: [{ role: "user", content: TRIAGE_PROMPT + text }] }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) return { split: false };
+    const data = await res.json();
+    const raw = (data?.choices?.[0]?.message?.content || "").trim();
+    const parsed = extractTriageJson(raw);
+    if (!parsed) return { split: false };
+    if (parsed.split === true && Array.isArray(parsed.subtasks) && parsed.subtasks.length > 0) {
+      const valid = parsed.subtasks.filter(
+        (st) => st && typeof st.title === "string" && st.title.trim() && typeof st.text === "string" && st.text.trim()
+      );
+      if (valid.length > 0) return { split: true, subtasks: valid };
+    }
+    return { split: false };
+  } catch (err) {
+    console.log(`[${new Date().toISOString()}] triage check failed (${err.message}), proceeding as one unit (fail-safe)`);
+    return { split: false };
+  }
+}
+
+// Inserts each subtask as a real, independent plain-text row - no files,
+// no separate repo, matching this queue's actual `tasks.text` shape.
+async function triageSplit(parentTask, decision) {
+  const ids = [];
+  for (const st of decision.subtasks) {
+    const res = await client.execute({
+      sql: "INSERT INTO tasks (text, status, creator_id, lane) VALUES (?, ?, ?, ?)",
+      args: [`[${st.title}] ${st.text}`, "ожидает", parentTask.creator_id, parentTask.lane || "architect"],
+    });
+    ids.push(Number(res.lastInsertRowid));
+  }
+  return ids;
 }
 
 run().catch(console.error);
