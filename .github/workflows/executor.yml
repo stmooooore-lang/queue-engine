@@ -93,6 +93,43 @@ jobs:
                   - id: mistral-medium-3-5
           SETTINGS
 
+      # TEMP DIAGNOSTIC, 2026-09-12: real dsh call, straight from bash, no
+      # JS layer in between - executor.mjs's own dsh call has been
+      # returning empty stdout+stderr with exit 0 on this exact runner
+      # shape (confirmed: same command reproduces fine locally on macOS
+      # with a fresh ~/.dsh, so the difference is something about THIS
+      # Linux runner specifically - auto-init failing silently is the live
+      # hypothesis). This step proves or disproves that directly, printed
+      # straight into the Actions log, before removing it.
+      - name: TEMP dsh diagnostic - direct call, full output
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          echo "--- dsh version ---"
+          dsh --version || true
+          echo "--- profile dir before call ---"
+          ls -la ~/.dsh/profiles/ 2>&1 || echo "(no profiles dir yet)"
+          cat > /tmp/diag-patch.yml << 'PATCH'
+          - id: agent-default-model
+            config:
+              provider: groq
+              model: openai/gpt-oss-120b
+          PATCH
+          echo "--- real dsh call ---"
+          set +e
+          DSH_PERMISSION_MODE=danger-full-access DSH_PROXY_DUMMY_KEY=unused \
+            dsh --profile headless --patch /tmp/diag-patch.yml "reply with just the word OK" \
+            > /tmp/diag-stdout.txt 2> /tmp/diag-stderr.txt
+          echo "EXIT CODE: $?"
+          set -e
+          echo "--- STDOUT ---"
+          cat /tmp/diag-stdout.txt
+          echo "--- STDERR ---"
+          cat /tmp/diag-stderr.txt
+          echo "--- profile dir after call ---"
+          ls -la ~/.dsh/profiles/headless/ 2>&1 || echo "(still no headless profile dir)"
+          find ~/.dsh/profiles -maxdepth 3 -iname "node_modules" 2>&1 || true
+
       - name: run the task
         env:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
