@@ -1,12 +1,17 @@
 name: Task Executor
 
-# Runs one queued task from Turso as a Cline agent turn, and reports back to
-# Telegram.
+# Runs one queued task from Turso as a real dsh turn against plexus/, and
+# reports back to Telegram.
 #
-# The proxy+cline setup mirrors cloud-agent.yml exactly - same litellm pin,
-# same providers.json shape - so a task from the phone gets the same lane map
-# as a task typed directly into cloud-agent. scripts/executor.mjs owns the
-# Turso/Telegram plumbing; it shells out to `cline` once the proxy is up.
+# 2026-09-12: model-calling layer changed from cline + a local litellm proxy
+# to dsh, calling real providers (Groq/NVIDIA/Mistral) directly - no proxy in
+# front of it. Everything else (Turso claim/write, Telegram notify, the
+# plexus/ confinement check below) is unchanged. See docs/DECISIONS.md in
+# the founder's "Continue MODELS integration" project for the real
+# provider-config schema this was built and tested against, and the real
+# bugs found along the way (litellm routing prefixes on model ids; dsh
+# validates every REGISTERED provider's credential at boot, not just the
+# selected one).
 
 on:
   workflow_dispatch:
@@ -29,53 +34,38 @@ jobs:
       - name: install the database client
         run: npm install --no-save @libsql/client
 
-      - name: install cline
-        run: npm i -g cline --silent
+      - name: install dsh
+        run: npm install -g @deepseek-ai/dsh --silent
 
-      # Same pin, same reason as cloud-agent.yml: the unpinned litellm CLI
-      # fails to import proxy_server on this runner (run 32549839784).
-      - name: proxy with the real lanes
-        env:
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          VERTEX_PROJECT: ${{ secrets.VERTEX_PROJECT }}
-          VERTEX_CREDENTIALS_JSON: ${{ secrets.VERTEX_CREDENTIALS_JSON }}
+      # dsh reads a fixed global path, ~/.dsh/settings.yaml - no CLI flag
+      # selects it. Same registry shape as this repo's own worker uses
+      # locally (real, curl-confirmed model ids - no litellm routing
+      # prefixes; NVIDIA's own "nvidia/" prefix is real, not litellm's).
+      - name: write dsh direct-provider settings
         run: |
-          pip install --quiet "litellm[proxy]==1.83.9"
-          python3 -c "import yaml;d=yaml.safe_load(open('cloud-config.yaml'));print('lanes:',sorted({m[\"model_name\"] for m in d[\"model_list\"]}))"
-          nohup litellm --config cloud-config.yaml --port 4000 --host 127.0.0.1 --num_workers 1 > /tmp/proxy.log 2>&1 &
-          sleep 5
-          grep -q "ModuleNotFoundError" /tmp/proxy.log && { echo "прокси не стартовал:"; tail -20 /tmp/proxy.log; exit 1; }
-          for i in $(seq 1 40); do
-            curl -fsS -m 3 http://127.0.0.1:4000/health/liveliness >/dev/null 2>&1 && { echo "proxy up after $((i*3))s"; exit 0; }
-            sleep 3
-          done
-          echo "proxy did not come up"; tail -20 /tmp/proxy.log; exit 1
-
-      - name: provider config, exact shape of a working one
-        run: |
-          mkdir -p ~/.cline/data/settings
-          python3 - <<'PY'
-          import json, os, datetime
-          cfg = {
-            "version": 1,
-            "lastUsedProvider": "openai-compatible",
-            "providers": {"openai-compatible": {
-                "settings": {
-                    "provider": "openai-compatible",
-                    "apiKey": "not-used-by-the-local-proxy",
-                    "model": "plexus-act",
-                    "baseUrl": "http://127.0.0.1:4000/v1",
-                    "headers": {}},
-                "updatedAt": datetime.datetime.utcnow().isoformat() + "Z",
-                "tokenSource": "migration"}}}
-          p = os.path.expanduser("~/.cline/data/settings/providers.json")
-          open(p, "w").write(json.dumps(cfg))
-          os.chmod(p, 0o600)
-          PY
+          mkdir -p ~/.dsh
+          cat > ~/.dsh/settings.yaml << 'SETTINGS'
+          llm-pi-ai:
+            providers:
+              groq:
+                apiKeyEnv: GROQ_API_KEY
+                api: openai-completions
+                baseURL: https://api.groq.com/openai/v1
+                models:
+                  - id: openai/gpt-oss-120b
+              nvidia:
+                apiKeyEnv: NVIDIA_API_KEY
+                api: openai-completions
+                baseURL: https://integrate.api.nvidia.com/v1
+                models:
+                  - id: nvidia/nemotron-3-ultra-550b-a55b
+              mistral:
+                apiKeyEnv: MISTRAL_API_KEY
+                api: openai-completions
+                baseURL: https://api.mistral.ai/v1
+                models:
+                  - id: mistral-medium-3-5
+          SETTINGS
 
       - name: run the task
         env:
@@ -83,6 +73,9 @@ jobs:
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TASK_ID: ${{ inputs.taskId }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
         run: node scripts/executor.mjs
 
       - name: nothing outside plexus/ may have changed
