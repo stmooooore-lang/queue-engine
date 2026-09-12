@@ -84,12 +84,21 @@ async function run() {
   await notifyTelegram(task.creator_id, `Задача ${taskId} ${status}: ${result.message}`);
 }
 
-// The agent works INSIDE plexus/ and nowhere else. Founder's decision
+// The agent works INSIDE WORKDIR and nowhere else. Founder's decision
 // 2026-08-22: a task arriving from a messenger turns text into work, and the
 // only limit that is easy to state and easy to check is where it is allowed to
-// touch. Everything the product needs lives under plexus/; nothing outside it
-// is a task the phone should be starting.
-const WORKDIR = "plexus";
+// touch.
+//
+// 2026-09-13: changed from "plexus" (a partial, hand-synced snapshot checked
+// into this repo) to a real checkout of the actual product repo, done as a
+// second checkout step in executor.yml (same lightweight job, no VM) - a real
+// no_access diagnost verdict on plexus-doc-ce's task 11 showed briefs written
+// against the real repo's paths (notes/, site/engine/, etc) structurally
+// couldn't work against the stale snapshot. Founder confirmed: the queue
+// should see the real repo. Still read-mostly by convention - see
+// executor.yml's confinement check and plexus-corridor.yml's header for why
+// nothing here pushes back to plexus-doc on its own.
+const WORKDIR = "plexus-doc";
 
 // Real, direct-provider config (2026-09-12) - no litellm alias model
 // strings, no routing prefixes (groq/, mistral/, gemini/ are litellm's own
@@ -214,7 +223,7 @@ async function runDshOnce(provider, text) {
 }
 
 /**
- * The task text becomes one dsh turn against plexus/ - real capacity-shaped
+ * The task text becomes one dsh turn against WORKDIR - real capacity-shaped
  * failures rotate to the next real provider (Groq -> NVIDIA -> Mistral),
  * same real mechanism verified tonight in worker/rotation.js.
  */
