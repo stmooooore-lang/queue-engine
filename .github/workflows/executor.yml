@@ -37,8 +37,14 @@ jobs:
       - name: install dsh
         run: npm install -g @deepseek-ai/dsh --silent
 
-      - name: TEMP diagnostic - Landlock probe (fixed path) + REAL profile invocation
+      - name: TEMP diagnostic - full env dump + Landlock probe + REAL profile invocation
         run: |
+          echo "--- full env dump (sorted, for offline diff) ---"
+          env | sort
+          echo "--- HOME / whoami / id ---"
+          echo "HOME=$HOME"; whoami; id
+          echo "--- bwrap availability ---"
+          which bwrap || echo "bwrap NOT on PATH"
           echo "--- kernel version ---"
           uname -r
           echo "--- direct landlock-run probe() call, resolved from dsh's own install dir ---"
