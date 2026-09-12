@@ -8,9 +8,20 @@ name: plexus-corridor
 # here: the cloud is a worker, not a git client, and the commit is made on the
 # Mac by the founder with his own key.
 #
-# Crypto reaches this runner by CryptoCompare (e=Bybit), not by api.bybit.com,
-# which refuses US addresses. Same venue, different road - see
-# plexus/scripts/lib/cryptocompare.mjs.
+# Crypto reaches this runner from the static Binance archive
+# (data.binance.vision), not from api.bybit.com, which answers 403 to
+# cloud-provider IP ranges including GitHub's - see
+# plexus/scripts/lib/binance-archive.mjs.
+#
+# CORRECTED 2026-09-12: this header used to say crypto arrived via
+# CryptoCompare and pointed at plexus/scripts/lib/cryptocompare.mjs. Both
+# were false from 2026-08-20 onward - S12-15 closed that day having REJECTED
+# the CryptoCompare route (free tier is 100 calls/month, one full run costs
+# ~75) and replaced it with the archive; the cryptocompare.mjs file was
+# removed with it. The stale comment outlived the code by three weeks and
+# cost real time twice: it was read as current and re-proposed as a live
+# data source. Canon was right throughout (START-HERE: "ключ CryptoCompare
+# не нужен, S12-15 закрыта") - only this comment lied.
 
 on:
   workflow_dispatch:
