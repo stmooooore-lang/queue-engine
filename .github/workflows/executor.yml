@@ -37,24 +37,39 @@ jobs:
       - name: install dsh
         run: npm install -g @deepseek-ai/dsh --silent
 
-      - name: TEMP diagnostic - is dsh actually a real, working binary
+      - name: TEMP diagnostic - Landlock sandbox probe (live hypothesis)
         run: |
-          echo "--- which dsh ---"
-          which dsh || echo "NOT ON PATH"
-          echo "--- npm ls -g ---"
-          npm ls -g @deepseek-ai/dsh || true
-          echo "--- dsh script head (first 15 lines) ---"
-          head -15 "$(which dsh)" || true
-          echo "--- direct node invocation, bypassing shebang ---"
-          node "$(which dsh)" --version 2>&1; echo "exit: $?"
-          echo "--- dsh --help ---"
-          dsh --help 2>&1 | head -20; echo "exit: $?"
-          echo "--- TTY check: is stdout a tty right now? ---"
-          node -e "console.log('isTTY:', process.stdout.isTTY)"
-          echo "--- dsh --version under a real pty (python pty.spawn, no controlling terminal needed) ---"
-          python3 -c "import pty; rc = pty.spawn(['dsh', '--version']); print('pty.spawn rc:', rc)"
-          echo "--- dsh with DEBUG/verbose env vars, plain pipe (last resort) ---"
-          DEBUG=* NODE_DEBUG=* dsh --version 2>&1 | head -50; echo "exit: $?"
+          echo "--- kernel version ---"
+          uname -r
+          echo "--- direct landlock-run probe() call ---"
+          node -e "
+          import('@deepseek-ai/node-addon-system/landlock-run').then(async (m) => {
+            console.log('module keys:', Object.keys(m));
+            try {
+              const result = await m.probe();
+              console.log('PROBE RESULT:', JSON.stringify(result));
+            } catch (e) {
+              console.log('PROBE THREW:', e && e.stack || e);
+            }
+          }).catch((e) => console.log('IMPORT FAILED:', e && e.stack || e));
+          "
+          echo "--- dsh call wrapped in explicit top-level catch (see if an error is being swallowed) ---"
+          cat > /tmp/wrap-dsh.mjs << 'WRAP'
+          import { spawn } from "node:child_process";
+          const child = spawn("dsh", ["--profile", "headless", "--version"], {
+            env: { ...process.env, DSH_PERMISSION_MODE: "danger-full-access", DSH_PROXY_DUMMY_KEY: "unused" },
+          });
+          let out = "", err = "";
+          child.stdout.on("data", (d) => (out += d));
+          child.stderr.on("data", (d) => (err += d));
+          child.on("error", (e) => console.log("SPAWN ERROR EVENT:", e));
+          child.on("close", (code, signal) => {
+            console.log("CLOSE code:", code, "signal:", signal);
+            console.log("STDOUT bytes:", out.length, JSON.stringify(out));
+            console.log("STDERR bytes:", err.length, JSON.stringify(err));
+          });
+          WRAP
+          node /tmp/wrap-dsh.mjs
 
       # 2026-09-12: real bug hunt, three dead ends before the actual fix -
       # keeping the record since the true cause was non-obvious.
