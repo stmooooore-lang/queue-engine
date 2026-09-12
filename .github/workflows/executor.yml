@@ -84,7 +84,7 @@ jobs:
         id: npm-global
         run: |
           echo "root=$(npm root -g)" >> "$GITHUB_OUTPUT"
-          echo "bin=$(npm bin -g 2>/dev/null || npm config get prefix)/bin" >> "$GITHUB_OUTPUT"
+          echo "bin=$(npm config get prefix)/bin" >> "$GITHUB_OUTPUT"
 
       # 2026-09-12: real bug found via plexus-doc-ce's live dispatch -
       # caching ONLY `npm root -g` (lib/node_modules, the package code)
