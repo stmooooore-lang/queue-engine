@@ -167,7 +167,16 @@ function sanitizeModelText(text) {
  */
 async function runDshOnce(provider, text) {
   const cfg = PROVIDER_CONFIG[provider];
-  const patchContent = `- id: agent-default-model\n  config:\n    provider: ${provider}\n    model: ${cfg.model}\n`;
+  // 2026-09-13: real bug found via plexus-doc-ce's Groq 413s on trivial
+  // tasks after WORKDIR became the real plexus-doc repo (commit e84a572).
+  // dsh's own "standard" preset (dsh-agent-presets/presets/standard/
+  // agent.cordis.yml) sets agent-instructions' maxBytes: 65536 by
+  // default - large enough to swallow plexus-doc's whole AGENTS.md/
+  // CLAUDE.md unencoded on every single call, a fixed tax that alone can
+  // exceed Groq's 8000 TPM budget before the real task prompt is even
+  // considered. Overriding it down here, cloud-side only - does not
+  // touch dsh's own defaults or the local queue's separate config.
+  const patchContent = `- id: agent-default-model\n  config:\n    provider: ${provider}\n    model: ${cfg.model}\n- id: agent-instructions\n  config:\n    maxBytes: 4096\n`;
   const patchFile = path.join(os.tmpdir(), `dsh-patch-${Date.now()}-${Math.random().toString(36).slice(2)}.yml`);
   await writeFile(patchFile, patchContent, "utf-8");
   try {
