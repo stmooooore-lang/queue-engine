@@ -39,6 +39,16 @@ async function run() {
   const task = taskRes.rows[0];
   if (!task) { console.log('No pending task found'); return; }
 
+  // GHQ2-c, 2026-09-14: a triage-split subtask does not run before its
+  // earlier, still-unaccepted sibling - leaves status untouched ('ожидает')
+  // so a future dispatch for this same taskId gets a fresh chance once the
+  // real blocker clears, rather than being marked done or failed for
+  // simply arriving out of order.
+  if (!(await siblingOrderOk(task))) {
+    console.log(`[${new Date().toISOString()}] sibling-order: task ${taskId} is waiting on an earlier unaccepted sibling, not running yet`);
+    return;
+  }
+
   // Mark as running
   await client.execute({ sql: 'UPDATE tasks SET status = ?, actions_run_id = ? WHERE id = ?', args: ['выполняется', process.env.GITHUB_RUN_ID, taskId] });
 
@@ -75,8 +85,26 @@ async function run() {
 
   // Execute work
   const workStart = Date.now();
-  const result = await doWork(task.text);
+  const result = await doWork(task.text, task);
+  if (result.decomposed) {
+    // TIMECEIL-CLOUD, 2026-09-14: real re-decomposition happened instead
+    // of a normal pass/fail - the original oversized task is done in the
+    // sense that it's been replaced by its own real subtasks (same
+    // convention triageCheck's own split path already uses above).
+    const note = `ТРИАЖ (после реального прогресса, обрезанного таймаутом): разбита на ${result.subtaskIds.length} подзадач: ${result.subtaskIds.join(", ")}`;
+    await client.execute({ sql: 'UPDATE tasks SET status = ?, result = ? WHERE id = ?', args: ['готова', note, taskId] });
+    await notifyTelegram(task.creator_id, `Задача ${taskId} ${note}`);
+    return;
+  }
   const workEnd = Date.now();
+
+  // GHQ2-e, 2026-09-14 (built directly by Claude Code, founder's own
+  // real-time call): a model's own answer/error text can genuinely
+  // contain a real credential (an env var dump, a copy-pasted log line) -
+  // scan and redact BEFORE it goes to Turso or Telegram, reusing the same
+  // shapes queue-engine's own scripts/pre-commit-secret-scan.sh already
+  // checks for (GCP service-account JSON, LiteLLM sk-.../MASTER_KEY).
+  result.message = redactSecrets(result.message);
 
   // Update task
   // GHQ2-b, 2026-09-14: a permanent, founder-fixable verdict (no_address,
@@ -198,6 +226,73 @@ function sanitizeModelText(text) {
   return t;
 }
 
+// GHQ2-e, 2026-09-14: reuses the exact same three real credential shapes
+// `scripts/pre-commit-secret-scan.sh` already checks for at commit time -
+// same repo, same real secrets it actually handles, just applied to a
+// model's runtime output instead of staged git content. Fails safe: a
+// regex that doesn't match anything just leaves the text untouched, never
+// throws.
+function redactSecrets(text) {
+  let out = String(text || "");
+  let hit = false;
+  // GCP service-account JSON key - both markers together, same
+  // specificity rule as the pre-commit script (avoids flagging ordinary
+  // text that only mentions one of the two in isolation).
+  if (/"type"\s*:\s*"service_account"/.test(out) && /BEGIN PRIVATE KEY/.test(out)) {
+    out = out.replace(/\{[^{}]*"type"\s*:\s*"service_account"[\s\S]*?\}/g, "[REDACTED: GCP service-account JSON key]");
+    hit = true;
+  }
+  // LiteLLM sk-... style key
+  if (/sk-[A-Za-z0-9_-]{20,}/.test(out)) {
+    out = out.replace(/sk-[A-Za-z0-9_-]{20,}/g, "[REDACTED: sk-... key]");
+    hit = true;
+  }
+  // *MASTER_KEY* assigned a 64-char hex value (openssl rand -hex 32 shape)
+  const masterKeyRe = /(MASTER_KEY|LITELLM_MASTER_KEY)([\s]*[:=][\s]*)["']?[a-f0-9]{64}["']?/gi;
+  if (masterKeyRe.test(out)) {
+    out = out.replace(masterKeyRe, "$1$2[REDACTED: master key]");
+    hit = true;
+  }
+  if (hit) console.log(`[${new Date().toISOString()}] secret-leak guard: redacted real credential shape(s) from task result before writing/notifying`);
+  return out;
+}
+
+// GHQ2-d / TIMECEIL-CLOUD, 2026-09-14: real progress-vs-loop
+// classification, ported verbatim (same heuristic, same threshold, same
+// <2-segments fallback to "loop") from the local queue's own
+// classify_kill_progress() (queue.sh, built for TIMECEIL earlier
+// tonight) - see docs/DECISIONS.md's TIMECEIL entry in the founder's own
+// "Continue MODELS integration" project for the original. dsh's own
+// transcript marks each turn with a literal "dsh: reasoning:" line;
+// consecutive segments are compared by word-set overlap - real
+// repetition restates nearly the same sentence (high overlap), real
+// progress reads as different text turn to turn even about the same
+// file (low overlap). Returns exactly "loop" or "progress" - matching
+// the local version's own two-value taxonomy, no third state invented.
+function classifyTimeoutKill(text) {
+  const clean = String(text || "").replace(/\x1b\[[0-9;]*m/g, "");
+  const segs = clean
+    .split(/^dsh: reasoning:\s*$/m)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (segs.length < 2) return "loop";
+  const words = (s) => new Set((s.toLowerCase().match(/[a-z0-9а-я_./-]{3,}/g)) || []);
+  let total = 0;
+  let count = 0;
+  for (let i = 1; i < segs.length; i++) {
+    const wa = words(segs[i - 1]);
+    const wb = words(segs[i]);
+    if (wa.size === 0 || wb.size === 0) { total += 0; count++; continue; }
+    let inter = 0;
+    for (const w of wa) if (wb.has(w)) inter++;
+    const union = new Set([...wa, ...wb]).size;
+    total += union === 0 ? 0 : inter / union;
+    count++;
+  }
+  const avg = count > 0 ? total / count : 0;
+  return avg < 0.5 ? "progress" : "loop";
+}
+
 /**
  * Runs one real dsh turn against WORKDIR, using the given direct provider.
  * dsh's --patch overlay selects the provider/model via the real, confirmed
@@ -254,7 +349,29 @@ async function runDshOnce(provider, text) {
       // 120 min a lone cline call could afford - a shorter, self-reported
       // timeout that still notifies Telegram beats a silent hard kill by
       // Actions' own job timeout with no result written at all.
-      const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("dsh timed out after 8min")); }, 8 * 60 * 1000);
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        // GHQ2-d, 2026-09-14 (built directly by Claude Code, founder's own
+        // real-time call): the brief this task started from named a file
+        // (worker/loop-detection.js) that does not exist anywhere in this
+        // repo's real history - a genuine brief defect, not something to
+        // port as described. Real, working loop-detection DOES exist on
+        // the local queue's own queue.sh (classify_kill_progress, built
+        // earlier tonight for TIMECEIL) - ported that real algorithm here
+        // instead: dsh's own transcript marks each turn with a literal
+        // "dsh: reasoning:" line, split the captured stdout on that marker
+        // and compare consecutive segments by word-set overlap. Real
+        // repetition restates nearly the same sentence (high overlap);
+        // real progress reads as different text turn to turn even about
+        // the same file (low overlap).
+        const timeoutErr = new Error("dsh timed out after 8min");
+        // TIMECEIL-CLOUD, 2026-09-14: real classification, not just a
+        // boolean - "progress" routes to re-decomposition below instead
+        // of a same-task model-swap retry.
+        timeoutErr.timeoutVerdict = classifyTimeoutKill(out);
+        timeoutErr.isLoop = timeoutErr.timeoutVerdict === "loop";
+        reject(timeoutErr);
+      }, 8 * 60 * 1000);
       child.stdout.setEncoding("utf8");
       child.stdout.on("data", (d) => (out += d));
       // 2026-09-12: was `child.stderr.resume()` (discard) - real bug found
@@ -297,7 +414,7 @@ async function runDshOnce(provider, text) {
  * failures rotate to the next real provider (Groq -> NVIDIA -> Mistral),
  * same real mechanism verified tonight in worker/rotation.js.
  */
-async function doWork(text) {
+async function doWork(text, task) {
   const tried = new Set();
   let provider = PROVIDER_ORDER[0];
   let lastErr = null;
@@ -315,6 +432,40 @@ async function doWork(text) {
       lastErr = err;
       const msg = String(err.message || err);
       attemptLog += `--- attempt on ${provider} ---\n${msg}\n\n`;
+      // TIMECEIL-CLOUD, 2026-09-14 (built directly by Claude Code,
+      // founder's own real-time call - ports the real fix already landed
+      // in the local queue's queue.sh for TIMECEIL, not a new design).
+      // A timeout that shows genuine, distinct progress (not real
+      // repetition) is a task too large for one 8-minute window, not a
+      // model problem - retrying it on a different provider just repeats
+      // the same too-big-for-one-window failure. Real re-decomposition
+      // via triageCheck()/triageSplit() instead, same machinery already
+      // used before a task is ever first attempted.
+      if (err.timeoutVerdict === "progress" && task) {
+        const decision = await triageCheck(text).catch(() => ({ split: false }));
+        if (decision.split) {
+          const subtaskIds = await triageSplit(task, decision).catch(() => null);
+          if (subtaskIds && subtaskIds.length > 0) {
+            console.log(`[${new Date().toISOString()}] timeout showed real progress, not a loop - re-decomposed into ${subtaskIds.length} subtasks instead of retrying on a different provider`);
+            return { decomposed: true, subtaskIds };
+          }
+        }
+        // Judge disagreed there's anything left to split, or the split
+        // itself failed - fall through to the ordinary failure path
+        // below rather than silently dropping the real progress finding.
+      }
+      // GHQ2-d, 2026-09-14: a real loop-detected failure (genuine
+      // repetition, not just a capacity-shaped one) escalates to the next
+      // real provider the same way a capacity failure already does -
+      // retrying the identical prompt on the identical provider that just
+      // looped cannot help, a different model can.
+      if (err.isLoop) {
+        const next = nextProvider(provider, tried);
+        if (next === null) break;
+        console.log(`[${new Date().toISOString()}] loop-detected failure on ${provider} - switching to ${next}`);
+        provider = next;
+        continue;
+      }
       if (!CAPACITY_RE.test(msg)) {
         const diag = await diagnose(text, attemptLog).catch(() => null);
         const base = `код ${err.code ?? "?"}: ${msg.split("\n")[0]}`;
@@ -440,16 +591,63 @@ async function triageCheck(text) {
 
 // Inserts each subtask as a real, independent plain-text row - no files,
 // no separate repo, matching this queue's actual `tasks.text` shape.
+//
+// GHQ2-c, 2026-09-14 (built directly by Claude Code, founder's own
+// real-time call - the local queue's own automated attempts at this
+// exhausted every model without converging). Real gap: subtasks are
+// inserted with no ordering marker at all, so a later sibling's own
+// dispatch could run before an earlier, still-unaccepted sibling - the
+// exact class of bug the LOCAL queue.sh's sibling-order guard already
+// exists to prevent. No schema change (parentTask.id/index would need a
+// new column on `tasks`, a real migration, not done tonight) - instead
+// the order is embedded directly in `text` as a `[SIB i/n parent:P]`
+// marker, parsed back out by siblingOrderOk() below before a subtask is
+// ever allowed to run.
 async function triageSplit(parentTask, decision) {
   const ids = [];
-  for (const st of decision.subtasks) {
+  const total = decision.subtasks.length;
+  for (let i = 0; i < total; i++) {
+    const st = decision.subtasks[i];
+    const sibMarker = `[SIB ${i + 1}/${total} parent:${parentTask.id}]`;
     const res = await client.execute({
       sql: "INSERT INTO tasks (text, status, creator_id, lane) VALUES (?, ?, ?, ?)",
-      args: [`[${st.title}] ${st.text}`, "ожидает", parentTask.creator_id, parentTask.lane || "architect"],
+      args: [`${sibMarker} [${st.title}] ${st.text}`, "ожидает", parentTask.creator_id, parentTask.lane || "architect"],
     });
     ids.push(Number(res.lastInsertRowid));
   }
   return ids;
+}
+
+// GHQ2-c, 2026-09-14: parses the `[SIB i/n parent:P]` marker triageSplit()
+// embeds in a subtask's own text. Returns null for a task that isn't a
+// triage-split subtask at all (no marker) - siblingOrderOk() then always
+// allows it, unchanged behavior for every non-subtask task.
+function parseSiblingMarker(text) {
+  const m = String(text || "").match(/^\[SIB (\d+)\/(\d+) parent:(\d+)\]/);
+  if (!m) return null;
+  return { index: Number(m[1]), total: Number(m[2]), parentId: Number(m[3]) };
+}
+
+// GHQ2-c, 2026-09-14: a subtask at index i>1 may only run once the
+// sibling at index i-1 (same parentId) has real status 'готова'. Fails
+// OPEN (allows the run) on any lookup error or if the earlier sibling
+// can't be found at all - a missing/ambiguous guard should never be the
+// reason real work never happens, matching the local queue.sh's own
+// "advisory, not a hard block on uncertainty" posture.
+async function siblingOrderOk(task) {
+  const sib = parseSiblingMarker(task.text);
+  if (!sib || sib.index <= 1) return true;
+  try {
+    const res = await client.execute({
+      sql: "SELECT status FROM tasks WHERE text LIKE ? LIMIT 1",
+      args: [`[SIB ${sib.index - 1}/${sib.total} parent:${sib.parentId}]%`],
+    });
+    const prev = res.rows[0];
+    if (!prev) return true;
+    return prev.status === "готова";
+  } catch {
+    return true;
+  }
 }
 
 // ============================================================================
