@@ -174,9 +174,21 @@ async function runDshOnce(provider, text) {
   // default - large enough to swallow plexus-doc's whole AGENTS.md/
   // CLAUDE.md unencoded on every single call, a fixed tax that alone can
   // exceed Groq's 8000 TPM budget before the real task prompt is even
-  // considered. Overriding it down here, cloud-side only - does not
-  // touch dsh's own defaults or the local queue's separate config.
-  const patchContent = `- id: agent-default-model\n  config:\n    provider: ${provider}\n    model: ${cfg.model}\n- id: agent-instructions\n  config:\n    maxBytes: 4096\n`;
+  // considered.
+  //
+  // First attempt at this cap was 4096 bytes - founder correctly caught
+  // that this would truncate plexus-doc's real AGENTS.md+CLAUDE.md
+  // (27363 bytes even after plexus-doc-ce's own same-night router split,
+  // confirmed via `gh api repos/.../contents`), risking real rule loss
+  // (renderInstructionContext drops least-specific files then truncates
+  // the most-specific remaining one - a genuine "incomplete brain" risk,
+  // not just a token-count optimization). Set high enough here to hold
+  // the current real file whole with real margin for growth (32768), not
+  // tight enough to force truncation - the actual over-Groq-limit case
+  // still relies on the already-working CAPACITY_RE rotation to NVIDIA
+  // (no meaningful token limit there) rather than on truncating real
+  // instructions to force-fit Groq specifically.
+  const patchContent = `- id: agent-default-model\n  config:\n    provider: ${provider}\n    model: ${cfg.model}\n- id: agent-instructions\n  config:\n    maxBytes: 32768\n`;
   const patchFile = path.join(os.tmpdir(), `dsh-patch-${Date.now()}-${Math.random().toString(36).slice(2)}.yml`);
   await writeFile(patchFile, patchContent, "utf-8");
   try {
