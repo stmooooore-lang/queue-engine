@@ -23,7 +23,7 @@
  */
 
 import { createClient } from "@libsql/client";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import { writeFile, unlink, mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -65,13 +65,26 @@ async function run() {
     }
   }
 
+  // GHQ4, 2026-09-14: real bug found via plexus-doc-ce's task 21 - this
+  // job's own actions/checkout@v4 for plexus-doc has no ref:, so it always
+  // lands on the default branch regardless of what the task text asks for.
+  // actions/checkout's ref can't be templated from a value only known once
+  // this script reads the real task row, so the branch switch happens
+  // here instead, with real git commands, before any work starts.
+  checkoutTaskBranch(task.text);
+
   // Execute work
   const workStart = Date.now();
   const result = await doWork(task.text);
   const workEnd = Date.now();
 
   // Update task
-  const status = result.success ? 'готова' : 'провал';
+  // GHQ2-b, 2026-09-14: a permanent, founder-fixable verdict (no_address,
+  // no_access, impossible_as_written, brief_conflicts_rules) gets a
+  // persistent "заблокирована" status instead of "провал" - retrying the
+  // same brief on a different provider cannot fix any of these, mirroring
+  // queue.sh's own queue-blocked.txt semantics.
+  const status = result.success ? 'готова' : (result.permanent ? 'заблокирована' : 'провал');
   const minutesUsed = Math.ceil((workEnd - workStart) / 60000);
   const secondsToFirstWork = Math.floor((workStart - startTime) / 1000);
 
@@ -99,6 +112,34 @@ async function run() {
 // executor.yml's confinement check and plexus-corridor.yml's header for why
 // nothing here pushes back to plexus-doc on its own.
 const WORKDIR = "plexus-doc";
+
+// GHQ4, 2026-09-14 (built directly by Claude Code, founder's own real-time
+// call - the local queue's own automated attempts at this exhausted every
+// model without converging). Convention, confirmed against plexus-doc's own
+// AGENTS.md: "ONE TASK, ONE BRANCH" - a brief names its target branch by
+// name in its text (e.g. "branch cursor-build (NOT main)"). No match = no
+// branch requested = leave the default checkout untouched, same as before
+// this existed. Only safe branch-name characters are captured by the regex
+// (alnum, dot, dash, underscore, slash) - never interpolated unsanitized
+// into a shell command.
+function checkoutTaskBranch(text) {
+  const m = String(text || "").match(/\bbranch[:\s]+([A-Za-z0-9][A-Za-z0-9._\/-]*)/i);
+  if (!m) {
+    console.log(`[${new Date().toISOString()}] branch: none named in task text, staying on default checkout`);
+    return null;
+  }
+  const branch = m[1].replace(/[.,;:]+$/, "");
+  try {
+    execSync(`git fetch origin ${branch}`, { cwd: WORKDIR, stdio: "pipe" });
+    execSync(`git checkout ${branch}`, { cwd: WORKDIR, stdio: "pipe" });
+    const actual = execSync("git branch --show-current", { cwd: WORKDIR }).toString().trim();
+    console.log(`[${new Date().toISOString()}] branch: task named "${branch}", checked out (git reports: ${actual})`);
+    return actual;
+  } catch (err) {
+    console.log(`[${new Date().toISOString()}] branch: task named "${branch}" but checkout failed (${err.message}) - staying on default checkout`);
+    return null;
+  }
+}
 
 // Real, direct-provider config (2026-09-12) - no litellm alias model
 // strings, no routing prefixes (groq/, mistral/, gemini/ are litellm's own
@@ -188,7 +229,15 @@ async function runDshOnce(provider, text) {
   // still relies on the already-working CAPACITY_RE rotation to NVIDIA
   // (no meaningful token limit there) rather than on truncating real
   // instructions to force-fit Groq specifically.
-  const patchContent = `- id: agent-default-model\n  config:\n    provider: ${provider}\n    model: ${cfg.model}\n- id: agent-instructions\n  config:\n    maxBytes: 32768\n`;
+  // GHQ3, 2026-09-14 (built directly by Claude Code, founder's own
+  // real-time call): CLAUDE.md's own content says it's a pointer for a
+  // real interactive Claude Code session (canon/START-HERE.md), not
+  // content dsh's headless calls need on top of the real AGENTS.md -
+  // confirmed live tonight via a real `dsh --profile headless --patch
+  // <file> --dump-config` run: instructionFileCandidates: ["AGENTS.md"]
+  // against plexus-doc's real files produced full AGENTS.md content and
+  // zero CLAUDE.md content, saving ~2.4KB/call with no loss.
+  const patchContent = `- id: agent-default-model\n  config:\n    provider: ${provider}\n    model: ${cfg.model}\n- id: agent-instructions\n  config:\n    maxBytes: 32768\n    instructionFileCandidates: ["AGENTS.md"]\n`;
   const patchFile = path.join(os.tmpdir(), `dsh-patch-${Date.now()}-${Math.random().toString(36).slice(2)}.yml`);
   await writeFile(patchFile, patchContent, "utf-8");
   try {
@@ -269,7 +318,11 @@ async function doWork(text) {
       if (!CAPACITY_RE.test(msg)) {
         const diag = await diagnose(text, attemptLog).catch(() => null);
         const base = `код ${err.code ?? "?"}: ${msg.split("\n")[0]}`;
-        return { success: false, message: truncate(diag ? `${base}\n\n${diag}` : base) };
+        return {
+          success: false,
+          message: truncate(diag ? `${base}\n\n${diag.line}` : base),
+          permanent: diag ? diag.permanent : false,
+        };
       }
       const next = nextProvider(provider, tried);
       if (next === null) break;
@@ -280,7 +333,11 @@ async function doWork(text) {
   const msg = String(lastErr?.message || lastErr || "unknown error");
   const diag = await diagnose(text, attemptLog).catch(() => null);
   const base = `код ${lastErr?.code ?? "?"}: ${msg.split("\n")[0]}`;
-  return { success: false, message: truncate(diag ? `${base}\n\n${diag}` : base) };
+  return {
+    success: false,
+    message: truncate(diag ? `${base}\n\n${diag.line}` : base),
+    permanent: diag ? diag.permanent : false,
+  };
 }
 
 async function notifyTelegram(chatId, message) {
@@ -421,6 +478,20 @@ const DIAGNOSE_VERDICTS = {
   unclear: "по логу причину назвать нельзя",
 };
 
+// GHQ2-b, 2026-09-14 (built directly by Claude Code, founder's own
+// real-time call - the local queue's own automated attempts at this
+// exhausted every model without converging). These four verdicts are the
+// ones only a human can actually fix (missing address/access/mechanism, or
+// a real conflict in the brief) - retrying the same brief on a different
+// model cannot help any of them, mirroring queue.sh's own queue-blocked.txt
+// semantics for exactly this class of verdict.
+const PERMANENT_VERDICTS = new Set([
+  "no_address",
+  "no_access",
+  "impossible_as_written",
+  "brief_conflicts_rules",
+]);
+
 const DIAGNOSE_PROMPT = `Ниже лог провалившейся попытки выполнить задачу и сам бриф задачи (в этой очереди бриф - это просто текст задачи, без отдельного файла).
 
 Ответь СТРОГО в этом формате, четыре строки, ничего больше:
@@ -490,7 +561,7 @@ async function diagnose(brief, log) {
     if (got.FACT && got.FACT.toUpperCase() !== "NONE") line += `\n  не хватило: ${got.FACT.slice(0, 300)}`;
     if (got.EVIDENCE) line += `\n  из лога: ${got.EVIDENCE.slice(0, 300)}`;
     line += "\n  (диагност только предполагает; правку в бриф вносит человек)";
-    return line;
+    return { line, permanent: PERMANENT_VERDICTS.has(got.VERDICT) };
   } catch {
     return null;
   }
