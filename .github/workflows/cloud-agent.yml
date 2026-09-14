@@ -28,20 +28,27 @@ jobs:
     # commit died with the runner because nothing pushed it. checkout@v4's
     # default token can push once the job is allowed to ask for write access.
     #
-    # workflows: write added 2026-09-14 - contents: write alone is not
-    # enough to push a change under .github/workflows/ (GitHub's own
-    # restriction on GitHub App-issued tokens, checkout@v4's default
-    # included): push failed with "refusing to allow a GitHub App to
-    # create or update workflow .github/workflows/dispatcher.yml without
-    # `workflows` permission" on GHQ-EXEC-DISPATCHER's real run
-    # (34815276598) after the agent had already written and locally
-    # committed dispatcher.yml/dispatcher.mjs - the commit was lost when
-    # the job then hit its 50min timeout with the push still failing.
     permissions:
       contents: write
-      workflows: write
     steps:
+      # `with: token: secrets.REPO_TOKEN` added 2026-09-14 - the default
+      # GITHUB_TOKEN can NEVER push a change under .github/workflows/, no
+      # matter what the permissions block says (there is no "workflows"
+      # key in that schema at all - a wrong guess at one, `workflows:
+      # write`, broke workflow_dispatch itself with a 422 and was
+      # reverted within the hour). GHQ-EXEC-DISPATCHER's real run
+      # (34815276598) wrote and locally committed dispatcher.yml here,
+      # then lost the commit when its push was rejected for exactly this
+      # reason. REPO_TOKEN is a PAT (used two steps below for plexus-doc
+      # already) - reusing it here on queue-engine's own checkout only
+      # works if that PAT's own scope/permissions include `workflow`;
+      # if the next real run still fails to push under
+      # .github/workflows/, that means it doesn't, and the scope needs
+      # adding in the token's own GitHub settings (not fixable from
+      # here).
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.REPO_TOKEN }}
       # Read+write access to plexus-doc itself, not just its partial mirror
       # in this repo - decided 2026-08-23, implemented 2026-08-24 once
       # hosting was solved. REPO_TOKEN is a PAT scoped for this; checkout@v4
