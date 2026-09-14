@@ -7,13 +7,16 @@ name: dispatcher
 # by itself. This cron polls Turso and calls workflow_dispatch on executor.yml
 # for each real pending task, via scripts/dispatcher.mjs.
 #
-# Uses secrets.REPO_TOKEN (a PAT, already used elsewhere in this repo for the
-# plexus-doc checkout in cloud-agent.yml) rather than the default GITHUB_TOKEN
-# for the actual dispatch call - GitHub's anti-recursion behavior for the
-# built-in token is real and documented for several trigger types, and this
-# workflow's whole job is triggering another one, so it isn't worth risking a
-# repeat of tonight's other GITHUB_TOKEN-schema mistake (queue-engine's own
-# DECISIONS.md, GHQ-EXEC-DISPATCHER entry, has the story).
+# Uses secrets.DISPATCH_TOKEN, a separate PAT from REPO_TOKEN (which is
+# scoped to plexus-doc only, for the checkout in cloud-agent.yml, and can't
+# reach queue-engine's own Actions API - confirmed the hard way tonight, see
+# queue-engine's own DECISIONS.md GHQ-EXEC-DISPATCHER entry). The founder
+# already had a PAT scoped exactly for this ("queue-engine-self-queue-
+# dispatch": repo access = queue-engine only, permissions = Read metadata +
+# Read/write Actions, created 2026-08-30) - DISPATCH_TOKEN is that token's
+# value. Not the default GITHUB_TOKEN: GitHub's anti-recursion behavior for
+# the built-in token is real and documented for several trigger types, and
+# this workflow's whole job is triggering another one.
 
 on:
   schedule:
@@ -36,5 +39,5 @@ jobs:
         env:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-          GH_TOKEN: ${{ secrets.REPO_TOKEN }}
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
         run: node scripts/dispatcher.mjs
