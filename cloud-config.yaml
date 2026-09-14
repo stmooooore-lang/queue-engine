@@ -14,6 +14,11 @@ model_list:
 
   - model_name: plexus-coder
     litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning
+      rpm: 40
+      api_key: os.environ/NVIDIA_API_KEY
+  - model_name: plexus-groq
+    litellm_params:
       model: groq/openai/gpt-oss-120b
       rpm: 30
       tpm: 8000
@@ -150,6 +155,8 @@ router_settings:
     - plexus-architect: ["plexus-gemini", "plexus-cheap"]
     - plexus-judge: ["plexus-architect"]
     - plexus-act:  ["plexus-coder", "plexus-cheap"]
+    - plexus-coder: ["plexus-groq"]
+    - plexus-groq: ["plexus-nvidia-reasoning"]
     - plexus-plan: ["plexus-architect"]
 
 
