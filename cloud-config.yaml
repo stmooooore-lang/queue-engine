@@ -156,7 +156,7 @@ router_settings:
     - plexus-judge: ["plexus-architect"]
     - plexus-act:  ["plexus-coder", "plexus-cheap"]
     - plexus-coder: ["plexus-groq"]
-    - plexus-groq: ["plexus-nvidia-reasoning"]
+    - plexus-groq: ["plexus-architect"]
     - plexus-plan: ["plexus-architect"]
 
 
