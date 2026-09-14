@@ -17,6 +17,11 @@ model_list:
       model: nvidia_nim/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning
       rpm: 40
       api_key: os.environ/NVIDIA_API_KEY
+  - model_name: plexus-nvidia-reasoning
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
+      rpm: 40
+      api_key: os.environ/NVIDIA_API_KEY
   - model_name: plexus-groq
     litellm_params:
       model: groq/openai/gpt-oss-120b
