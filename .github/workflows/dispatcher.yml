@@ -1,0 +1,40 @@
+name: dispatcher
+
+# Real gap this closes (decided 2026-09-12): executor.yml only runs on an
+# explicit workflow_dispatch with a taskId input - it never scans the tasks
+# table on its own, unlike the old scripts/poller.mjs. Inserting a Turso row
+# (e.g. from worker/index.js's Telegram entry point) is therefore not enough
+# by itself. This cron polls Turso and calls workflow_dispatch on executor.yml
+# for each real pending task, via scripts/dispatcher.mjs.
+#
+# Uses secrets.REPO_TOKEN (a PAT, already used elsewhere in this repo for the
+# plexus-doc checkout in cloud-agent.yml) rather than the default GITHUB_TOKEN
+# for the actual dispatch call - GitHub's anti-recursion behavior for the
+# built-in token is real and documented for several trigger types, and this
+# workflow's whole job is triggering another one, so it isn't worth risking a
+# repeat of tonight's other GITHUB_TOKEN-schema mistake (queue-engine's own
+# DECISIONS.md, GHQ-EXEC-DISPATCHER entry, has the story).
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+      - name: install deps
+        run: npm install --no-save @libsql/client --silent
+      - name: dispatch pending tasks
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          GH_TOKEN: ${{ secrets.REPO_TOKEN }}
+        run: node scripts/dispatcher.mjs
