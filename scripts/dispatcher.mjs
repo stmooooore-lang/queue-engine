@@ -17,6 +17,18 @@
  * no row and exits cleanly ("No pending task found"). Worst case from firing
  * twice for the same task in one tick is one harmless extra Actions run, not
  * a correctness bug. That existing guarantee is why this stays this small.
+ *
+ * One task in flight at a time, 2026-09-14 - the founder's real, direct
+ * correction: "ОЧЕРЕДЬ - это когда последовательно" (a QUEUE means
+ * sequential). The first version dispatched up to 5 tasks per tick with no
+ * check for what was already running, and the very first real tick fired 5
+ * of plexus-doc-cc's tasks within ~8 seconds of each other - all 5 then
+ * failed on the same provider rate limits (groq/nvidia/mistral), competing
+ * for one shared TPM budget instead of queuing behind each other the way
+ * the local queue.sh always has. Fixed by checking for any executor.yml run
+ * already queued/in_progress before dispatching, and dispatching at most one
+ * task per tick if so - the next tick (10 min later) picks up the next one,
+ * same one-at-a-time posture as the local queue.
  */
 
 import { createClient } from "@libsql/client";
@@ -51,20 +63,33 @@ async function siblingOrderOk(task) {
   }
 }
 
-const MAX_DISPATCHES_PER_TICK = Number(process.env.MAX_DISPATCHES_PER_TICK || 5);
 const REPO = process.env.GITHUB_REPOSITORY; // "owner/repo", set automatically by Actions
 
+// One task in flight at a time (see the file header) - if executor.yml
+// already has a queued or in_progress run, this tick dispatches nothing and
+// waits for the next one. `gh run list --json status` returns real GitHub
+// Actions run status strings ("queued", "in_progress", "completed", ...).
+function executorAlreadyRunning() {
+  const out = execFileSync(
+    "gh",
+    ["run", "list", "--workflow", "executor.yml", "--repo", REPO, "--json", "status", "--limit", "20"],
+    { env: process.env }
+  ).toString();
+  const runs = JSON.parse(out);
+  return runs.some((r) => r.status === "queued" || r.status === "in_progress");
+}
+
 async function main() {
+  if (executorAlreadyRunning()) {
+    console.log(`[${new Date().toISOString()}] executor.yml already has a run in flight, dispatching nothing this tick`);
+    return;
+  }
+
   const pending = await client.execute({
     sql: "SELECT id, text FROM tasks WHERE status = 'ожидает' ORDER BY id ASC",
   });
 
-  let dispatched = 0;
   for (const task of pending.rows) {
-    if (dispatched >= MAX_DISPATCHES_PER_TICK) {
-      console.log(`[${new Date().toISOString()}] reached MAX_DISPATCHES_PER_TICK=${MAX_DISPATCHES_PER_TICK}, stopping this tick`);
-      break;
-    }
     if (!(await siblingOrderOk(task))) {
       console.log(`[${new Date().toISOString()}] task ${task.id}: waiting on an earlier unaccepted sibling, skipping`);
       continue;
@@ -74,14 +99,14 @@ async function main() {
         stdio: "inherit",
         env: process.env,
       });
-      console.log(`[${new Date().toISOString()}] dispatched executor.yml for task ${task.id}`);
-      dispatched++;
+      console.log(`[${new Date().toISOString()}] dispatched executor.yml for task ${task.id}, stopping - one at a time`);
+      return;
     } catch (e) {
       console.error(`[${new Date().toISOString()}] failed to dispatch task ${task.id}: ${e.message}`);
     }
   }
 
-  console.log(`[${new Date().toISOString()}] tick done: ${dispatched} dispatched, ${pending.rows.length} were pending`);
+  console.log(`[${new Date().toISOString()}] tick done: nothing ready to dispatch out of ${pending.rows.length} pending`);
 }
 
 main().catch((e) => {
