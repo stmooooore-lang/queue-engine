@@ -29,6 +29,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Create headless dsh profile directory (required for dsh to initialize
+      # its profile structure before Node.js setup runs)
+      - name: create headless dsh profile directory
+        run: |
+          mkdir -p ~/.dsh/profiles/headless
+          if [ ! -d ~/.dsh/profiles/headless ]; then
+            echo "FAIL: headless profile directory was not created"
+            exit 1
+          fi
+          echo "OK: headless profile directory exists at ~/.dsh/profiles/headless"
+
       # 2026-09-13: real gap found via plexus-doc-ce's task 11 - dsh only had
       # `plexus/`, a partial snapshot checked into this repo (see the header
       # of plexus-corridor.yml: "the cloud is a worker, not a git client").
