@@ -30,6 +30,61 @@ import path from "node:path";
 
 const client = createClient({ url: process.env.TURSO_DATABASE_URL, authToken: process.env.TURSO_AUTH_TOKEN });
 
+/**
+ * Executes a shell command directly in WORKDIR without LLM/dsh.
+ * Used for tasks that need actual code execution (scripts, tests, builds).
+ * 
+ * @param {string} command - The shell command to execute
+ * @returns {Promise<{success: boolean, stdout: string, stderr: string, exitCode: number}>}
+ */
+async function runCommand(command) {
+  return await new Promise((resolve) => {
+    const child = spawn('bash', ['-c', command], {
+      cwd: WORKDIR,
+      env: { ...process.env },
+    });
+    
+    let stdout = '';
+    let stderr = '';
+    
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (d) => (stdout += d));
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (d) => { if (stderr.length < 10000) stderr += d; });
+    
+    // 5 minute timeout for command execution
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      resolve({
+        success: false,
+        stdout,
+        stderr: stderr + '\n[TIMEOUT] Command killed after 5 minutes',
+        exitCode: -1
+      });
+    }, 5 * 60 * 1000);
+    
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({
+        success: code === 0,
+        stdout: stdout.trim(),
+        stderr: stderr.trim(),
+        exitCode: code
+      });
+    });
+    
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({
+        success: false,
+        stdout: '',
+        stderr: err.message,
+        exitCode: -1
+      });
+    });
+  });
+}
+
 async function run() {
   const taskId = process.env.TASK_ID;
   const startTime = Date.now();
@@ -285,7 +340,7 @@ function classifyTimeoutKill(text) {
     if (wa.size === 0 || wb.size === 0) { total += 0; count++; continue; }
     let inter = 0;
     for (const w of wa) if (wb.has(w)) inter++;
-    const union = new Set([...wa, ...wb]).size;
+    const union = new Set([...wa, [...wb]]).size;
     total += union === 0 ? 0 : inter / union;
     count++;
   }
@@ -415,6 +470,16 @@ async function runDshOnce(provider, text) {
  * same real mechanism verified tonight in worker/rotation.js.
  */
 async function doWork(text, task) {
+  // RUN_COMMAND: direct shell command execution (bypasses LLM/dsh)
+  if (text.trim().startsWith('RUN_COMMAND: ')) {
+    const command = text.trim().slice('RUN_COMMAND: '.length).trim();
+    console.log(`[${new Date().toISOString()}] RUN_COMMAND: executing ${command}`);
+    const cmdResult = await runCommand(command);
+    const output = cmdResult.success
+      ? `Команда выполнена успешно (exit ${cmdResult.exitCode}).\nSTDOUT: ${cmdResult.stdout || '(пусто)'}\nSTDERR: ${cmdResult.stderr || '(пусто)'}`
+      : `Команда завершилась с ошибкой (exit ${cmdResult.exitCode}).\nSTDOUT: ${cmdResult.stdout || '(пусто)'}\nSTDERR: ${cmdResult.stderr}`;
+    return { success: cmdResult.success, message: cmdResult.success ? cmdResult.stdout : (cmdResult.stderr || 'Command failed') };
+  }
   const tried = new Set();
   let provider = PROVIDER_ORDER[0];
   let lastErr = null;
