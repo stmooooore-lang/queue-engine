@@ -153,6 +153,16 @@ async function run() {
   }
   const workEnd = Date.now();
 
+  // Push artifacts to origin BEFORE marking task as done
+  if (result.success) {
+    const pushed = await pushTaskArtifacts();
+    if (!pushed) {
+      // Push failed - mark as failed instead of done
+      result.success = false;
+      result.message = "Artifact push to origin failed: " + result.message;
+    }
+  }
+
   // GHQ2-e, 2026-09-14 (built directly by Claude Code, founder's own
   // real-time call): a model's own answer/error text can genuinely
   // contain a real credential (an env var dump, a copy-pasted log line) -
@@ -195,6 +205,35 @@ async function run() {
 // executor.yml's confinement check and plexus-corridor.yml's header for why
 // nothing here pushes back to plexus-doc on its own.
 const WORKDIR = "plexus-doc";
+
+
+/**
+ * Push any changes made in WORKDIR (plexus-doc) back to origin.
+ * Called after successful task completion, before marking task as 'готова'.
+ * Uses REPO_TOKEN from executor.yml environment (scoped to plexus-doc push).
+ */
+async function pushTaskArtifacts() {
+  try {
+    const status = execSync("git status --porcelain", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
+    if (!status) {
+      console.log(`[${new Date().toISOString()}] push: no changes in ${WORKDIR}, skipping`);
+      return true;
+    }
+    execSync("git config user.name 'queue-engine[bot]'", { cwd: WORKDIR, stdio: "pipe" });
+    execSync("git config user.email 'queue-engine@users.noreply.github.com'", { cwd: WORKDIR, stdio: "pipe" });
+    execSync("git add -A", { cwd: WORKDIR, stdio: "pipe" });
+    const firstFile = status.split('\n')[0].slice(0, 50);
+    const commitMsg = `task ${process.env.TASK_ID}: ${firstFile}`;
+    execSync(`git commit -m "${commitMsg.replace(/"/g, '\"')}"`, { cwd: WORKDIR, stdio: "pipe" });
+    const branch = execSync("git branch --show-current", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
+    execSync(`git push origin ${branch}`, { cwd: WORKDIR, stdio: "pipe" });
+    console.log(`[${new Date().toISOString()}] push: committed and pushed ${status.split('\n').length} file(s) to origin/${branch}`);
+    return true;
+  } catch (err) {
+    console.log(`[${new Date().toISOString()}] push: FAILED - ${err.message}`);
+    return false;
+  }
+}
 
 // GHQ4, 2026-09-14 (built directly by Claude Code, founder's own real-time
 // call - the local queue's own automated attempts at this exhausted every
