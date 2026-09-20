@@ -269,12 +269,31 @@ function checkoutTaskBranch(text) {
 // providers - see docs/DECISIONS.md). NVIDIA's "nvidia/" prefix IS real -
 // confirmed against the one working example in ~/.dsh/settings.yaml's own
 // nvidia-direct entry, not a litellm artifact.
-const PROVIDER_ORDER = ["groq", "nvidia", "mistral"];
+//
+// 2026-09-15 (CONFIG-ENRICH-b): added Google (Gemini API) and Vertex AI
+// as fallback pair - Google quota errors (RESOURCE_EXHAUSTED, quota
+// exceeded) trigger auto-switch to Vertex. Both use native Google SDK
+// compatible endpoints, not litellm prefixes.
+const PROVIDER_ORDER = ["groq", "nvidia", "mistral", "google", "vertex"];
 const PROVIDER_CONFIG = {
   groq: { baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY", model: "openai/gpt-oss-120b" },
   nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", model: "nvidia/nemotron-3-ultra-550b-a55b" },
   mistral: { baseURL: "https://api.mistral.ai/v1", apiKeyEnv: "MISTRAL_API_KEY", model: "mistral-medium-3-5" },
+  google: { baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", apiKeyEnv: "GOOGLE_API_KEY", model: "gemini-1.5-pro" },
+  vertex: { baseURL: "https://${VERTEX_LOCATION:-us-central1}-aiplatform.googleapis.com/v1/projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION:-us-central1}/publishers/google/models/", apiKeyEnv: "VERTEX_ACCESS_TOKEN", model: "gemini-1.5-pro" },
 };
+
+// Helper to resolve Vertex baseURL with env vars at runtime (shell-style ${VAR:-default} not interpolated in JS)
+function resolveVertexBaseURL(cfg) {
+  if (cfg.baseURL.includes("${")) {
+    const location = process.env.VERTEX_LOCATION || "us-central1";
+    const projectId = process.env.VERTEX_PROJECT_ID || "";
+    return cfg.baseURL
+      .replace(/\$\{VERTEX_LOCATION:-([^}]+)\}/g, location)
+      .replace(/\$\{VERTEX_PROJECT_ID\}/g, projectId);
+  }
+  return cfg.baseURL;
+}
 
 // Capacity-shaped failure detector - same real pattern used throughout this
 // project's own local queue.sh and the parallel GHQ work tonight.
@@ -287,7 +306,10 @@ const PROVIDER_CONFIG = {
 // immediately on the first provider instead of rotating to NVIDIA/Mistral.
 // Added both the dsh-native tag and the JSON body's own code field so
 // either shape matches.
-const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|No deployments available|RateLimitError|RATE_LIMIT|rate_limit_exceeded|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|hook dispatch failed|operation timed out/i;
+//
+// 2026-09-15 (CONFIG-ENRICH-b): added Google quota errors (RESOURCE_EXHAUSTED,
+// quota exceeded, 429) to trigger auto-switch from Google to Vertex.
+const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|No deployments available|RateLimitError|RATE_LIMIT|rate_limit_exceeded|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|hook dispatch failed|operation timed out|timed out after|RESOURCE_EXHAUSTED|quota exceeded|429|rate limit/i;
 
 function nextProvider(current, tried) {
   const remaining = PROVIDER_ORDER.filter((p) => !tried.has(p));
@@ -313,7 +335,16 @@ function sanitizeModelText(text) {
   const t = (text || "").trim();
   if (!t) return t;
   const looksLikeHtmlPage = /^<!DOCTYPE html/i.test(t) || /^<html[\s>]/i.test(t);
-  const hasHugeUnbrokenToken = /\S{500,}/.test(t);
+  // An HTML error page or raw binary blob shows a huge unbroken token from
+  // the very first characters. A long hash/minified line/a long URL buried
+  // inside otherwise normal prose is a legitimate answer and must NOT be
+  // condemned wholesale. So scope the unbroken-token check to the start of
+  // the response only (0.5KB is far more than any honest prose prefix and
+  // far less than the error-page/blob signal size): if a run of >=500
+  // non-whitespace chars appears within the opening prefix, treat it as a
+  // blob; otherwise leave the full text alone even if a long token appears
+  // later. (CLOUD-EXECUTOR-LOOP-DETECTOR-FIX)
+  const hasHugeUnbrokenToken = /^\S{500,}/.test(t);
   if (looksLikeHtmlPage || hasHugeUnbrokenToken) {
     return `[proxy/HTTP error, not a model answer - looks like ${looksLikeHtmlPage ? "an HTML error page" : "a raw binary/encoded blob"}]`;
   }
