@@ -104,12 +104,22 @@ jobs:
       # tonight): real measurement showed `npm install -g
       # @deepseek-ai/dsh` alone was 65 of every 86s (75%) of a task run,
       # before any model call even started. Caches the global npm
-      # install dir, keyed on a PINNED dsh version (0.1.5-rc.1 - the
-      # exact version this whole session's dsh work was tested against
-      # tonight, see docs/DECISIONS.md) rather than "latest", so the
-      # cache never goes stale silently AND a future dsh release can't
-      # silently change behavior underneath already-verified work - a
-      # version bump becomes a deliberate, visible edit to this file.
+      # install dir, keyed on a PINNED dsh version rather than "latest",
+      # so the cache never goes stale silently AND a future dsh release
+      # can't silently change behavior underneath already-verified work -
+      # a version bump becomes a deliberate, visible edit to this file.
+      #
+      # 2026-09-30: pin changed 0.1.5-rc.1 -> 0.1.5-rc.3. Real cause of
+      # task 64's block (run 36687803570), reproduced offline on macOS:
+      # `npm install -g @deepseek-ai/dsh@0.1.5-rc.1` installs the CORE at
+      # 0.1.5-rc.1 but resolves every `@deepseek-ai/dsh-*` dependency
+      # through its own caret range `^0.1.5-rc.1`, which npm satisfies
+      # with 0.1.5-rc.3. That mixed tree (core rc.1 + plugins rc.3) boots
+      # no headless profile at all: the sandbox entry never gets a Cordis
+      # fiber and dsh exits 1 with "plugin(s) failed to load:
+      # @deepseek-ai/dsh-sandbox-local". Pinning the MATCHED version keeps
+      # core and plugins on the same build; 0.1.5-rc.3 was verified
+      # booting a real `--profile headless --patch` run before this edit.
       - name: get npm global paths
         id: npm-global
         run: |
@@ -131,16 +141,83 @@ jobs:
           path: |
             ${{ steps.npm-global.outputs.root }}
             ${{ steps.npm-global.outputs.bin }}
-          key: dsh-global-${{ runner.os }}-node24-0.1.5-rc.1-v2
+          key: dsh-global-${{ runner.os }}-node24-0.1.5-rc.3-v3
 
       - name: install dsh
         if: steps.dsh-cache.outputs.cache-hit != 'true'
-        run: npm install -g @deepseek-ai/dsh@0.1.5-rc.1 --silent
+        run: npm install -g @deepseek-ai/dsh@0.1.5-rc.3 --silent
 
       - name: verify dsh is real after cache/install
         run: |
           which dsh
           dsh --version
+
+      # 2026-10-03: post-install tree-homogeneity guard. The pinned core
+      # does not pin its @deepseek-ai/dsh-* dependencies (the package
+      # manifest carries caret ranges ^0.1.5-rc.3), so npm resolves them
+      # on its own. Today that lands on exactly 0.1.5-rc.3 because the
+      # 0.1.5 line ends there - a coincidence of the registry, not a
+      # guarantee: when rc.4 (or a 0.1.5 stable) is published, the caret
+      # leaks and the rc.1 mixed-tree bug class returns. This step checks
+      # the INSTALLED tree by fact, not by range: every @deepseek-ai/dsh*
+      # package must be at the core's own version. A mismatch fails the
+      # job before any task runs.
+      - name: verify dsh tree is homogeneous
+        run: |
+          root=$(npm root -g)
+          core=$(node -e "console.log(require(process.argv[1]).version)" "$root/@deepseek-ai/dsh/package.json")
+          echo "core dsh version: $core"
+          bad=$(find "$root/@deepseek-ai" -maxdepth 2 -name package.json | while read -r p; do
+            name=$(node -e "console.log(require(process.argv[1]).name)" "$p" 2>/dev/null) || continue
+            case "$name" in
+              @deepseek-ai/dsh|@deepseek-ai/dsh-*) ;;
+              *) continue ;;
+            esac
+            v=$(node -e "console.log(require(process.argv[1]).version)" "$p" 2>/dev/null)
+            [ "$v" != "$core" ] && echo "$name@$v"
+          done)
+          if [ -n "$bad" ]; then
+            echo "FAIL: mixed dsh tree - core $core, mismatched packages:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK: dsh tree homogeneous - every @deepseek-ai/dsh* package at $core"
+
+      # 2026-09-30: `dsh --version` was the ONLY dsh check this workflow
+      # made, and it passes on a dsh whose headless profile cannot boot at
+      # all - exactly how task 64's real blocker (a plugin tree that does
+      # not resolve) stayed invisible here while the job stayed green. This
+      # step starts a real headless profile with the same profile/patch
+      # shape executor.mjs uses. A registered-but-dummy provider makes the
+      # turn fail at AUTH, which is the EXPECTED, healthy outcome: reaching
+      # a provider error proves the whole plugin tree mounted. The one
+      # outcome treated as fatal is the plugin tree itself failing to load.
+      - name: smoke-test that the headless profile actually boots
+        run: |
+          mkdir -p ~/.dsh/profiles/headless
+          cat > ~/.dsh/settings.yaml << 'SETTINGS'
+          llm-pi-ai:
+            providers:
+              nvidia:
+                apiKeyEnv: NVIDIA_API_KEY
+                api: openai-completions
+                baseURL: https://integrate.api.nvidia.com/v1
+                models:
+                  - id: nvidia/nemotron-3-ultra-550b-a55b
+          SETTINGS
+          printf -- '- id: agent-default-model\n  config:\n    provider: nvidia\n    model: nvidia/nemotron-3-ultra-550b-a55b\n' > /tmp/boot-check-patch.yml
+          set +e
+          NVIDIA_API_KEY=dsh-boot-check-not-a-real-key \
+            dsh --profile headless --patch /tmp/boot-check-patch.yml "boot check" > /tmp/boot-check.log 2>&1
+          boot_status=$?
+          set -e
+          if grep -q "plugin(s) failed to load\|plugin tree failed to load" /tmp/boot-check.log; then
+            echo "FAIL: the headless profile does not boot - plugin tree failed to load:"
+            tail -25 /tmp/boot-check.log
+            exit 1
+          fi
+          echo "OK: headless profile booted (exit $boot_status, no plugin-tree failure)"
+          tail -5 /tmp/boot-check.log
 
       # dsh reads a fixed global path, ~/.dsh/settings.yaml - no CLI flag
       # selects it. Same registry shape as this repo's own worker uses

@@ -188,6 +188,19 @@ async function run() {
 
   // Notify via Telegram to creator
   await notifyTelegram(task.creator_id, `Задача ${taskId} ${status}: ${result.message}`);
+
+  // 2026-09-30: everything a task actually did or failed to do was written to
+  // Turso and to Telegram, and NOTHING was written to this process's own
+  // stdout - the run printed one line about the branch and then exited 0. So
+  // GitHub reported a green workflow for a run whose task ended in
+  // провал/заблокирована (real case: run 36687803570, task 64 - the real
+  // blocker lived only in the database row). Print the verdict to the log and
+  // exit non-zero when the task did not complete, so a green job means the
+  // task was really done. The two early returns above (no pending task,
+  // waiting on an unaccepted sibling) deliberately still exit 0 - those are
+  // "nothing to do", not "the work failed".
+  console.log(`[${new Date().toISOString()}] task ${taskId}: ${status} - ${String(result.message).split("\n")[0]}`);
+  if (status !== "готова") process.exitCode = 1;
 }
 
 // The agent works INSIDE WORKDIR and nowhere else. Founder's decision
@@ -616,6 +629,9 @@ async function doWork(text, task) {
       provider = next;
     }
   }
+  // Все провайдеры исчерпаны — эскалация фаундеру
+  const finalError = String(lastErr?.message || lastErr || "unknown error");
+  await escalateToFounder(process.env.TASK_ID, finalError, provider).catch(() => {});
   const msg = String(lastErr?.message || lastErr || "unknown error");
   const diag = await diagnose(text, attemptLog).catch(() => null);
   const base = `код ${lastErr?.code ?? "?"}: ${msg.split("\n")[0]}`;
@@ -633,6 +649,16 @@ async function notifyTelegram(chatId, message) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chat_id: chatId, text: message })
   });
+}
+
+/**
+ * Эскалация фаундеру при исчерпании лимитов/зацикливании.
+ * Вызывается когда все провайдеры исчерпаны или обнаружен loop.
+ */
+async function escalateToFounder(taskId, error, provider) {
+  const founderChatId = "1568126"; // founder's personal Telegram chat_id
+  const msg = `🚨 ЭСКАЛЯЦИЯ: задача ${taskId} провалилась на ${provider}\nОшибка: ${error}\nВсе провайдеры исчерпаны или зациклены.`;
+  await notifyTelegram(founderChatId, msg);
 }
 
 // ============================================================================
