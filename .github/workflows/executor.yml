@@ -174,7 +174,7 @@ jobs:
               *) continue ;;
             esac
             v=$(node -e "console.log(require(process.argv[1]).version)" "$p" 2>/dev/null)
-            [ "$v" != "$core" ] && echo "$name@$v"
+            if [ "$v" != "$core" ]; then echo "$name@$v"; fi
           done)
           if [ -n "$bad" ]; then
             echo "FAIL: mixed dsh tree - core $core, mismatched packages:"
