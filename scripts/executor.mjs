@@ -487,6 +487,17 @@ async function runDshOnce(provider, text) {
       });
       let out = "";
       let err = "";
+      // 2026-10-04: reasoning stream, held separately from `err` (which stays
+      // small for error messages). dsh streams its reasoning under the
+      // "dsh: reasoning:" heading to STDERR - verified in the installed
+      // package (@deepseek-ai/dsh-headless 0.1.5-rc.3, lib/index.js:89
+      // `stderr.write("dsh: reasoning:\n")`; its README: "streams each
+      // non-empty provider reasoning delta to stderr under a `dsh: reasoning:`
+      // heading, then prints the final answer on stdout"). Capped to the last
+      // MAX_OUTPUT chars: the timeout classifier compares consecutive
+      // segments, so it needs the recent tail, not the first bytes of an
+      // 8-minute run.
+      let reasoning = "";
       // Job-level cap in executor.yml is 30 min total (checkout + install +
       // settings write leaves ~27 min of work budget). Up to 3 providers can
       // be tried in rotation, so each single attempt gets 8 min, not the
@@ -503,16 +514,26 @@ async function runDshOnce(provider, text) {
         // the local queue's own queue.sh (classify_kill_progress, built
         // earlier tonight for TIMECEIL) - ported that real algorithm here
         // instead: dsh's own transcript marks each turn with a literal
-        // "dsh: reasoning:" line, split the captured stdout on that marker
-        // and compare consecutive segments by word-set overlap. Real
-        // repetition restates nearly the same sentence (high overlap);
+        // "dsh: reasoning:" line, split the captured reasoning stream on
+        // that marker and compare consecutive segments by word-set overlap.
+        // Real repetition restates nearly the same sentence (high overlap);
         // real progress reads as different text turn to turn even about
         // the same file (low overlap).
         const timeoutErr = new Error("dsh timed out after 8min");
         // TIMECEIL-CLOUD, 2026-09-14: real classification, not just a
         // boolean - "progress" routes to re-decomposition below instead
         // of a same-task model-swap retry.
-        timeoutErr.timeoutVerdict = classifyTimeoutKill(out);
+        // 2026-10-04: real bug found via run 37178108573 (task 64, nvidia
+        // attempt ran the full 8 minutes) - this classified `out` (stdout),
+        // but the "dsh: reasoning:" markers never appear on stdout: dsh
+        // writes them to stderr and the final answer to stdout (verified in
+        // the installed package). stdout therefore held one blob with no
+        // markers, classifyTimeoutKill saw <2 segments and returned "loop"
+        // by its own `segs.length < 2` default - the re-decomposition branch
+        // below was unreachable dead code, and every timeout rotated
+        // providers instead of splitting a genuinely progressing task. The
+        // classifier is fed the reasoning stream now.
+        timeoutErr.timeoutVerdict = classifyTimeoutKill(reasoning);
         timeoutErr.isLoop = timeoutErr.timeoutVerdict === "loop";
         reject(timeoutErr);
       }, 8 * 60 * 1000);
@@ -523,6 +544,12 @@ async function runDshOnce(provider, text) {
       // captured (bounded) instead of thrown away.
       child.stderr.setEncoding("utf8");
       child.stderr.on("data", (d) => { if (err.length < 4000) err += d; });
+      // 2026-10-04: the reasoning stream for the timeout classifier - see the
+      // comment above the `reasoning` declaration. Tail-capped, not head-capped.
+      child.stderr.on("data", (d) => {
+        reasoning += d;
+        if (reasoning.length > MAX_OUTPUT) reasoning = reasoning.slice(-MAX_OUTPUT);
+      });
       child.on("close", (code) => {
         clearTimeout(timer);
         const trimmed = out.trim();
