@@ -247,6 +247,24 @@ jobs:
                 baseURL: https://api.mistral.ai/v1
                 models:
                   - id: mistral-medium-3-5
+              # 2026-10-04: google was in PROVIDER_ORDER (executor.mjs:290) but
+              # never declared here - when provider rotation reached it, dsh
+              # failed with NO_ADAPTER: no adapter registered for provider
+              # "google" (run 37178108573, task 64). Declared now, same shape
+              # as the other three. Model gemini-3.8-flash, NOT the stale
+              # gemini-1.5-pro from PROVIDER_CONFIG - verified against the real
+              # endpoint (HTTP 200 chat completion; gemini-1.5-pro returns 404
+              # "no longer available to new users", and every pro-tier model
+              # carries free-tier limit 0 on this key, 429). The env value is
+              # fed from secrets.GEMINI_API_KEY in the run-the-task step below
+              # (a GOOGLE_API_KEY secret does not exist; GEMINI_API_KEY is the
+              # real secret's name).
+              google:
+                apiKeyEnv: GOOGLE_API_KEY
+                api: openai-completions
+                baseURL: https://generativelanguage.googleapis.com/v1beta/openai/
+                models:
+                  - id: gemini-3.8-flash
           SETTINGS
 
       - name: run the task
@@ -258,6 +276,12 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          # 2026-10-04: the google provider (PROVIDER_ORDER, executor.mjs:290)
+          # reads GOOGLE_API_KEY, but the real secret is named GEMINI_API_KEY -
+          # this bridge feeds the env name the code expects from the secret
+          # that exists (verified: a GOOGLE_API_KEY secret does not exist;
+          # the removed 2026-09-20 Google block did the same bridging).
+          GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: node scripts/executor.mjs
 
       - name: nothing outside plexus/ or plexus-doc/ may have changed

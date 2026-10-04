@@ -292,7 +292,13 @@ const PROVIDER_CONFIG = {
   groq: { baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY", model: "openai/gpt-oss-120b" },
   nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", model: "nvidia/nemotron-3-ultra-550b-a55b" },
   mistral: { baseURL: "https://api.mistral.ai/v1", apiKeyEnv: "MISTRAL_API_KEY", model: "mistral-medium-3-5" },
-  google: { baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", apiKeyEnv: "GOOGLE_API_KEY", model: "gemini-1.5-pro" },
+  // 2026-10-04: model was gemini-1.5-pro - verified dead against the real
+  // endpoint (HTTP 404 "no longer available to new users"; every pro-tier
+  // model carries free-tier limit 0 on the current key, 429). gemini-3.8-flash
+  // verified with a real HTTP 200 chat completion. Same id now in the
+  // workflow's settings.yaml google entry - the dsh --patch overlay (line
+  // 473) selects the model from HERE, so code and yaml must agree.
+  google: { baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", apiKeyEnv: "GOOGLE_API_KEY", model: "gemini-3.8-flash" },
   vertex: { baseURL: "https://${VERTEX_LOCATION:-us-central1}-aiplatform.googleapis.com/v1/projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION:-us-central1}/publishers/google/models/", apiKeyEnv: "VERTEX_ACCESS_TOKEN", model: "gemini-1.5-pro" },
 };
 
