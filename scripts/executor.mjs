@@ -113,7 +113,7 @@ async function run() {
   // below for why this isn't just the local project's existing
   // worker/triage.js reused as-is.) Fail-safe: any error here just
   // proceeds to doWork() as one unit, same as before this existed.
-  const triageDecision = await triageCheck(task.text);
+  const triageDecision = await triageCheck(task.text, CLAIM_TIME_PAYLOAD_FACT);
   if (triageDecision.split) {
     const subtaskIds = await triageSplit(task, triageDecision).catch((err) => {
       console.log(`[${new Date().toISOString()}] triage split failed (${err.message}), proceeding as one unit instead`);
@@ -146,7 +146,12 @@ async function run() {
     // of a normal pass/fail - the original oversized task is done in the
     // sense that it's been replaced by its own real subtasks (same
     // convention triageCheck's own split path already uses above).
-    const note = `ТРИАЖ (после реального прогресса, обрезанного таймаутом): разбита на ${result.subtaskIds.length} подзадач: ${result.subtaskIds.join(", ")}`;
+    // 2026-10-04: the note names the real reason - the exhausted-provider
+    // path splits because every provider rejected the payload, not because
+    // a timeout cut off real progress.
+    const note = result.decomposeReason === "capacity-exhausted"
+      ? `ТРИАЖ (все провайдеры отвергли payload задачи): разбита на ${result.subtaskIds.length} подзадач: ${result.subtaskIds.join(", ")}`
+      : `ТРИАЖ (после реального прогресса, обрезанного таймаутом): разбита на ${result.subtaskIds.length} подзадач: ${result.subtaskIds.join(", ")}`;
     await client.execute({ sql: 'UPDATE tasks SET status = ?, result = ? WHERE id = ?', args: ['готова', note, taskId] });
     await notifyTelegram(task.creator_id, `Задача ${taskId} ${note}`);
     return;
@@ -662,10 +667,31 @@ async function doWork(text, task) {
       provider = next;
     }
   }
-  // Все провайдеры исчерпаны — эскалация фаундеру
+  // Все провайдеры исчерпаны
+  const msg = String(lastErr?.message || lastErr || "unknown error");
+  // 2026-10-04: decompose on exhausted-provider capacity failure, not only on
+  // timeout-progress. Real case, run 37214241683 / task 64: the payload
+  // (12457 tokens) exceeds groq's on-demand TPM (8000) before the model even
+  // reasons - every provider rejected it within seconds (groq 413, nvidia
+  // rate-limit, mistral 429, google 400), no 8-minute timeout ever fired, so
+  // the timeout-progress re-decomposition above was never reached and the
+  // task was unexecutable: the problem is the payload size, not the provider.
+  // Same machinery as the claim-time triage, on the original task text; the
+  // payload fact now also states every provider already rejected it.
+  // AUTH failures do not match CAPACITY_RE and keep the ordinary failure
+  // path - no decomposition on auth.
+  if (CAPACITY_RE.test(msg) && task) {
+    const decision = await triageCheck(text, EXHAUSTED_PAYLOAD_FACT).catch(() => ({ split: false }));
+    if (decision.split) {
+      const subtaskIds = await triageSplit(task, decision).catch(() => null);
+      if (subtaskIds && subtaskIds.length > 0) {
+        console.log(`[${new Date().toISOString()}] re-decomposed into ${subtaskIds.length} subtasks because all providers rejected the payload`);
+        return { decomposed: true, subtaskIds, decomposeReason: "capacity-exhausted" };
+      }
+    }
+  }
   const finalError = String(lastErr?.message || lastErr || "unknown error");
   await escalateToFounder(process.env.TASK_ID, finalError, provider).catch(() => {});
-  const msg = String(lastErr?.message || lastErr || "unknown error");
   const diag = await diagnose(text, attemptLog).catch(() => null);
   const base = `код ${lastErr?.code ?? "?"}: ${msg.split("\n")[0]}`;
   return {
@@ -715,11 +741,27 @@ async function escalateToFounder(taskId, error, provider) {
 // real shape.
 // ============================================================================
 
+// 2026-10-04: real gap found via task 64 (runs 37178108573, 37214241683) -
+// the triage decision was made on the task TEXT alone (task 64: 2179 chars,
+// ~550 tokens) while the real work prompt carries dsh's own AGENTS.md
+// auto-load (maxBytes 32768, ~8K tokens) plus the agent tool schema - the
+// part that actually blows the provider ceiling (groq on-demand TPM 8000;
+// run 37214241683: groq 413, Requested 12457). The triage model could not
+// see any of that, so a coherent-but-too-big brief was judged "one unit"
+// (verified live: {"split": false}, HTTP 200, 1666 tokens) and never split.
+// The facts below are passed into every triage call so the decision is made
+// with the real numbers in view. Founder's own choice, 2026-10-04: amend the
+// prompt and pass the fact, not a forced split.
+const CLAIM_TIME_PAYLOAD_FACT = "Полный промпт работы - это НЕ только текст задачи ниже: dsh автозагружает AGENTS.md (maxBytes 32768, примерно 8K токенов) и добавляет схему инструментов агента; полный промпт примерно на 8-10K токенов больше самого текста задачи. Ориентир лимита: groq on-demand TPM 8000 токенов на запрос.";
+const EXHAUSTED_PAYLOAD_FACT = CLAIM_TIME_PAYLOAD_FACT + "\nВСЕ провайдеры очереди уже отвергли полный payload этой задачи целиком: groq вернул 413 (payload too large), nvidia и mistral - rate limit, google - 400. Ни один бесплатный провайдер не примет этот payload одним вызовом. Дробление на подзадачи - единственный оставшийся путь выполнить задачу.";
+
 const TRIAGE_PROMPT = `Задача ниже написана как ОДНА единица работы для агента, но выглядит большой или упоминает несколько разных файлов/шагов. Оцени честно: это реально одна связная единица, или несколько независимых шагов, каждый из которых можно сделать и проверить отдельно?
 
 Целевой размер каждой подзадачи - то, что один вызов модели может реально выполнить без превышения лимита провайдера по токенам (ориентир - несколько тысяч токенов на весь промпт, не десятки тысяч).
 
-Если ОДНА связная единица (даже большая) - ответь ровно: {"split": false}
+Если ОДНА связная единица и её ПОЛНЫЙ промпт работы укладывается в лимит провайдера (см. ФАКТ О РАЗМЕРЕ PAYLOAD ниже, когда он есть) - ответь ровно: {"split": false}. Если ФАКТ О РАЗМЕРЕ PAYLOAD прямо говорит, что полный промпт НЕ укладывается в лимит (все провайдеры уже отвергли payload целиком) - дели, даже если текст задачи связный: связность текста не делает задачу выполнимой одним вызовом модели.
+
+Если ниже приведён блок "ФАКТ О РАЗМЕРЕ PAYLOAD" - это проверенный факт, не оценка: реальные цифры полного промпта (текст задачи + автозагружаемый dsh AGENTS.md + схема инструментов) и реального лимита провайдера. Учитывай его наравне с текстом задачи.
 
 Если НЕСКОЛЬКО - ответь JSON строго такой формы, без пояснений вокруг:
 {"split": true, "subtasks": [{"title": "короткий заголовок", "text": "самодостаточный текст этой подзадачи - ВСЁ, что нужно агенту знать, включая любые конкретные пути/файлы/язык/метод из исходной задачи, повторённые ДОСЛОВНО как в исходном тексте, не только в первой подзадаче - не пересказывай своими словами и не заменяй методологию"}]}
@@ -753,7 +795,7 @@ function extractTriageJson(text) {
 // tool use, no provider rotation needed here (if the classifier call
 // itself hits a real capacity failure, fail safe and just run the task
 // as one unit rather than risk never processing it at all).
-async function triageCheck(text) {
+async function triageCheck(text, payloadFact) {
   const provider = PROVIDER_ORDER[0];
   const cfg = PROVIDER_CONFIG[provider];
   const apiKey = process.env[cfg.apiKeyEnv];
@@ -762,7 +804,10 @@ async function triageCheck(text) {
     const res = await fetch(`${cfg.baseURL.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model: cfg.model, messages: [{ role: "user", content: TRIAGE_PROMPT + text }] }),
+      // 2026-10-04: the payload fact (when given) sits between the prompt's
+      // own instructions and the task text - the model decides with the real
+      // numbers in view, not on the brief's size alone.
+      body: JSON.stringify({ model: cfg.model, messages: [{ role: "user", content: TRIAGE_PROMPT + (payloadFact ? `ФАКТ О РАЗМЕРЕ PAYLOAD (проверен, не оценка):\n${payloadFact}\n\n---\n` : "") + text }] }),
       signal: AbortSignal.timeout(30000),
     });
     if (!res.ok) return { split: false };
