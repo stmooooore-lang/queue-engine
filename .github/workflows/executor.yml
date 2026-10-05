@@ -22,6 +22,10 @@ on:
         description: 'Task id to execute'
         required: true
 
+concurrency:
+  group: plexus-executor
+  cancel-in-progress: false
+
 jobs:
   execute:
     runs-on: ubuntu-latest
