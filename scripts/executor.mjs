@@ -113,20 +113,27 @@ async function run() {
   // below for why this isn't just the local project's existing
   // worker/triage.js reused as-is.) Fail-safe: any error here just
   // proceeds to doWork() as one unit, same as before this existed.
-  const triageDecision = await triageCheck(task.text, CLAIM_TIME_PAYLOAD_FACT);
-  if (triageDecision.split) {
-    const subtaskIds = await triageSplit(task, triageDecision).catch((err) => {
-      console.log(`[${new Date().toISOString()}] triage split failed (${err.message}), proceeding as one unit instead`);
-      return null;
-    });
-    if (subtaskIds && subtaskIds.length > 0) {
-      const note = `ТРИАЖ: разбита на ${subtaskIds.length} подзадач: ${subtaskIds.join(", ")}`;
-      await client.execute({
-        sql: 'UPDATE tasks SET status = ?, result = ? WHERE id = ?',
-        args: ['готова', note, taskId],
+  // 2026-10-07: [NO-TRIAGE] marker (hasNoTriageMarker above) - a
+  // self-declared leaf-level task skips claim-time decomposition
+  // entirely and goes straight to execution as one unit.
+  if (hasNoTriageMarker(task.text)) {
+    console.log(`[${new Date().toISOString()}] no-triage marker present, skipping decomposition`);
+  } else {
+    const triageDecision = await triageCheck(task.text, CLAIM_TIME_PAYLOAD_FACT);
+    if (triageDecision.split) {
+      const subtaskIds = await triageSplit(task, triageDecision).catch((err) => {
+        console.log(`[${new Date().toISOString()}] triage split failed (${err.message}), proceeding as one unit instead`);
+        return null;
       });
-      await notifyTelegram(task.creator_id, `Задача ${taskId} ${note}`);
-      return;
+      if (subtaskIds && subtaskIds.length > 0) {
+        const note = `ТРИАЖ: разбита на ${subtaskIds.length} подзадач: ${subtaskIds.join(", ")}`;
+        await client.execute({
+          sql: 'UPDATE tasks SET status = ?, result = ? WHERE id = ?',
+          args: ['готова', note, taskId],
+        });
+        await notifyTelegram(task.creator_id, `Задача ${taskId} ${note}`);
+        return;
+      }
     }
   }
 
@@ -681,12 +688,20 @@ async function doWork(text, task) {
   // AUTH failures do not match CAPACITY_RE and keep the ordinary failure
   // path - no decomposition on auth.
   if (CAPACITY_RE.test(msg) && task) {
-    const decision = await triageCheck(text, EXHAUSTED_PAYLOAD_FACT).catch(() => ({ split: false }));
-    if (decision.split) {
-      const subtaskIds = await triageSplit(task, decision).catch(() => null);
-      if (subtaskIds && subtaskIds.length > 0) {
-        console.log(`[${new Date().toISOString()}] re-decomposed into ${subtaskIds.length} subtasks because all providers rejected the payload`);
-        return { decomposed: true, subtaskIds, decomposeReason: "capacity-exhausted" };
+    // 2026-10-07: [NO-TRIAGE] marker (hasNoTriageMarker above) - never
+    // decompose a self-declared leaf-level task even here; fall through to
+    // the ordinary failure path below (provider rotation has already fully
+    // run at this point, so this means: fail by payload, no decomposition).
+    if (hasNoTriageMarker(text)) {
+      console.log(`[${new Date().toISOString()}] no-triage marker present, skipping decomposition`);
+    } else {
+      const decision = await triageCheck(text, EXHAUSTED_PAYLOAD_FACT).catch(() => ({ split: false }));
+      if (decision.split) {
+        const subtaskIds = await triageSplit(task, decision).catch(() => null);
+        if (subtaskIds && subtaskIds.length > 0) {
+          console.log(`[${new Date().toISOString()}] re-decomposed into ${subtaskIds.length} subtasks because all providers rejected the payload`);
+          return { decomposed: true, subtaskIds, decomposeReason: "capacity-exhausted" };
+        }
       }
     }
   }
@@ -754,6 +769,19 @@ async function escalateToFounder(taskId, error, provider) {
 // prompt and pass the fact, not a forced split.
 const CLAIM_TIME_PAYLOAD_FACT = "Полный промпт работы - это НЕ только текст задачи ниже: dsh автозагружает AGENTS.md (maxBytes 32768, примерно 8K токенов) и добавляет схему инструментов агента; полный промпт примерно на 8-10K токенов больше самого текста задачи. Ориентир лимита: groq on-demand TPM 8000 токенов на запрос.";
 const EXHAUSTED_PAYLOAD_FACT = CLAIM_TIME_PAYLOAD_FACT + "\nВСЕ провайдеры очереди уже отвергли полный payload этой задачи целиком: groq вернул 413 (payload too large), nvidia и mistral - rate limit, google - 400. Ни один бесплатный провайдер не примет этот payload одним вызовом. Дробление на подзадачи - единственный оставшийся путь выполнить задачу.";
+
+// 2026-10-07, [NO-TRIAGE] marker: a task whose text carries "[NO-TRIAGE]"
+// declares itself leaf-level and is NEVER decomposed - not at claim time,
+// not on provider exhaustion. Fixes the real non-converging cascade (tasks
+// 89-107 over 11 dispatches, 9 of them triage splits): single-step "read X,
+// extract Y" tasks kept being split into 2-3 subtasks that were themselves
+// split again. The marker is the task author's own declaration that the
+// task is already one unit. Deliberately NOT gating the timeout-progress
+// re-decomposition path - that is a different failure mode (real progress
+// cut off by a timeout) and has not produced a cascade.
+function hasNoTriageMarker(text) {
+  return typeof text === "string" && text.includes("[NO-TRIAGE]");
+}
 
 const TRIAGE_PROMPT = `Задача ниже написана как ОДНА единица работы для агента, но выглядит большой или упоминает несколько разных файлов/шагов. Оцени честно: это реально одна связная единица, или несколько независимых шагов, каждый из которых можно сделать и проверить отдельно?
 
