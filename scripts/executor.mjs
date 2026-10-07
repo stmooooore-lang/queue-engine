@@ -311,13 +311,19 @@ const PROVIDER_CONFIG = {
   // workflow's settings.yaml google entry - the dsh --patch overlay (line
   // 473) selects the model from HERE, so code and yaml must agree.
   google: { baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", apiKeyEnv: "GOOGLE_API_KEY", model: "gemini-3.8-flash" },
-  vertex: { baseURL: "https://${VERTEX_LOCATION:-us-central1}-aiplatform.googleapis.com/v1/projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION:-us-central1}/publishers/google/models/", apiKeyEnv: "VERTEX_ACCESS_TOKEN", model: "gemini-1.5-pro" },
+  // 2026-10-07: baseURL переведён на OpenAI-совместимый endpoint Vertex
+  // (/endpoints/openapi), потому что код ниже склеивает к нему
+  // /chat/completions. Native путь /publishers/google/models/ не подходит.
+  // model обновлена на gemini-3.8-flash (1.5-pro мертва, 404). location
+  // по умолчанию global — Gemini 3.x на региональных endpoint'ах не
+  // находит эти модели.
+  vertex: { baseURL: "https://${VERTEX_LOCATION:-global}-aiplatform.googleapis.com/v1/projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION:-global}/endpoints/openapi", apiKeyEnv: "VERTEX_ACCESS_TOKEN", model: "gemini-3.8-flash" },
 };
 
 // Helper to resolve Vertex baseURL with env vars at runtime (shell-style ${VAR:-default} not interpolated in JS)
 function resolveVertexBaseURL(cfg) {
   if (cfg.baseURL.includes("${")) {
-    const location = process.env.VERTEX_LOCATION || "us-central1";
+    const location = process.env.VERTEX_LOCATION || "global";
     const projectId = process.env.VERTEX_PROJECT_ID || "";
     return cfg.baseURL
       .replace(/\$\{VERTEX_LOCATION:-([^}]+)\}/g, location)

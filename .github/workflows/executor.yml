@@ -227,10 +227,35 @@ jobs:
       # selects it. Same registry shape as this repo's own worker uses
       # locally (real, curl-confirmed model ids - no litellm routing
       # prefixes; NVIDIA's own "nvidia/" prefix is real, not litellm's).
+      # 2026-10-07: vertex - последний fallback в PROVIDER_ORDER, читается по
+      # OAuth2 access-токену (~1 час жизни), а не по статическому секрету.
+      # Шаг обязан идти ДО write-settings: тот собирает vertex baseURL из
+      # этих env на момент генерации settings.yaml.
+      - name: get Vertex access token from service account
+        id: vertex-auth
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: |
+          set -e
+          # 2026-10-07: Vertex читается по OAuth2, а не по статическому
+          # API-ключу. Токен живёт ~1 час — на одну задачу хватает.
+          echo "$GCP_SA_KEY" > /tmp/gcp-sa.json
+          gcloud auth activate-service-account --key-file=/tmp/gcp-sa.json --quiet
+          echo "VERTEX_ACCESS_TOKEN=$(gcloud auth print-access-token)" >> "$GITHUB_ENV"
+          echo "VERTEX_PROJECT_ID=$GCP_PROJECT_ID" >> "$GITHUB_ENV"
+          echo "VERTEX_LOCATION=global" >> "$GITHUB_ENV"
+          rm -f /tmp/gcp-sa.json
+
       - name: write dsh direct-provider settings
         run: |
           mkdir -p ~/.dsh
-          cat > ~/.dsh/settings.yaml << 'SETTINGS'
+          # 2026-10-07: разделитель heredoc без кавычек - ${VERTEX_PROJECT_ID} и
+          # ${VERTEX_LOCATION} в vertex-блоке ниже должны раскрыться в реальные
+          # значения env на момент генерации (приносит шаг vertex-auth выше).
+          # В остальных блоках heredoc $ не встречается - разэкранирование
+          # ничего в них не меняет.
+          cat > ~/.dsh/settings.yaml << SETTINGS
           llm-pi-ai:
             providers:
               groq:
@@ -269,6 +294,18 @@ jobs:
                 baseURL: https://generativelanguage.googleapis.com/v1beta/openai/
                 models:
                   - id: gemini-3.8-flash
+              # 2026-10-07: vertex был последним в PROVIDER_ORDER, но не был
+              # объявлен здесь - ротация дойдёт и упадёт NO_ADAPTER (тот же
+              # класс пропуска, что у google до 2026-10-04). baseURL собирается
+              # из env на момент генерации settings.yaml, значения приносит
+              # шаг vertex-auth выше; поэтому heredoc этого шага раскрывает
+              # ${...} (разделитель без кавычек).
+              vertex:
+                apiKeyEnv: VERTEX_ACCESS_TOKEN
+                api: openai-completions
+                baseURL: https://aiplatform.googleapis.com/v1/projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/endpoints/openapi
+                models:
+                  - id: gemini-3.8-flash
           SETTINGS
 
       - name: run the task
@@ -286,6 +323,13 @@ jobs:
           # that exists (verified: a GOOGLE_API_KEY secret does not exist;
           # the removed 2026-09-20 Google block did the same bridging).
           GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # 2026-10-07: vertex-провайдер (последний fallback) читает
+          # OAuth2-токен из сервис-аккаунта - env приносит шаг vertex-auth
+          # выше, секретов с этими именами в репо нет (реальные:
+          # GCP_PROJECT_ID / GCP_SA_KEY).
+          VERTEX_ACCESS_TOKEN: ${{ env.VERTEX_ACCESS_TOKEN }}
+          VERTEX_PROJECT_ID: ${{ env.VERTEX_PROJECT_ID }}
+          VERTEX_LOCATION: ${{ env.VERTEX_LOCATION }}
         run: node scripts/executor.mjs
 
       - name: nothing outside plexus/ or plexus-doc/ may have changed
