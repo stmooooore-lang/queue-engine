@@ -24,24 +24,458 @@
 
 import { createClient } from "@libsql/client";
 import { spawn, execSync } from "node:child_process";
-import { writeFile, unlink, mkdir } from "node:fs/promises";
+import { writeFile, readFile, unlink, mkdir, readdir, stat, appendFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const client = createClient({ url: process.env.TURSO_DATABASE_URL, authToken: process.env.TURSO_AUTH_TOKEN });
+const client = createClient({ url: process.env.TURSO_DATABASE_URL || "file::memory:", authToken: process.env.TURSO_AUTH_TOKEN });
+
+const WORKDIR = process.env.WORKDIR || (existsSync("plexus-doc") ? "plexus-doc" : ".");
+const CHECKPOINT_DIR = process.env.CHECKPOINT_DIR || path.join(WORKDIR, "checkpoints");
+
+/**
+ * Detects whether a job is explicitly marked as long compute.
+ * Inspects job metadata, flags, type, lane, text prefixes, or inline directives.
+ *
+ * @param {object} [task] - Task object from database
+ * @param {string} [text] - Task text/prompt
+ * @returns {boolean}
+ */
+function isLongComputeJob(task, text) {
+  const content = (text || task?.text || '').trim();
+
+  // 1. Text prefixes
+  if (
+    content.startsWith('LONG_RUN_COMMAND:') ||
+    content.startsWith('LONG_COMPUTE:') ||
+    content.startsWith('RUN_COMMAND_LONG:') ||
+    content.startsWith('RESUME_COMMAND:') ||
+    content.startsWith('RESUME:')
+  ) {
+    return true;
+  }
+
+  // 2. RUN_COMMAND prefix with inline tag, e.g. RUN_COMMAND: [long_compute], [longrun], or [resume]
+  if (/^RUN_COMMAND:\s*\[(long[_-]?compute|longrun|compute|resume)\]/i.test(content)) {
+    return true;
+  }
+
+  // 3. Leading bracket tag, e.g. [long_compute], [longrun], or [resume]
+  if (/^\[(long[_-]?compute|longrun|resume)\]/i.test(content)) {
+    return true;
+  }
+
+  // 4. Text flags / directives, e.g. "long_compute: true", "job_type: long_compute", "resume: true"
+  if (/(?:^|\n)\s*(?:long[_-]?compute|is_long_compute|resume|is_resume)\s*[:=]\s*(?:true|1|yes)\b/i.test(content)) {
+    return true;
+  }
+  if (/(?:^|\n)\s*(?:job[_-]?type|type|lane)\s*[:=]\s*(?:long[_-]?compute|longrun|compute)\b/i.test(content)) {
+    return true;
+  }
+  // 2026-10-07: job_cap и computation_duration — синонимы. Любой из
+  // них переводит задачу в long-compute-путь. Раньше job_cap читался
+  // только как потолок в extractJobCap, и задача без явного
+  // LONG_COMPUTE: маркера оставалась на 5-минутном таймауте.
+  // Поймано тестом test-timeout-and-compute-path.mjs:124.
+  // Directives for computation duration or job cap
+  if (/(?:^|\n)\s*(?:computation[_-]?duration|compute[_-]?duration|job[_-]?cap(?:[_-]?ms)?)\s*[:=]/i.test(content)) {
+    return true;
+  }
+
+  // 5. Database columns / metadata on task object
+  if (task) {
+    // task status partial / checkpoint or resume flag
+    if (task.status === 'partial' || task.status === 'checkpoint' || task.is_resume === true || task.resume === true) {
+      return true;
+    }
+    // lane
+    if (typeof task.lane === 'string' && /^(longrun|long[_-]?compute|compute)$/i.test(task.lane)) {
+      return true;
+    }
+    // type or job_type
+    if (typeof task.type === 'string' && /^(longrun|long[_-]?compute|compute)$/i.test(task.type)) {
+      return true;
+    }
+    if (typeof task.job_type === 'string' && /^(longrun|long[_-]?compute|compute)$/i.test(task.job_type)) {
+      return true;
+    }
+    // boolean / flag properties
+    if (task.is_long_compute === true || task.is_long_compute === 1 || task.is_long_compute === 'true') {
+      return true;
+    }
+    if (task.long_compute === true || task.long_compute === 1 || task.long_compute === 'true') {
+      return true;
+    }
+    // 2026-10-07: job_cap — синоним computation_duration (решение владельца,
+    // полный комментарий у текстовых директив выше): свойство job_cap /
+    // job_cap_ms на объекте задачи тоже переводит её в long-compute-путь,
+    // как и meta.job_cap в metadata-ветке ниже (тест :132).
+    if (task.computation_duration || task.compute_duration || task.job_cap || task.job_cap_ms) {
+      return true;
+    }
+    // metadata column (JSON or object)
+    if (task.metadata) {
+      try {
+        const meta = typeof task.metadata === 'string' ? JSON.parse(task.metadata) : task.metadata;
+        if (
+          meta.long_compute === true ||
+          meta.is_long_compute === true ||
+          meta.resume === true ||
+          meta.is_resume === true ||
+          meta.compute_path === true ||
+          meta.computation_duration ||
+          meta.compute_duration ||
+          meta.job_cap ||
+          meta.job_cap_ms ||
+          /^(longrun|long[_-]?compute|compute)$/i.test(meta.type || '') ||
+          /^(longrun|long[_-]?compute|compute)$/i.test(meta.job_type || '') ||
+          /^(longrun|long[_-]?compute|compute)$/i.test(meta.lane || '') ||
+          meta.exempt_timeout === true
+        ) {
+          return true;
+        }
+      } catch {}
+    }
+  }
+
+  // 6. Environment variable override
+  if (
+    process.env.LONG_COMPUTE === 'true' ||
+    process.env.JOB_TYPE === 'longrun' ||
+    process.env.TASK_LANE === 'longrun' ||
+    process.env.RESUME === 'true' ||
+    process.env.TASK_RESUME === 'true'
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Detects whether a job is marked for resume or is continuing from a partial state.
+ *
+ * @param {object} [task] - Task object from database
+ * @param {string} [text] - Task text/prompt
+ * @returns {boolean}
+ */
+function isResumeJob(task, text) {
+  const content = (text || task?.text || '').trim();
+
+  // 1. Text prefixes for resume
+  if (
+    content.startsWith('RESUME_COMMAND:') ||
+    content.startsWith('RESUME:')
+  ) {
+    return true;
+  }
+
+  // 2. RUN_COMMAND prefix with [resume] tag
+  if (/^RUN_COMMAND:\s*\[resume\]/i.test(content)) {
+    return true;
+  }
+
+  // 3. Leading bracket tag [resume]
+  if (/^\[resume\]/i.test(content)) {
+    return true;
+  }
+
+  // 4. Text flags / directives
+  if (/(?:^|\n)\s*(?:resume|is_resume)\s*[:=]\s*(?:true|1|yes)\b/i.test(content)) {
+    return true;
+  }
+  if (/(?:^|\n)\s*resume[_-]?from\s*[:=]/i.test(content)) {
+    return true;
+  }
+
+  // 5. Task database columns / metadata
+  if (task) {
+    if (task.status === 'partial' || task.status === 'checkpoint') {
+      return true;
+    }
+    if (task.is_resume === true || task.is_resume === 1 || task.is_resume === 'true') {
+      return true;
+    }
+    if (task.resume === true || task.resume === 1 || task.resume === 'true') {
+      return true;
+    }
+    if (task.resume_from || task.resumeFrom) {
+      return true;
+    }
+    if (task.metadata) {
+      try {
+        const meta = typeof task.metadata === 'string' ? JSON.parse(task.metadata) : task.metadata;
+        if (meta.resume === true || meta.is_resume === true || meta.resume_from || meta.resumeFrom) {
+          return true;
+        }
+      } catch {}
+    }
+  }
+
+  // 6. Environment variable overrides
+  if (process.env.RESUME === 'true' || process.env.TASK_RESUME === 'true' || process.env.IS_RESUME === 'true') {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Extracts resume_from identifier from task, text directives, metadata, or environment.
+ *
+ * @param {object} [task]
+ * @param {string} [text]
+ * @returns {string|null}
+ */
+function extractResumeFrom(task, text) {
+  const content = (text || task?.text || '').trim();
+  const m = content.match(/(?:^|\n|\s|\[)(?:resume[_-]?from)[:\s=]+(\d+|[a-zA-Z0-9_-]+)/i);
+  if (m) return m[1];
+
+  if (task?.resume_from) return String(task.resume_from);
+  if (task?.resumeFrom) return String(task.resumeFrom);
+
+  if (task?.metadata) {
+    try {
+      const meta = typeof task.metadata === 'string' ? JSON.parse(task.metadata) : task.metadata;
+      if (meta.resume_from || meta.resumeFrom) return String(meta.resume_from || meta.resumeFrom);
+    } catch {}
+  }
+
+  if (process.env.RESUME_FROM) return process.env.RESUME_FROM;
+
+  return null;
+}
+
+/**
+ * Extracts executable shell command if the task is a direct command execution.
+ *
+ * @param {string} text - Task text
+ * @param {object} [task] - Task record from database
+ * @returns {string|null} - Command string or null if not a command task
+ */
+function extractCommand(text, task) {
+  if (!text || typeof text !== 'string') return null;
+  const trimmed = text.trim();
+
+  const directiveLineRe = /^\s*(?:job[_-]?cap|computation[_-]?duration|compute[_-]?duration|long[_-]?compute|is_long_compute|resume|is_resume|resume[_-]?from|parent[_-]?id|parent|job[_-]?type|type|lane|timeout)\s*[:=].*$/i;
+
+  const prefixes = [
+    'LONG_RUN_COMMAND:',
+    'RUN_COMMAND_LONG:',
+    'LONG_COMPUTE:',
+    'RESUME_COMMAND:',
+    'RESUME:',
+    'RUN_COMMAND:'
+  ];
+
+  for (const prefix of prefixes) {
+    if (trimmed.startsWith(prefix)) {
+      let cmd = trimmed.slice(prefix.length).trim();
+      // Strip optional inline bracket tag like [long_compute], [longrun], or [resume]
+      cmd = cmd.replace(/^\[(long[_-]?compute|longrun|compute|resume)\]\s*/i, '');
+      cmd = cmd.split('\n').filter(l => !directiveLineRe.test(l)).join('\n').trim();
+      return cmd;
+    }
+  }
+
+  // Handle leading bracket tag e.g. [long_compute] <command> or [resume] <command>
+  const bracketMatch = trimmed.match(/^\[(long[_-]?compute|longrun|resume)\]\s+(.+)$/is);
+  if (bracketMatch) {
+    let cmd = bracketMatch[2].trim();
+    cmd = cmd.split('\n').filter(l => !directiveLineRe.test(l)).join('\n').trim();
+    return cmd;
+  }
+
+  // Handle case where directives precede the prefix (e.g. "job_cap: 30m\nRUN_COMMAND: ./sim")
+  const lines = trimmed.split('\n');
+  const nonDirectiveLines = lines.filter(l => !directiveLineRe.test(l));
+  const cleanedText = nonDirectiveLines.join('\n').trim();
+
+  for (const prefix of prefixes) {
+    if (cleanedText.startsWith(prefix)) {
+      let cmd = cleanedText.slice(prefix.length).trim();
+      cmd = cmd.replace(/^\[(long[_-]?compute|longrun|compute|resume)\]\s*/i, '');
+      return cmd;
+    }
+  }
+
+  const cleanedBracketMatch = cleanedText.match(/^\[(long[_-]?compute|longrun|resume)\]\s+(.+)$/is);
+  if (cleanedBracketMatch) {
+    return cleanedBracketMatch[2].trim();
+  }
+
+  // If task is explicitly in compute or longrun lane and text is a shell command
+  if (task && typeof task.lane === 'string' && /^(longrun|compute)$/i.test(task.lane)) {
+    return cleanedText || trimmed;
+  }
+  if (task && typeof task.type === 'string' && /^(longrun|compute)$/i.test(task.type)) {
+    return cleanedText || trimmed;
+  }
+  if (task && (task.long_compute === true || task.is_long_compute === true) && cleanedText) {
+    return cleanedText;
+  }
+  if (task && (task.status === 'partial' || task.status === 'checkpoint' || task.is_resume === true || task.resume === true) && cleanedText) {
+    return cleanedText;
+  }
+  if (cleanedText && isLongComputeJob(task, trimmed)) {
+    return cleanedText;
+  }
+
+  return null;
+}
+
+/**
+ * Parses duration strings like "30m", "1800s", "1h", "5000ms" or numeric milliseconds.
+ * 
+ * @param {string|number} val 
+ * @returns {number|null} Duration in milliseconds, or null if unparseable
+ */
+function parseDuration(val) {
+  if (val === null || val === undefined) return null;
+  if (typeof val === 'number') return val > 0 ? val : null;
+  const str = String(val).trim();
+  if (!str) return null;
+  const match = str.match(/^(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|sec(?:onds?)?|m|min(?:utes?)?|h|hours?|hrs?)?$/i);
+  if (!match) return null;
+  const num = parseFloat(match[1]);
+  const unit = (match[2] || '').toLowerCase();
+  if (/^(h|hours?|hrs?)$/.test(unit)) return Math.round(num * 3600 * 1000);
+  if (/^(m|min|minutes?)$/.test(unit)) return Math.round(num * 60 * 1000);
+  if (/^(s|sec|seconds?)$/.test(unit)) return Math.round(num * 1000);
+  if (/^(ms|milliseconds?)$/.test(unit)) return Math.round(num);
+  // If no unit provided, assume seconds if small (< 3600), otherwise ms
+  return num < 3600 ? Math.round(num * 1000) : Math.round(num);
+}
+
+/**
+ * Extracts agreed job cap or computation duration from task and text.
+ * When both job cap and computation duration are present, agrees on the effective
+ * cap duration (bounding computation duration by the agreed job cap ceiling).
+ * 
+ * @param {object} [task] 
+ * @param {string} [text] 
+ * @returns {number|null} Duration in milliseconds
+ */
+function extractJobCap(task, text) {
+  const content = (text || task?.text || '').trim();
+
+  let jobCap = null;
+  let compDuration = null;
+
+  // 1. Text directives: "job_cap: 30m", "computation_duration: 1800s", etc.
+  const capMatch = content.match(/(?:^|\n)\s*(?:job[_-]?cap|job[_-]?cap[_-]?ms)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?\s*[a-zA-Z]*)/i);
+  if (capMatch) {
+    jobCap = parseDuration(capMatch[1]);
+  }
+
+  const compMatch = content.match(/(?:^|\n)\s*(?:computation[_-]?duration|compute[_-]?duration)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?\s*[a-zA-Z]*)/i);
+  if (compMatch) {
+    compDuration = parseDuration(compMatch[1]);
+  }
+
+  const timeoutMatch = content.match(/(?:^|\n)\s*timeout\s*[:=]\s*([0-9]+(?:\.[0-9]+)?\s*[a-zA-Z]*)/i);
+  if (timeoutMatch && !jobCap) {
+    jobCap = parseDuration(timeoutMatch[1]);
+  }
+
+  // 2. Task properties
+  if (task) {
+    if (!jobCap) {
+      if (task.job_cap_ms) jobCap = parseDuration(task.job_cap_ms);
+      else if (task.job_cap) jobCap = parseDuration(task.job_cap);
+    }
+    if (!compDuration) {
+      if (task.computation_duration) compDuration = parseDuration(task.computation_duration);
+      else if (task.compute_duration) compDuration = parseDuration(task.compute_duration);
+    }
+    if (task.metadata) {
+      try {
+        const meta = typeof task.metadata === 'string' ? JSON.parse(task.metadata) : task.metadata;
+        if (!jobCap) {
+          const metaCap = meta.job_cap_ms || meta.job_cap || meta.timeout_ms;
+          if (metaCap) jobCap = parseDuration(metaCap);
+        }
+        if (!compDuration) {
+          const metaComp = meta.computation_duration || meta.compute_duration;
+          if (metaComp) compDuration = parseDuration(metaComp);
+        }
+      } catch {}
+    }
+  }
+
+  // 3. Environment variables
+  if (!jobCap && process.env.JOB_CAP_MS) jobCap = parseDuration(process.env.JOB_CAP_MS);
+  if (!jobCap && process.env.LONG_COMPUTE_TIMEOUT_MS) jobCap = parseDuration(process.env.LONG_COMPUTE_TIMEOUT_MS);
+
+  // Agree computation duration with job cap (cap acts as ceiling)
+  if (jobCap && compDuration) {
+    return Math.min(jobCap, compDuration);
+  }
+  return jobCap || compDuration || null;
+}
+
+/**
+ * Determines effective timeout in milliseconds based on job type and options.
+ * - Standard jobs: 5-minute timeout (300,000 ms) unless overridden by options.timeoutMs
+ * - Long compute jobs: exempt from 5-minute limit. Uses explicit jobCapMs/timeoutMs or env vars if provided, otherwise 0 (unlimited/runner-bound).
+ * 
+ * @param {object|boolean|number} [options]
+ * @returns {number} Effective timeout in ms (0 = no timeout)
+ */
+function getEffectiveTimeout(options = {}) {
+  let isLongCompute = false;
+  let timeoutMs = null;
+  let jobCapMs = null;
+
+  if (typeof options === 'boolean') {
+    isLongCompute = options;
+  } else if (typeof options === 'number') {
+    timeoutMs = options;
+  } else if (options && typeof options === 'object') {
+    if (options.isLongCompute !== undefined) isLongCompute = Boolean(options.isLongCompute);
+    if (options.timeoutMs !== undefined) timeoutMs = options.timeoutMs;
+    if (options.jobCapMs !== undefined) jobCapMs = options.jobCapMs;
+    if (options.jobCap !== undefined) jobCapMs = options.jobCap;
+  }
+
+  if (isLongCompute) {
+    if (timeoutMs && timeoutMs > 0) {
+      return timeoutMs;
+    } else if (jobCapMs && jobCapMs > 0) {
+      return jobCapMs;
+    } else if (process.env.LONG_COMPUTE_TIMEOUT_MS) {
+      return Number(process.env.LONG_COMPUTE_TIMEOUT_MS);
+    } else if (process.env.JOB_CAP_MS) {
+      return Number(process.env.JOB_CAP_MS);
+    } else {
+      return 0; // Completely exempt from 5-minute timeout limit
+    }
+  } else {
+    return (timeoutMs && timeoutMs > 0) ? timeoutMs : 5 * 60 * 1000;
+  }
+}
 
 /**
  * Executes a shell command directly in WORKDIR without LLM/dsh.
  * Used for tasks that need actual code execution (scripts, tests, builds).
+ * Jobs explicitly marked as long compute are exempt from the 5-minute timeout limit.
  * 
  * @param {string} command - The shell command to execute
+ * @param {object|boolean|number} [options] - Options object, boolean isLongCompute, or number timeoutMs
+ * @param {boolean} [options.isLongCompute=false] - Whether job is marked as long compute (exempts from 5-min limit)
+ * @param {number} [options.timeoutMs] - Explicit timeout in ms. If omitted and isLongCompute=true, no timeout is applied
+ * @param {number} [options.jobCapMs] - Upper job cap in ms (defaults to env.JOB_CAP_MS or env.LONG_COMPUTE_TIMEOUT_MS)
  * @returns {Promise<{success: boolean, stdout: string, stderr: string, exitCode: number}>}
  */
-async function runCommand(command) {
+async function runCommand(command, options = {}) {
+  const effectiveTimeout = getEffectiveTimeout(options);
+
   return await new Promise((resolve) => {
     const child = spawn('bash', ['-c', command], {
-      cwd: WORKDIR,
-      env: { ...process.env },
+      cwd: options.cwd || WORKDIR,
+      env: { ...process.env, ...(options.env || {}) },
     });
     
     let stdout = '';
@@ -52,19 +486,24 @@ async function runCommand(command) {
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (d) => { if (stderr.length < 10000) stderr += d; });
     
-    // 5 minute timeout for command execution
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      resolve({
-        success: false,
-        stdout,
-        stderr: stderr + '\n[TIMEOUT] Command killed after 5 minutes',
-        exitCode: -1
-      });
-    }, 5 * 60 * 1000);
+    // Timeout enforcement: only armed if effectiveTimeout > 0.
+    // Long compute jobs are exempt from the standard 5-minute limit.
+    let timer = null;
+    if (effectiveTimeout > 0) {
+      timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        const timeoutMinutes = Math.round(effectiveTimeout / 60000);
+        resolve({
+          success: false,
+          stdout,
+          stderr: stderr + `\n[TIMEOUT] Command killed after ${timeoutMinutes > 0 ? timeoutMinutes + ' minutes' : effectiveTimeout + 'ms'}`,
+          exitCode: -1
+        });
+      }, effectiveTimeout);
+    }
     
     child.on('close', (code) => {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       resolve({
         success: code === 0,
         stdout: stdout.trim(),
@@ -74,7 +513,7 @@ async function runCommand(command) {
     });
     
     child.on('error', (err) => {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       resolve({
         success: false,
         stdout: '',
@@ -85,14 +524,581 @@ async function runCommand(command) {
   });
 }
 
+/**
+ * Saves stderr and partial results as partial artifacts (not complete results).
+ * Writes structured JSON metadata, raw stderr log, and partial stdout into CHECKPOINT_DIR.
+ *
+ * @param {string|number} taskId - Task ID
+ * @param {object} data - Partial execution details { stdout, stderr, exitCode, jobCapMs, command, metadata }
+ * @param {object} [options] - Additional options
+ * @returns {Promise<{isPartial: boolean, status: string, jsonPath: string, stderrPath: string, stdoutPath: string|null, checkpointFiles: string[]}>}
+ */
+async function savePartialArtifact(taskId, data = {}, options = {}) {
+  const dir = options.checkpointDir || CHECKPOINT_DIR;
+  await mkdir(dir, { recursive: true });
+
+  const timestamp = new Date().toISOString();
+  const safeTaskId = String(taskId || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_');
+
+  const jsonFileName = `task-${safeTaskId}-partial.json`;
+  const stderrFileName = `task-${safeTaskId}-stderr.log`;
+  const stdoutFileName = `task-${safeTaskId}-partial-stdout.log`;
+
+  const jsonPath = path.join(dir, jsonFileName);
+  const stderrPath = path.join(dir, stderrFileName);
+  const stdoutPath = data.stdout ? path.join(dir, stdoutFileName) : null;
+
+  // 1. Write raw stderr log
+  const stderrContent = String(data.stderr || '(no stderr captured)');
+  await writeFile(stderrPath, stderrContent, 'utf-8');
+
+  // 2. Write partial stdout log if present
+  if (stdoutPath && data.stdout) {
+    await writeFile(stdoutPath, String(data.stdout), 'utf-8');
+  }
+
+  // 3. Scan existing checkpoint files in dir
+  let checkpointFiles = [];
+  try {
+    const entries = await readdir(dir);
+    checkpointFiles = entries.filter(f => f.startsWith(`task-${safeTaskId}`) || f.endsWith('.ckpt') || f.endsWith('.pt') || f.includes('checkpoint'));
+  } catch {}
+
+  // 4. Write structured partial artifact JSON metadata
+  const artifactPayload = {
+    task_id: taskId,
+    status: 'partial',
+    is_partial: true,
+    is_complete: false,
+    timestamp,
+    exit_code: data.exitCode ?? -1,
+    job_cap_ms: data.jobCapMs ?? null,
+    command: data.command || null,
+    stderr: stderrContent.slice(0, 10000),
+    stderr_file: stderrFileName,
+    stdout_preview: (data.stdout || '').slice(0, 10000),
+    stdout_file: stdoutFileName,
+    checkpoint_files: checkpointFiles,
+    metadata: data.metadata || {}
+  };
+
+  await writeFile(jsonPath, JSON.stringify(artifactPayload, null, 2), 'utf-8');
+  console.log(`[${new Date().toISOString()}] CHECKPOINT: saved partial artifact to ${jsonPath} and stderr to ${stderrPath}`);
+
+  return {
+    isPartial: true,
+    status: 'partial',
+    jsonPath,
+    stderrPath,
+    stdoutPath,
+    checkpointFiles
+  };
+}
+
+/**
+ * Uploads/pushes checkpoints and artifacts to origin git repository or artifact storage.
+ * Handles both complete artifacts and partial checkpoint artifacts.
+ *
+ * @param {string|number} taskId - Task ID
+ * @param {object} [options]
+ * @param {boolean} [options.isPartial=false] - Whether these are partial artifacts
+ * @param {string} [options.workdir] - Target working directory (defaults to WORKDIR)
+ * @returns {Promise<boolean>}
+ */
+async function uploadTaskCheckpointsAndArtifacts(taskId, options = {}) {
+  const isPartial = Boolean(options.isPartial);
+  const targetDir = options.workdir || WORKDIR;
+  const dir = options.checkpointDir || CHECKPOINT_DIR;
+
+  try {
+    // If checkpoint directory exists and is outside targetDir, copy checkpoint files to targetDir/checkpoints
+    if (existsSync(dir)) {
+      const rel = path.relative(targetDir, dir);
+      const isInsideTarget = !rel.startsWith('..') && !path.isAbsolute(rel);
+      if (!isInsideTarget) {
+        const destDir = path.join(targetDir, "checkpoints");
+        await mkdir(destDir, { recursive: true });
+        const cpFiles = await readdir(dir);
+        for (const f of cpFiles) {
+          const srcFile = path.join(dir, f);
+          const destFile = path.join(destDir, f);
+          try {
+            const content = await readFile(srcFile);
+            await writeFile(destFile, content);
+          } catch {}
+        }
+      }
+    }
+
+    const status = execSync("git status --porcelain", { cwd: targetDir, stdio: "pipe" }).toString().trim();
+    if (!status) {
+      console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: no changes in ${targetDir}, skipping push`);
+      return true;
+    }
+
+    execSync("git config user.name 'queue-engine[bot]'", { cwd: targetDir, stdio: "pipe" });
+    execSync("git config user.email 'queue-engine@users.noreply.github.com'", { cwd: targetDir, stdio: "pipe" });
+    execSync("git add -A", { cwd: targetDir, stdio: "pipe" });
+
+    const modeLabel = isPartial ? "partial checkpoint/artifact" : "completed artifacts";
+    const commitMsg = `task ${taskId} (${modeLabel}): ${status.split('\n')[0].slice(0, 50)}`;
+    execSync(`git commit -m "${commitMsg.replace(/"/g, '\"')}"`, { cwd: targetDir, stdio: "pipe" });
+
+    const branch = execSync("git branch --show-current", { cwd: targetDir, stdio: "pipe" }).toString().trim();
+    if (branch) {
+      execSync(`git push origin ${branch}`, { cwd: targetDir, stdio: "pipe" });
+      console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: committed and pushed ${status.split('\n').length} file(s) (${modeLabel}) to origin/${branch}`);
+    } else {
+      console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: detached HEAD or no branch, committed locally only`);
+    }
+    return true;
+  } catch (err) {
+    console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: FAILED - ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * Locates the latest checkpoint or partial artifact file for a task to support resume.
+ *
+ * @param {string|number} taskId - Task ID
+ * @param {object} [options]
+ * @param {string} [options.checkpointDir] - Directory containing checkpoints
+ * @param {number|string} [options.resumeFrom] - Alternative task ID to resume from
+ * @returns {Promise<{path: string, filename: string, isPartial: boolean, data: object|null, mtime: Date}|null>}
+ */
+async function findLatestCheckpoint(taskId, options = {}) {
+  const dir = options.checkpointDir || CHECKPOINT_DIR;
+  if (!existsSync(dir)) return null;
+
+  const targetId = options.resumeFrom || taskId;
+  const safeId = targetId ? String(targetId).replace(/[^a-zA-Z0-9_-]/g, '_') : null;
+
+  try {
+    const files = await readdir(dir);
+    if (!files || files.length === 0) return null;
+
+    const candidates = [];
+    for (const file of files) {
+      const fullPath = path.join(dir, file);
+      let isTarget = !safeId;
+      if (safeId) {
+        const targetPattern = new RegExp(`(^|[^0-9a-zA-Z])${safeId}([^0-9a-zA-Z]|$)`, 'i');
+        isTarget = file.includes(`task-${safeId}`) || file.includes(`task_${safeId}`) || targetPattern.test(file);
+      }
+      const isLog = file.endsWith('.log') || file.endsWith('.txt');
+      const isCheckpoint = (
+        file.endsWith('.json') ||
+        file.endsWith('.ckpt') ||
+        file.endsWith('.pt') ||
+        file.endsWith('.h5') ||
+        file.endsWith('.bin') ||
+        file.endsWith('.parquet') ||
+        file.includes('checkpoint') ||
+        file.includes('partial')
+      ) && !isLog;
+
+      if (isCheckpoint && isTarget) {
+        try {
+          const st = await stat(fullPath);
+          if (st.isFile()) {
+            candidates.push({ file, path: fullPath, mtime: st.mtime });
+          }
+        } catch {}
+      }
+    }
+
+    if (candidates.length === 0) return null;
+
+    candidates.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+    const latest = candidates[0];
+
+    let data = null;
+    let isPartial = latest.file.includes('partial');
+
+    if (latest.file.endsWith('.json')) {
+      try {
+        const raw = await readFile(latest.path, 'utf-8');
+        data = JSON.parse(raw);
+        if (data.is_partial !== undefined) isPartial = Boolean(data.is_partial);
+      } catch {}
+    }
+
+    return {
+      path: latest.path,
+      filename: latest.file,
+      mtime: latest.mtime,
+      isPartial,
+      data
+    };
+  } catch (err) {
+    console.log(`[${new Date().toISOString()}] CHECKPOINT: error finding checkpoint in ${dir}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Executes a long compute job resuming from a previous checkpoint or partial artifact.
+ *
+ * @param {string} command - Shell command to resume
+ * @param {object} [task] - Task object from database
+ * @param {string} [text] - Task text/prompt
+ * @param {object} [options] - Additional options
+ * @returns {Promise<{success: boolean, message: string, exitCode: number, stdout: string, stderr: string, isResume: boolean, checkpoint: object|null}>}
+ */
+async function executeResume(command, task = null, text = '', options = {}) {
+  const taskId = task?.id || process.env.TASK_ID || 'compute';
+  const checkpointDir = options.checkpointDir || CHECKPOINT_DIR;
+  console.log(`[${new Date().toISOString()}] RESUME: initiating resume execution for task ${taskId}`);
+
+  const resumeTarget = task?.resume_from || options.resumeFrom || extractResumeFrom(task, text);
+  const checkpoint = await findLatestCheckpoint(taskId, {
+    checkpointDir: checkpointDir,
+    resumeFrom: resumeTarget
+  });
+
+  const envOverrides = {
+    IS_RESUME: "true",
+    RESUME_TASK_ID: String(taskId),
+  };
+
+  if (checkpoint) {
+    console.log(`[${new Date().toISOString()}] RESUME: found checkpoint at ${checkpoint.path} (mtime ${checkpoint.mtime.toISOString()}, partial=${checkpoint.isPartial})`);
+    process.env.RESUME_CHECKPOINT = checkpoint.path;
+    process.env.CHECKPOINT_PATH = checkpoint.path;
+    process.env.IS_RESUME = "true";
+    envOverrides.RESUME_CHECKPOINT = checkpoint.path;
+    envOverrides.CHECKPOINT_PATH = checkpoint.path;
+    if (checkpoint.data && typeof checkpoint.data === 'object') {
+      envOverrides.RESUME_METADATA = JSON.stringify(checkpoint.data);
+    }
+  } else {
+    console.log(`[${new Date().toISOString()}] RESUME: no previous checkpoint file found in ${checkpointDir}, starting from initial state`);
+    process.env.IS_RESUME = "true";
+  }
+
+  const computeResult = await executeLongCompute(command, task, text, {
+    ...options,
+    checkpointDir: checkpointDir,
+    isResume: true,
+    checkpoint: checkpoint,
+    env: { ...envOverrides, ...(options.env || {}) }
+  });
+
+  return {
+    ...computeResult,
+    isResume: true,
+    checkpoint: checkpoint
+  };
+}
+
+/**
+ * Extracts parent and sibling information from task object or text.
+ * Handles [SIB i/n parent:P] format, parent_id directives, and task metadata.
+ *
+ * @param {object} [task]
+ * @param {string} [text]
+ * @returns {{parentId: number, index: number, total: number|null}|null}
+ */
+function extractParentAndSiblingInfo(task, text) {
+  const content = (text || task?.text || '').trim();
+  const sib = parseSiblingMarker(content);
+  if (sib) return sib;
+
+  let parentId = task?.parent_id || task?.parentId || null;
+  let total = task?.total_siblings || task?.sibling_count || null;
+  let index = task?.sibling_index || task?.subtask_index || null;
+
+  if (task?.metadata) {
+    try {
+      const meta = typeof task.metadata === 'string' ? JSON.parse(task.metadata) : task.metadata;
+      if (!parentId && (meta.parent_id || meta.parentId)) parentId = Number(meta.parent_id || meta.parentId);
+      if (!total && (meta.total_siblings || meta.total)) total = Number(meta.total_siblings || meta.total);
+      if (!index && (meta.sibling_index || meta.index)) index = Number(meta.sibling_index || meta.index);
+    } catch {}
+  }
+
+  if (!parentId) {
+    const parentMatch = content.match(/(?:^|\n|\s|\[)(?:parent[_-]?id|parent)[:\s=]+(\d+)/i);
+    if (parentMatch) {
+      parentId = Number(parentMatch[1]);
+    }
+  }
+
+  if (parentId) {
+    return { parentId: Number(parentId), index: Number(index) || 1, total: total ? Number(total) : null };
+  }
+  return null;
+}
+
+/**
+ * Checks and ensures correct tree completion when jobs are completed or resumed.
+ * When all siblings of a parent task reach 'готова', updates the parent task status to 'готова'
+ * and records completion metadata.
+ *
+ * @param {string|number} taskId - Current task ID
+ * @param {object} [task] - Current task object
+ * @param {object} [db=client] - Database client
+ * @returns {Promise<{treeComplete: boolean, parentId?: number|string, totalSiblings?: number, completedSiblings?: number, reason?: string, error?: string}>}
+ */
+async function checkTreeCompletion(taskId, task = null, db = client) {
+  if (!db) return { treeComplete: false, reason: "no_db" };
+  if (!task && taskId) {
+    try {
+      const res = await db.execute({ sql: "SELECT * FROM tasks WHERE id = ?", args: [taskId] });
+      task = res?.rows?.[0] || null;
+    } catch {}
+  }
+  const content = task?.text || "";
+  const info = extractParentAndSiblingInfo(task, content);
+
+  if (!info || !info.parentId) {
+    try {
+      const childrenRes = await db.execute({
+        sql: "SELECT id, status, text, result FROM tasks WHERE text LIKE ? OR text LIKE ?",
+        args: [`%parent:${taskId}]%`, `%parent:${taskId}%`]
+      });
+      const children = childrenRes.rows || [];
+      if (children.length > 0) {
+        const allDone = children.every(r => r.status === 'готова');
+        const anyPartial = children.some(r => r.status === 'partial');
+        const anyFailed = children.some(r => r.status === 'провал' || r.status === 'заблокирована');
+        if (allDone) {
+          const completionNote = `ДЕРЕВО ЗАДАЧ ЗАВЕРШЕНО: все ${children.length} подзадач выполнены успешно (подзадачи: ${children.map(c => c.id).join(', ')})`;
+          await db.execute({
+            sql: "UPDATE tasks SET status = 'готова', result = ? WHERE id = ?",
+            args: [completionNote, taskId]
+          });
+          console.log(`[${new Date().toISOString()}] TREE_COMPLETION: parent task ${taskId} marked 'готова' (all ${children.length} subtasks done)`);
+          return {
+            treeComplete: true,
+            parentId: taskId,
+            totalSiblings: children.length,
+            completedSiblings: children.length
+          };
+        }
+        return {
+          treeComplete: false,
+          parentId: taskId,
+          totalSiblings: children.length,
+          completedSiblings: children.filter(c => c.status === 'готова').length,
+          anyPartial,
+          anyFailed
+        };
+      }
+    } catch (err) {
+      console.log(`[${new Date().toISOString()}] TREE_COMPLETION: parent check error: ${err.message}`);
+    }
+    return { treeComplete: false, reason: "not_in_tree" };
+  }
+
+  const parentId = info.parentId;
+  const expectedTotal = info.total;
+
+  try {
+    const sibRes = await db.execute({
+      sql: "SELECT id, status, text, result FROM tasks WHERE text LIKE ? OR text LIKE ?",
+      args: [`%parent:${parentId}]%`, `%parent:${parentId}%`]
+    });
+
+    const siblings = sibRes.rows || [];
+    if (siblings.length === 0) {
+      return { treeComplete: false, parentId, reason: "no_siblings_found" };
+    }
+
+    const totalCount = expectedTotal || siblings.length;
+    const completedSiblings = siblings.filter(s => s.status === 'готова');
+    const partialSiblings = siblings.filter(s => s.status === 'partial');
+    const failedSiblings = siblings.filter(s => s.status === 'провал' || s.status === 'заблокирована');
+    const pendingSiblings = siblings.filter(s => s.status === 'ожидает' || s.status === 'выполняется');
+
+    const isAllCompleted = siblings.length >= totalCount && completedSiblings.length === siblings.length;
+
+    if (isAllCompleted) {
+      console.log(`[${new Date().toISOString()}] TREE_COMPLETION: all ${siblings.length} siblings for parent ${parentId} are 'готова'. Marking parent complete.`);
+      const parentNote = `ДЕРЕВО ЗАДАЧ ЗАВЕРШЕНО: все ${siblings.length} подзадач выполнены успешно (подзадачи: ${siblings.map(s => s.id).join(', ')})`;
+
+      await db.execute({
+        sql: "UPDATE tasks SET status = 'готова', result = ? WHERE id = ?",
+        args: [parentNote, parentId]
+      });
+
+      return {
+        treeComplete: true,
+        parentId,
+        totalSiblings: siblings.length,
+        completedSiblings: completedSiblings.length,
+        siblings: siblings.map(s => ({ id: s.id, status: s.status }))
+      };
+    } else {
+      console.log(`[${new Date().toISOString()}] TREE_COMPLETION: tree for parent ${parentId} not yet complete (${completedSiblings.length}/${siblings.length} completed, ${partialSiblings.length} partial, ${pendingSiblings.length} pending)`);
+      return {
+        treeComplete: false,
+        parentId,
+        totalSiblings: siblings.length,
+        completedSiblings: completedSiblings.length,
+        partialCount: partialSiblings.length,
+        pendingCount: pendingSiblings.length,
+        failedCount: failedSiblings.length
+      };
+    }
+  } catch (err) {
+    console.log(`[${new Date().toISOString()}] TREE_COMPLETION: error: ${err.message}`);
+    return { treeComplete: false, parentId, error: err.message };
+  }
+}
+
+/**
+ * Separate compute path for executing long compute jobs with extended duration per agreed job cap.
+ * Exempt from the 5-minute timeout limit of standard jobs.
+ * Saves stderr and partial results as partial artifacts (not complete results) on failure/timeout.
+ * 
+ * @param {string} command - Shell command to execute
+ * @param {object} [task] - Task object from database
+ * @param {string} [text] - Task text
+ * @param {object} [options] - Additional execution options
+ * @returns {Promise<{success: boolean, message: string, exitCode: number, stdout: string, stderr: string, isLongCompute: boolean, jobCapMs: number|null, partial?: boolean, partialArtifacts?: object}>}
+ */
+async function executeLongCompute(command, task = null, text = '', options = {}) {
+  const taskId = task?.id || process.env.TASK_ID || 'compute';
+  const jobCapMs = options.jobCapMs || options.jobCap || extractJobCap(task, text) || null;
+  const isResume = Boolean(options.isResume || isResumeJob(task, text));
+  const checkpointDir = options.checkpointDir || CHECKPOINT_DIR;
+  let checkpoint = options.checkpoint || null;
+
+  if (isResume && !checkpoint) {
+    const resumeTarget = task?.resume_from || options.resumeFrom || extractResumeFrom(task, text);
+    checkpoint = await findLatestCheckpoint(taskId, {
+      checkpointDir: checkpointDir,
+      resumeFrom: resumeTarget
+    });
+    if (checkpoint) {
+      console.log(`[${new Date().toISOString()}] COMPUTE_PATH: resuming from checkpoint ${checkpoint.path}`);
+      process.env.RESUME_CHECKPOINT = checkpoint.path;
+      process.env.CHECKPOINT_PATH = checkpoint.path;
+      process.env.IS_RESUME = "true";
+    }
+  }
+
+  console.log(`[${new Date().toISOString()}] COMPUTE_PATH: executing long compute job${isResume ? ' (resumed)' : ''} (jobCapMs=${jobCapMs ? jobCapMs + 'ms' : 'unlimited/runner-bound'})`);
+  
+  try {
+    await mkdir(checkpointDir, { recursive: true });
+  } catch {}
+
+  const env = {
+    ...(options.env || {})
+  };
+  if (isResume) {
+    env.IS_RESUME = "true";
+    if (checkpoint?.path) {
+      env.RESUME_CHECKPOINT = checkpoint.path;
+      env.CHECKPOINT_PATH = checkpoint.path;
+    }
+  }
+
+  const cmdResult = await runCommand(command, {
+    isLongCompute: true,
+    jobCapMs: jobCapMs,
+    timeoutMs: options.timeoutMs,
+    cwd: options.cwd || WORKDIR,
+    env: env
+  });
+
+  if (cmdResult.success) {
+    let compArtifact = null;
+    try {
+      compArtifact = {
+        task_id: taskId,
+        status: 'complete',
+        is_partial: false,
+        is_complete: true,
+        exit_code: 0,
+        stdout: cmdResult.stdout,
+        stderr: cmdResult.stderr,
+        timestamp: new Date().toISOString(),
+        job_cap_ms: jobCapMs,
+        is_resume: isResume,
+        resumed_from_checkpoint: checkpoint ? checkpoint.path : null
+      };
+      await writeFile(
+        path.join(checkpointDir, `task-${taskId}-complete.json`),
+        JSON.stringify(compArtifact, null, 2),
+        'utf-8'
+      );
+    } catch {}
+
+    const uploaded = await uploadTaskCheckpointsAndArtifacts(taskId, {
+      isPartial: false,
+      checkpointDir: checkpointDir,
+      workdir: options.cwd || options.workdir || WORKDIR
+    });
+
+    return {
+      success: true,
+      message: cmdResult.stdout || 'Command executed successfully',
+      exitCode: cmdResult.exitCode,
+      stdout: cmdResult.stdout,
+      stderr: cmdResult.stderr,
+      isLongCompute: true,
+      isResume,
+      checkpoint,
+      artifactUploaded: uploaded,
+      jobCapMs: jobCapMs
+    };
+  }
+
+  // Save stderr and partial results as partial artifacts, not as complete results
+  console.log(`[${new Date().toISOString()}] COMPUTE_PATH: job did not complete cleanly (exitCode ${cmdResult.exitCode}). Saving stderr and partial results as partial artifacts.`);
+
+  const partialArtifactInfo = await savePartialArtifact(taskId, {
+    stdout: cmdResult.stdout,
+    stderr: cmdResult.stderr,
+    exitCode: cmdResult.exitCode,
+    jobCapMs,
+    command,
+    metadata: {
+      is_resume: isResume,
+      resumed_from_checkpoint: checkpoint ? checkpoint.path : null
+    }
+  }, { checkpointDir: checkpointDir });
+
+  const partialUploaded = await uploadTaskCheckpointsAndArtifacts(taskId, {
+    isPartial: true,
+    checkpointDir: checkpointDir,
+    workdir: options.cwd || options.workdir || WORKDIR
+  });
+
+  let failureMsg = cmdResult.stderr;
+  if (cmdResult.stdout) {
+    failureMsg = failureMsg ? `${failureMsg}\n[STDOUT]: ${cmdResult.stdout}` : cmdResult.stdout;
+  }
+
+  return {
+    success: false,
+    partial: true,
+    status: 'partial',
+    message: `ЧАСТИЧНЫЙ РЕЗУЛЬТАТ (exit ${cmdResult.exitCode}): сохранены частичные артефакты и stderr в ${checkpointDir}.\n${failureMsg || 'Partial execution'}`,
+    exitCode: cmdResult.exitCode,
+    stdout: cmdResult.stdout,
+    stderr: cmdResult.stderr,
+    isLongCompute: true,
+    isResume,
+    checkpoint,
+    artifactUploaded: partialUploaded,
+    jobCapMs: jobCapMs,
+    partialArtifacts: partialArtifactInfo
+  };
+}
+
 async function run() {
   const taskId = process.env.TASK_ID;
   const startTime = Date.now();
 
-  // Fetch task
-  const taskRes = await client.execute({ sql: 'SELECT * FROM tasks WHERE id = ? AND status = ?', args: [taskId, 'ожидает'] });
+  // Fetch task (supports pending and partial tasks for resume)
+  const taskRes = await client.execute({ sql: "SELECT * FROM tasks WHERE id = ? AND status IN ('ожидает', 'partial')", args: [taskId] });
   const task = taskRes.rows[0];
-  if (!task) { console.log('No pending task found'); return; }
+  if (!task) { console.log('No pending or partial task found'); return; }
 
   // GHQ2-c, 2026-09-14: a triage-split subtask does not run before its
   // earlier, still-unaccepted sibling - leaves status untouched ('ожидает')
@@ -113,12 +1119,12 @@ async function run() {
   // below for why this isn't just the local project's existing
   // worker/triage.js reused as-is.) Fail-safe: any error here just
   // proceeds to doWork() as one unit, same as before this existed.
-  // 2026-10-07: [NO-TRIAGE] marker (hasNoTriageMarker above) - a
-  // self-declared leaf-level task skips claim-time decomposition
-  // entirely and goes straight to execution as one unit.
-  if (hasNoTriageMarker(task.text)) {
-    console.log(`[${new Date().toISOString()}] no-triage marker present, skipping decomposition`);
-  } else {
+  // Shell command tasks and long compute jobs bypass triage to avoid misclassification or splitting.
+  const isCommandOrLongCompute = extractCommand(task.text, task) !== null || isLongComputeJob(task, task.text);
+  // 2026-10-07: [NO-TRIAGE] marker (hasNoTriageMarker below) - a
+  // self-declared leaf-level task skips claim-time decomposition entirely.
+  const noTriage = hasNoTriageMarker(task.text);
+  if (!isCommandOrLongCompute && !noTriage) {
     const triageDecision = await triageCheck(task.text, CLAIM_TIME_PAYLOAD_FACT);
     if (triageDecision.split) {
       const subtaskIds = await triageSplit(task, triageDecision).catch((err) => {
@@ -135,6 +1141,10 @@ async function run() {
         return;
       }
     }
+  } else if (noTriage) {
+    console.log(`[${new Date().toISOString()}] no-triage marker present, skipping decomposition`);
+  } else {
+    console.log(`[${new Date().toISOString()}] triage: bypassed for ${isLongComputeJob(task, task.text) ? 'long compute' : 'shell command'} job`);
   }
 
   // GHQ4, 2026-09-14: real bug found via plexus-doc-ce's task 21 - this
@@ -189,7 +1199,9 @@ async function run() {
   // persistent "заблокирована" status instead of "провал" - retrying the
   // same brief on a different provider cannot fix any of these, mirroring
   // queue.sh's own queue-blocked.txt semantics.
-  const status = result.success ? 'готова' : (result.permanent ? 'заблокирована' : 'провал');
+  const status = result.success
+    ? 'готова'
+    : (result.partial || result.status === 'partial' ? 'partial' : (result.permanent ? 'заблокирована' : 'провал'));
   const minutesUsed = Math.ceil((workEnd - workStart) / 60000);
   const secondsToFirstWork = Math.floor((workStart - startTime) / 1000);
 
@@ -197,6 +1209,21 @@ async function run() {
     sql: 'UPDATE tasks SET status = ?, result = ?, actions_run_id = ?, seconds_to_first_work = ?, minutes_used = ? WHERE id = ?',
     args: [status, result.message, process.env.GITHUB_RUN_ID, secondsToFirstWork, minutesUsed, taskId]
   });
+
+  // Ensure correct tree completion when jobs are completed or resumed
+  if (status === 'готова') {
+    try {
+      const treeRes = await checkTreeCompletion(taskId, task, client);
+      if (treeRes && treeRes.treeComplete) {
+        console.log(`[${new Date().toISOString()}] TREE_COMPLETION: tree finished successfully for parent ${treeRes.parentId} (${treeRes.completedSiblings}/${treeRes.totalSiblings} subtasks done)`);
+        if (task.creator_id && treeRes.parentId) {
+          await notifyTelegram(task.creator_id, `Дерево задач завершено: родительская задача ${treeRes.parentId} готова`);
+        }
+      }
+    } catch (treeErr) {
+      console.log(`[${new Date().toISOString()}] TREE_COMPLETION: check error: ${treeErr.message}`);
+    }
+  }
 
   // Notify via Telegram to creator
   await notifyTelegram(task.creator_id, `Задача ${taskId} ${status}: ${result.message}`);
@@ -229,7 +1256,12 @@ async function run() {
 // should see the real repo. Still read-mostly by convention - see
 // executor.yml's confinement check and plexus-corridor.yml's header for why
 // nothing here pushes back to plexus-doc on its own.
-const WORKDIR = "plexus-doc";
+// 2026-10-07: само объявление const WORKDIR переехало наверх файла (к
+// CHECKPOINT_DIR, env-настраиваемое - рефакторинг задач CLOUD-MAINT-d).
+// Здесь осталась вторая копия от того же рефакторинга, из-за которой файл
+// перестал парситься (SyntaxError: Identifier 'WORKDIR' has already been
+// declared, node --check падал ещё до правок Vertex). Копия убрана,
+// исторические комментарии сохранены.
 
 
 /**
@@ -604,15 +1636,35 @@ async function runDshOnce(provider, text) {
  * same real mechanism verified tonight in worker/rotation.js.
  */
 async function doWork(text, task) {
-  // RUN_COMMAND: direct shell command execution (bypasses LLM/dsh)
-  if (text.trim().startsWith('RUN_COMMAND: ')) {
-    const command = text.trim().slice('RUN_COMMAND: '.length).trim();
-    console.log(`[${new Date().toISOString()}] RUN_COMMAND: executing ${command}`);
-    const cmdResult = await runCommand(command);
+  const isResume = isResumeJob(task, text);
+  const isLongCompute = isLongComputeJob(task, text);
+  const command = extractCommand(text, task);
+
+  // Resume execution for long compute or resume jobs
+  if (isResume && command !== null) {
+    return await executeResume(command, task, text);
+  }
+
+  // Separate compute path for long compute jobs (exempt from 5-minute limit, respects job cap duration)
+  if (isLongCompute && command !== null) {
+    return await executeLongCompute(command, task, text);
+  }
+
+  // Direct shell command execution for regular jobs (bypasses LLM/dsh, standard 5-minute timeout)
+  if (command !== null) {
+    console.log(`[${new Date().toISOString()}] RUN_COMMAND: executing ${command} (standard 5-minute timeout)`);
+    const cmdResult = await runCommand(command, { isLongCompute: false });
     const output = cmdResult.success
       ? `Команда выполнена успешно (exit ${cmdResult.exitCode}).\nSTDOUT: ${cmdResult.stdout || '(пусто)'}\nSTDERR: ${cmdResult.stderr || '(пусто)'}`
       : `Команда завершилась с ошибкой (exit ${cmdResult.exitCode}).\nSTDOUT: ${cmdResult.stdout || '(пусто)'}\nSTDERR: ${cmdResult.stderr}`;
-    return { success: cmdResult.success, message: cmdResult.success ? cmdResult.stdout : (cmdResult.stderr || 'Command failed') };
+    let failureMsg = cmdResult.stderr;
+    if (cmdResult.stdout) {
+      failureMsg = failureMsg ? `${failureMsg}\n[STDOUT]: ${cmdResult.stdout}` : cmdResult.stdout;
+    }
+    return {
+      success: cmdResult.success,
+      message: cmdResult.success ? (cmdResult.stdout || 'Command executed successfully') : (failureMsg || 'Command failed')
+    };
   }
   const tried = new Set();
   let provider = PROVIDER_ORDER[0];
@@ -694,7 +1746,7 @@ async function doWork(text, task) {
   // AUTH failures do not match CAPACITY_RE and keep the ordinary failure
   // path - no decomposition on auth.
   if (CAPACITY_RE.test(msg) && task) {
-    // 2026-10-07: [NO-TRIAGE] marker (hasNoTriageMarker above) - never
+    // 2026-10-07: [NO-TRIAGE] marker (hasNoTriageMarker below) - never
     // decompose a self-declared leaf-level task even here; fall through to
     // the ordinary failure path below (provider rotation has already fully
     // run at this point, so this means: fail by payload, no decomposition).
@@ -1038,4 +2090,26 @@ async function diagnose(brief, log) {
   }
 }
 
-run().catch(console.error);
+export {
+  runCommand,
+  isLongComputeJob,
+  isResumeJob,
+  extractResumeFrom,
+  extractCommand,
+  parseDuration,
+  extractJobCap,
+  getEffectiveTimeout,
+  savePartialArtifact,
+  uploadTaskCheckpointsAndArtifacts,
+  findLatestCheckpoint,
+  executeResume,
+  extractParentAndSiblingInfo,
+  checkTreeCompletion,
+  executeLongCompute,
+  doWork,
+  run
+};
+
+if (process.argv[1] && process.argv[1].endsWith('executor.mjs')) {
+  run().catch(console.error);
+}
