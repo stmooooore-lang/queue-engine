@@ -351,3 +351,26 @@ jobs:
             exit 1
           fi
           echo "граница цела: изменения только внутри plexus/ и/или plexus-doc/"
+
+      # 2026-10-09 (CLOUD-QUEUE-ESCALATION-d): workflow-level failure alert.
+      # executor.mjs reports task RESULTS to Telegram, but only from inside a
+      # healthy "run the task" step: if an earlier step fails (dsh cache
+      # install, tree homogeneity check, boot smoke-test, vertex auth,
+      # settings write) or executor.mjs dies before its own notify, the
+      # failure stayed invisible in Telegram. Placed last so `failure()`
+      # covers every step above, including the `if: always()` confinement
+      # check right before it (failure() is true when ANY previous step
+      # failed). Secrets stay in env only and are never echoed, per the
+      # no-secret-logging rule in queue-engine/AGENTS.md; the message is
+      # built solely from default GITHUB_* context vars.
+      - name: notify Telegram on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+        run: |
+          message="Task Executor FAILED: workflow '${GITHUB_WORKFLOW}' in ${GITHUB_REPOSITORY} (run ${GITHUB_RUN_NUMBER}, attempt ${GITHUB_RUN_ATTEMPT}) failed. Logs: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl -sS --fail -X POST \
+            --data-urlencode "chat_id=${TELEGRAM_ADMIN_CHAT_ID}" \
+            --data-urlencode "text=${message}" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"

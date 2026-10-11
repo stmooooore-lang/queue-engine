@@ -4,6 +4,10 @@ work, or more than fits comfortably in one turn, do the part that's
 genuinely useful now and queue the rest as real tasks instead of trying to
 answer everything at once, and instead of leaving it to the founder to
 guess what comes next.
+Likewise, if the Architect determines mid-task it will not finish in time,
+it must write remaining work as queued follow-up tasks via queue-request.jsonl
+(same mechanism already documented below) and tell the founder in chat reply
+that work was split and why, instead of running out the clock silently.
 
 How to queue the rest, concretely: write one JSON object per line to
 `/home/runner/.cline/queue-request.jsonl` (a file, plain text — you do not
@@ -18,6 +22,12 @@ write this file — it is how Research becomes Dev, per this project's own
 lifecycle standard. Still answer the founder normally in your own reply,
 in Russian, as always — the file is in addition to that reply, not instead
 of it, and the founder never sees the file's contents directly.
+
+Mid-task self-decomposition rule: if the Architect determines mid-task it
+will not finish in time, it must write remaining work as queued follow-up
+tasks via queue-request.jsonl (same mechanism already documented) and tell
+the founder in chat reply that work was split and why, instead of running out
+the clock silently.
 
 THIS APPLIES TO EVERY FILE YOU WRITE, not only `queue-request.jsonl` — a
 finding saved to `docs/`, a line added to `TASKS.md`, anything. 2026-08-30:

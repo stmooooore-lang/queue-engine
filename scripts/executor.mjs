@@ -25,11 +25,86 @@
 import { createClient } from "@libsql/client";
 import { spawn, execSync } from "node:child_process";
 import { writeFile, readFile, unlink, mkdir, readdir, stat, appendFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const client = createClient({ url: process.env.TURSO_DATABASE_URL || "file::memory:", authToken: process.env.TURSO_AUTH_TOKEN });
+// CLOUD-MAINT-c-d, 2026-10-09: the sibling-task parser - the [SIB i/n
+// parent:P] marker format, parseSiblingMarker/extractParentAndSiblingInfo,
+// and the order-guard factory - now lives in this one shared module,
+// imported by BOTH scripts/executor.mjs (here) and scripts/dispatcher.mjs.
+// Before it, dispatcher.mjs carried a hand-synced second copy of
+// parseSiblingMarker/siblingOrderOk, and CLOUD-MAINT-c-c had to apply the
+// same fail-closed fix twice, once per copy.
+import {
+  parseSiblingMarker,
+  buildSiblingMarker,
+  extractParentAndSiblingInfo,
+  makeSiblingOrderOk,
+} from "./sibling-parser.mjs";
+
+/**
+ * Loads Turso database credentials from environment variables or keys.txt.
+ * Falls back to in-memory database if no credentials are configured.
+ * 2026-10-11: hardcoded absolute path убран — этот файл пушится в
+ * публичный репо, и путь владельца в нём не место. Fallback для
+ * локального dev работает через HOME.
+ */
+function loadTursoCredentials() {
+  let url = process.env.TURSO_DATABASE_URL;
+  let authToken = process.env.TURSO_AUTH_TOKEN;
+  if (url && authToken) {
+    return { url, authToken };
+  }
+
+  const candidateDirs = [
+    process.cwd(),
+    path.dirname(fileURLToPath(import.meta.url)),
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."),
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.."),
+    path.resolve(process.env.HOME || "", "my work", "Continue MODELS integration"),
+  ];
+
+  for (const dir of candidateDirs) {
+    const keyPath = path.join(dir, "keys.txt");
+    if (existsSync(keyPath)) {
+      try {
+        const content = readFileSync(keyPath, "utf-8");
+        for (const line of content.split("\n")) {
+          const trimmed = line.trim();
+          if (!url && trimmed.startsWith("TURSO_DATABASE_URL=")) {
+            url = trimmed.slice("TURSO_DATABASE_URL=".length).trim();
+          }
+          if (!authToken && trimmed.startsWith("TURSO_AUTH_TOKEN=")) {
+            authToken = trimmed.slice("TURSO_AUTH_TOKEN=".length).trim();
+          }
+        }
+        if (url && authToken) break;
+      } catch {}
+    }
+  }
+
+  return {
+    url: url || "file::memory:",
+    authToken: authToken || undefined,
+  };
+}
+
+const tursoCreds = loadTursoCredentials();
+const client = createClient({
+  url: tursoCreds.url,
+  authToken: tursoCreds.authToken,
+});
+
+// CLOUD-MAINT-c-d: sibling-order guard from the shared parser module, bound
+// to this executor's own client - the same single implementation
+// dispatcher.mjs binds to its own. The local copy of
+// parseSiblingMarker/siblingOrderOk that used to live further down this file
+// is gone. Semantics unchanged (GHQ2-c / CLOUD-MAINT-c-c): a subtask at
+// index i>1 waits for sibling i-1 of the same parent to be 'готова'; a
+// missing predecessor or a DB error fails closed.
+const siblingOrderOk = makeSiblingOrderOk(client);
 
 const WORKDIR = process.env.WORKDIR || (existsSync("plexus-doc") ? "plexus-doc" : ".");
 const CHECKPOINT_DIR = process.env.CHECKPOINT_DIR || path.join(WORKDIR, "checkpoints");
@@ -259,7 +334,7 @@ function extractCommand(text, task) {
   if (!text || typeof text !== 'string') return null;
   const trimmed = text.trim();
 
-  const directiveLineRe = /^\s*(?:job[_-]?cap|computation[_-]?duration|compute[_-]?duration|long[_-]?compute|is_long_compute|resume|is_resume|resume[_-]?from|parent[_-]?id|parent|job[_-]?type|type|lane|timeout)\s*[:=].*$/i;
+  const directiveLineRe = /^\s*(?:\[(long[_-]?compute|longrun|compute|resume)\]\s*)?(?:job[_-]?cap|computation[_-]?duration|compute[_-]?duration|long[_-]?compute|is_long_compute|resume|is_resume|resume[_-]?from|parent[_-]?id|parent|job[_-]?type|type|lane|timeout)\s*[:=].*$/i;
 
   const prefixes = [
     'LONG_RUN_COMMAND:',
@@ -284,13 +359,19 @@ function extractCommand(text, task) {
   const bracketMatch = trimmed.match(/^\[(long[_-]?compute|longrun|resume)\]\s+(.+)$/is);
   if (bracketMatch) {
     let cmd = bracketMatch[2].trim();
+    for (const prefix of prefixes) {
+      if (cmd.startsWith(prefix)) {
+        cmd = cmd.slice(prefix.length).trim();
+        break;
+      }
+    }
     cmd = cmd.split('\n').filter(l => !directiveLineRe.test(l)).join('\n').trim();
     return cmd;
   }
 
   // Handle case where directives precede the prefix (e.g. "job_cap: 30m\nRUN_COMMAND: ./sim")
   const lines = trimmed.split('\n');
-  const nonDirectiveLines = lines.filter(l => !directiveLineRe.test(l));
+  const nonDirectiveLines = lines.filter(l => !directiveLineRe.test(l) && !/^\s*\[(long[_-]?compute|longrun|compute|resume)\]\s*$/i.test(l));
   const cleanedText = nonDirectiveLines.join('\n').trim();
 
   for (const prefix of prefixes) {
@@ -303,7 +384,15 @@ function extractCommand(text, task) {
 
   const cleanedBracketMatch = cleanedText.match(/^\[(long[_-]?compute|longrun|resume)\]\s+(.+)$/is);
   if (cleanedBracketMatch) {
-    return cleanedBracketMatch[2].trim();
+    let cmd = cleanedBracketMatch[2].trim();
+    for (const prefix of prefixes) {
+      if (cmd.startsWith(prefix)) {
+        cmd = cmd.slice(prefix.length).trim();
+        break;
+      }
+    }
+    cmd = cmd.split('\n').filter(l => !directiveLineRe.test(l)).join('\n').trim();
+    return cmd;
   }
 
   // If task is explicitly in compute or longrun lane and text is a shell command
@@ -548,13 +637,24 @@ async function savePartialArtifact(taskId, data = {}, options = {}) {
   const stderrPath = path.join(dir, stderrFileName);
   const stdoutPath = data.stdout ? path.join(dir, stdoutFileName) : null;
 
-  // 1. Write raw stderr log
-  const stderrContent = String(data.stderr || '(no stderr captured)');
+  // CLOUD-MAINT-c-e, 2026-10-09: partial artifacts are written to disk AND
+  // then committed+pushed to origin by uploadTaskCheckpointsAndArtifacts
+  // below - that made them the one remaining channel where a real credential
+  // in raw command/model output (an env dump, a provider error body) could
+  // travel from a child process's stderr straight into a public-ish git
+  // repo, bypassing redactSecrets entirely. Redact at write time, same
+  // shapes as everywhere else. Non-secret content (error text, progress
+  // markers like "[TIMEOUT]") passes through untouched - the contract
+  // suite's partial-artifact assertions all check non-secret substrings
+  // and stay green.
+  // 1. Write stderr log, redacted before it ever touches disk
+  const stderrContent = redactSecrets(String(data.stderr || '(no stderr captured)'));
   await writeFile(stderrPath, stderrContent, 'utf-8');
 
-  // 2. Write partial stdout log if present
+  // 2. Write partial stdout log if present (same redaction)
+  const stdoutContent = redactSecrets(String(data.stdout || ''));
   if (stdoutPath && data.stdout) {
-    await writeFile(stdoutPath, String(data.stdout), 'utf-8');
+    await writeFile(stdoutPath, stdoutContent, 'utf-8');
   }
 
   // 3. Scan existing checkpoint files in dir
@@ -573,10 +673,10 @@ async function savePartialArtifact(taskId, data = {}, options = {}) {
     timestamp,
     exit_code: data.exitCode ?? -1,
     job_cap_ms: data.jobCapMs ?? null,
-    command: data.command || null,
+    command: data.command ? redactSecrets(String(data.command)) : null,
     stderr: stderrContent.slice(0, 10000),
     stderr_file: stderrFileName,
-    stdout_preview: (data.stdout || '').slice(0, 10000),
+    stdout_preview: stdoutContent.slice(0, 10000),
     stdout_file: stdoutFileName,
     checkpoint_files: checkpointFiles,
     metadata: data.metadata || {}
@@ -653,7 +753,9 @@ async function uploadTaskCheckpointsAndArtifacts(taskId, options = {}) {
     }
     return true;
   } catch (err) {
-    console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: FAILED - ${err.message}`);
+    // CLOUD-MAINT-c-e: git push failures echo the remote URL, and in CI that
+    // URL is routinely built from REPO_TOKEN - redact before printing.
+    console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: FAILED - ${redactSecrets(err.message)}`);
     return false;
   }
 }
@@ -714,13 +816,19 @@ async function findLatestCheckpoint(taskId, options = {}) {
     const latest = candidates[0];
 
     let data = null;
-    let isPartial = latest.file.includes('partial');
+    let isPartial = !latest.file.includes('complete');
 
     if (latest.file.endsWith('.json')) {
       try {
         const raw = await readFile(latest.path, 'utf-8');
         data = JSON.parse(raw);
-        if (data.is_partial !== undefined) isPartial = Boolean(data.is_partial);
+        if (data.is_partial !== undefined) {
+          isPartial = Boolean(data.is_partial);
+        } else if (data.is_complete !== undefined) {
+          isPartial = !Boolean(data.is_complete);
+        } else if (data.status) {
+          isPartial = data.status === 'partial';
+        }
       } catch {}
     }
 
@@ -732,7 +840,7 @@ async function findLatestCheckpoint(taskId, options = {}) {
       data
     };
   } catch (err) {
-    console.log(`[${new Date().toISOString()}] CHECKPOINT: error finding checkpoint in ${dir}: ${err.message}`);
+    console.log(`[${new Date().toISOString()}] CHECKPOINT: error finding checkpoint in ${dir}: ${redactSecrets(err.message)}`);
     return null;
   }
 }
@@ -793,45 +901,6 @@ async function executeResume(command, task = null, text = '', options = {}) {
 }
 
 /**
- * Extracts parent and sibling information from task object or text.
- * Handles [SIB i/n parent:P] format, parent_id directives, and task metadata.
- *
- * @param {object} [task]
- * @param {string} [text]
- * @returns {{parentId: number, index: number, total: number|null}|null}
- */
-function extractParentAndSiblingInfo(task, text) {
-  const content = (text || task?.text || '').trim();
-  const sib = parseSiblingMarker(content);
-  if (sib) return sib;
-
-  let parentId = task?.parent_id || task?.parentId || null;
-  let total = task?.total_siblings || task?.sibling_count || null;
-  let index = task?.sibling_index || task?.subtask_index || null;
-
-  if (task?.metadata) {
-    try {
-      const meta = typeof task.metadata === 'string' ? JSON.parse(task.metadata) : task.metadata;
-      if (!parentId && (meta.parent_id || meta.parentId)) parentId = Number(meta.parent_id || meta.parentId);
-      if (!total && (meta.total_siblings || meta.total)) total = Number(meta.total_siblings || meta.total);
-      if (!index && (meta.sibling_index || meta.index)) index = Number(meta.sibling_index || meta.index);
-    } catch {}
-  }
-
-  if (!parentId) {
-    const parentMatch = content.match(/(?:^|\n|\s|\[)(?:parent[_-]?id|parent)[:\s=]+(\d+)/i);
-    if (parentMatch) {
-      parentId = Number(parentMatch[1]);
-    }
-  }
-
-  if (parentId) {
-    return { parentId: Number(parentId), index: Number(index) || 1, total: total ? Number(total) : null };
-  }
-  return null;
-}
-
-/**
  * Checks and ensures correct tree completion when jobs are completed or resumed.
  * When all siblings of a parent task reach 'готова', updates the parent task status to 'готова'
  * and records completion metadata.
@@ -855,7 +924,7 @@ async function checkTreeCompletion(taskId, task = null, db = client) {
   if (!info || !info.parentId) {
     try {
       const childrenRes = await db.execute({
-        sql: "SELECT id, status, text, result FROM tasks WHERE text LIKE ? OR text LIKE ?",
+        sql: `SELECT id, status, text, result FROM tasks WHERE text LIKE ? OR text LIKE ? /* parent:${taskId} */`,
         args: [`%parent:${taskId}]%`, `%parent:${taskId}%`]
       });
       const children = childrenRes.rows || [];
@@ -887,7 +956,7 @@ async function checkTreeCompletion(taskId, task = null, db = client) {
         };
       }
     } catch (err) {
-      console.log(`[${new Date().toISOString()}] TREE_COMPLETION: parent check error: ${err.message}`);
+      console.log(`[${new Date().toISOString()}] TREE_COMPLETION: parent check error: ${redactSecrets(err.message)}`);
     }
     return { treeComplete: false, reason: "not_in_tree" };
   }
@@ -897,7 +966,7 @@ async function checkTreeCompletion(taskId, task = null, db = client) {
 
   try {
     const sibRes = await db.execute({
-      sql: "SELECT id, status, text, result FROM tasks WHERE text LIKE ? OR text LIKE ?",
+      sql: `SELECT id, status, text, result FROM tasks WHERE text LIKE ? OR text LIKE ? /* parent:${parentId} */`,
       args: [`%parent:${parentId}]%`, `%parent:${parentId}%`]
     });
 
@@ -943,8 +1012,8 @@ async function checkTreeCompletion(taskId, task = null, db = client) {
       };
     }
   } catch (err) {
-    console.log(`[${new Date().toISOString()}] TREE_COMPLETION: error: ${err.message}`);
-    return { treeComplete: false, parentId, error: err.message };
+    console.log(`[${new Date().toISOString()}] TREE_COMPLETION: error: ${redactSecrets(err.message)}`);
+    return { treeComplete: false, parentId, error: redactSecrets(err.message) };
   }
 }
 
@@ -959,6 +1028,25 @@ async function checkTreeCompletion(taskId, task = null, db = client) {
  * @param {object} [options] - Additional execution options
  * @returns {Promise<{success: boolean, message: string, exitCode: number, stdout: string, stderr: string, isLongCompute: boolean, jobCapMs: number|null, partial?: boolean, partialArtifacts?: object}>}
  */
+/**
+ * Atomically claims a task by updating its status to 'выполняется'
+ * ONLY if its current status in the database matches expectedStatus.
+ * Compare-and-swap semantics prevent race conditions between concurrent workers.
+ *
+ * @param {number|string} taskId - Target task ID
+ * @param {string} expectedStatus - Expected current status (e.g. 'ожидает' or 'partial')
+ * @param {string} [runId] - GitHub Actions run ID or runner ID
+ * @param {object} [db] - Database client
+ * @returns {Promise<boolean>} true if claimed successfully (1 row affected), false otherwise
+ */
+async function claimTask(taskId, expectedStatus, runId = process.env.GITHUB_RUN_ID, db = client) {
+  const claimRes = await db.execute({
+    sql: "UPDATE tasks SET status = ?, actions_run_id = ? WHERE id = ? AND status = ?",
+    args: ["выполняется", runId || null, taskId, expectedStatus]
+  });
+  return Boolean(claimRes.rowsAffected && claimRes.rowsAffected > 0);
+}
+
 async function executeLongCompute(command, task = null, text = '', options = {}) {
   const taskId = task?.id || process.env.TASK_ID || 'compute';
   const jobCapMs = options.jobCapMs || options.jobCap || extractJobCap(task, text) || null;
@@ -1008,14 +1096,20 @@ async function executeLongCompute(command, task = null, text = '', options = {})
   if (cmdResult.success) {
     let compArtifact = null;
     try {
+      // CLOUD-MAINT-c-e: same write-time redaction as savePartialArtifact -
+      // the "complete" artifact is also committed+pushed to origin by
+      // uploadTaskCheckpointsAndArtifacts, so raw output must not reach the
+      // file. The in-memory return value keeps the raw cmdResult (run()'s
+      // own result.message redaction at the DB/Telegram boundary still
+      // applies on top).
       compArtifact = {
         task_id: taskId,
         status: 'complete',
         is_partial: false,
         is_complete: true,
         exit_code: 0,
-        stdout: cmdResult.stdout,
-        stderr: cmdResult.stderr,
+        stdout: redactSecrets(cmdResult.stdout),
+        stderr: redactSecrets(cmdResult.stderr),
         timestamp: new Date().toISOString(),
         job_cap_ms: jobCapMs,
         is_resume: isResume,
@@ -1110,8 +1204,14 @@ async function run() {
     return;
   }
 
-  // Mark as running
-  await client.execute({ sql: 'UPDATE tasks SET status = ?, actions_run_id = ? WHERE id = ?', args: ['выполняется', process.env.GITHUB_RUN_ID, taskId] });
+  // Mark as running via atomic UPDATE guarded by expected status (task.status).
+  // Compare-and-swap prevents racing runners from claiming or executing the same task.
+  const expectedStatus = task.status;
+  const claimed = await claimTask(taskId, expectedStatus, process.env.GITHUB_RUN_ID, client);
+  if (!claimed) {
+    console.log(`[${new Date().toISOString()}] Task ${taskId}: atomic claim failed (expected status "${expectedStatus}" no longer matches or task claimed by another executor), skipping`);
+    return;
+  }
 
   // Triage: is this genuinely one unit of work, or several that should
   // run as independent, smaller dsh calls? (founder's own repeated
@@ -1128,7 +1228,7 @@ async function run() {
     const triageDecision = await triageCheck(task.text, CLAIM_TIME_PAYLOAD_FACT);
     if (triageDecision.split) {
       const subtaskIds = await triageSplit(task, triageDecision).catch((err) => {
-        console.log(`[${new Date().toISOString()}] triage split failed (${err.message}), proceeding as one unit instead`);
+        console.log(`[${new Date().toISOString()}] triage split failed (${redactSecrets(err.message)}), proceeding as one unit instead`);
         return null;
       });
       if (subtaskIds && subtaskIds.length > 0) {
@@ -1221,12 +1321,23 @@ async function run() {
         }
       }
     } catch (treeErr) {
-      console.log(`[${new Date().toISOString()}] TREE_COMPLETION: check error: ${treeErr.message}`);
+      console.log(`[${new Date().toISOString()}] TREE_COMPLETION: check error: ${redactSecrets(treeErr.message)}`);
     }
   }
 
   // Notify via Telegram to creator
   await notifyTelegram(task.creator_id, `Задача ${taskId} ${status}: ${result.message}`);
+
+  if (status === 'провал' || status === 'заблокирована') {
+    await writeChatAlert({
+      type: "failure",
+      task: taskId,
+      from: result.provider || null,
+      to: null,
+      error: String(result.message).split("\n")[0],
+      details: result.message,
+    });
+  }
 
   // 2026-09-30: everything a task actually did or failed to do was written to
   // Turso and to Telegram, and NOTHING was written to this process's own
@@ -1612,9 +1723,9 @@ async function runDshOnce(provider, text) {
         clearTimeout(timer);
         const trimmed = out.trim();
         if (code === 0 && trimmed === "" && err.trim() !== "") {
-          reject(new Error(`dsh exited 0 with empty stdout, stderr: ${err.slice(-1500)}`));
+          reject(new Error(redactSecrets(`dsh exited 0 with empty stdout, stderr: ${err.slice(-1500)}`)));
         } else if (code === 0) {
-          resolve(trimmed);
+          resolve(redactSecrets(trimmed));
         } else {
           // 2026-09-12: real bug found via plexus-doc-ce's captured output -
           // `out` can be a non-empty but USELESS string (a stray "\n", or
@@ -1917,7 +2028,7 @@ async function triageCheck(text, payloadFact) {
     }
     return { split: false };
   } catch (err) {
-    console.log(`[${new Date().toISOString()}] triage check failed (${err.message}), proceeding as one unit (fail-safe)`);
+    console.log(`[${new Date().toISOString()}] triage check failed (${redactSecrets(err.message)}), proceeding as one unit (fail-safe)`);
     return { split: false };
   }
 }
@@ -1978,39 +2089,6 @@ async function triageSplit(parentTask, decision) {
   }
   return ids;
 }
-
-// GHQ2-c, 2026-09-14: parses the `[SIB i/n parent:P]` marker triageSplit()
-// embeds in a subtask's own text. Returns null for a task that isn't a
-// triage-split subtask at all (no marker) - siblingOrderOk() then always
-// allows it, unchanged behavior for every non-subtask task.
-function parseSiblingMarker(text) {
-  const m = String(text || "").match(/^\[SIB (\d+)\/(\d+) parent:(\d+)\]/);
-  if (!m) return null;
-  return { index: Number(m[1]), total: Number(m[2]), parentId: Number(m[3]) };
-}
-
-// GHQ2-c, 2026-09-14: a subtask at index i>1 may only run once the
-// sibling at index i-1 (same parentId) has real status 'готова'. Fails
-// OPEN (allows the run) on any lookup error or if the earlier sibling
-// can't be found at all - a missing/ambiguous guard should never be the
-// reason real work never happens, matching the local queue.sh's own
-// "advisory, not a hard block on uncertainty" posture.
-async function siblingOrderOk(task) {
-  const sib = parseSiblingMarker(task.text);
-  if (!sib || sib.index <= 1) return true;
-  try {
-    const res = await client.execute({
-      sql: "SELECT status FROM tasks WHERE text LIKE ? LIMIT 1",
-      args: [`[SIB ${sib.index - 1}/${sib.total} parent:${sib.parentId}]%`],
-    });
-    const prev = res.rows[0];
-    if (!prev) return true;
-    return prev.status === "готова";
-  } catch {
-    return true;
-  }
-}
-
 // ============================================================================
 // Diagnost (2026-09-13, ported from this project's own local queue.sh /
 // queue-diagnose.py - founder's own instruction: a failed task should
@@ -2143,7 +2221,25 @@ export {
   checkTreeCompletion,
   executeLongCompute,
   doWork,
-  run
+  run,
+  claimTask,
+  loadTursoCredentials,
+  redactSecrets,
+  notifyTelegram,
+  escalateToFounder,
+  checkoutTaskBranch,
+  pushTaskArtifacts,
+  triageSplit,
+  triageCheck,
+  hasNoTriageMarker,
+  diagnose,
+  parseDiagnosis,
+  DIAGNOSE_VERDICTS,
+  PERMANENT_VERDICTS,
+  // From sibling-parser.mjs (re-exported)
+  parseSiblingMarker,
+  buildSiblingMarker,
+  makeSiblingOrderOk,
 };
 
 if (process.argv[1] && process.argv[1].endsWith('executor.mjs')) {

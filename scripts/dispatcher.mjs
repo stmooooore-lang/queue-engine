@@ -34,36 +34,31 @@
 import { createClient } from "@libsql/client";
 import { execFileSync } from "node:child_process";
 
-const client = createClient({ url: process.env.TURSO_DATABASE_URL, authToken: process.env.TURSO_AUTH_TOKEN });
+// CLOUD-MAINT-c-d, 2026-10-09: the sibling-task parser (the [SIB i/n
+// parent:P] marker format, its parse/extract routines and the order guard)
+// now lives in one shared module used by both this dispatcher and
+// executor.mjs. Until now this file kept a second, hand-synced copy of
+// parseSiblingMarker/siblingOrderOk (ported here in GHQ2-c), and
+// CLOUD-MAINT-c-c then had to apply the same fail-closed fix twice - once
+// per copy.
+import { parseSiblingMarker, makeSiblingOrderOk } from "./sibling-parser.mjs";
+import {
+  redactSecrets,
+  classifyProgressVsLoop,
+  classifyTimeoutKill,
+  detectLoop,
+} from "./executor.mjs";
 
-// Ported from executor.mjs's own parseSiblingMarker/siblingOrderOk (GHQ2-c,
-// 2026-09-14) - same [SIB i/n parent:P] text-embedded marker, same
-// fail-open-on-error posture. Kept in sync by hand since this is a separate
-// process with its own short lifetime, not worth sharing a module for two
-// small functions.
-function parseSiblingMarker(text) {
-  const m = String(text || "").match(/^\[SIB (\d+)\/(\d+) parent:(\d+)\]/);
-  if (!m) return null;
-  return { index: Number(m[1]), total: Number(m[2]), parentId: Number(m[3]) };
-}
+const client = createClient({ url: process.env.TURSO_DATABASE_URL || "file::memory:", authToken: process.env.TURSO_AUTH_TOKEN });
 
-async function siblingOrderOk(task) {
-  const sib = parseSiblingMarker(task.text);
-  if (!sib || sib.index <= 1) return true;
-  try {
-    const res = await client.execute({
-      sql: "SELECT status FROM tasks WHERE text LIKE ? LIMIT 1",
-      args: [`[SIB ${sib.index - 1}/${sib.total} parent:${sib.parentId}]%`],
-    });
-    const prev = res.rows[0];
-    if (!prev) return true;
-    return prev.status === "готова";
-  } catch {
-    return true;
-  }
-}
+// Same sibling-order guard as executor.mjs, from the single shared
+// implementation in sibling-parser.mjs, bound to this dispatcher's own
+// client. Semantics unchanged (CLOUD-MAINT-c-c): an out-of-order sibling
+// waits for its predecessor to be 'готова'; a missing predecessor or a DB
+// error fails closed.
+const siblingOrderOk = makeSiblingOrderOk(client);
 
-const REPO = process.env.GITHUB_REPOSITORY; // "owner/repo", set automatically by Actions
+const REPO = process.env.GITHUB_REPOSITORY || "stmooooore-lang/queue-engine"; // "owner/repo", set automatically by Actions
 
 // One task in flight at a time (see the file header) - if executor.yml
 // already has a queued or in_progress run, this tick dispatches nothing and
@@ -102,14 +97,28 @@ async function main() {
       console.log(`[${new Date().toISOString()}] dispatched executor.yml for task ${task.id}, stopping - one at a time`);
       return;
     } catch (e) {
-      console.error(`[${new Date().toISOString()}] failed to dispatch task ${task.id}: ${e.message}`);
+      console.error(`[${new Date().toISOString()}] failed to dispatch task ${task.id}: ${redactSecrets(e.message)}`);
     }
   }
 
   console.log(`[${new Date().toISOString()}] tick done: nothing ready to dispatch out of ${pending.rows.length} pending`);
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+export {
+  parseSiblingMarker,
+  siblingOrderOk,
+  executorAlreadyRunning,
+  main,
+  client,
+  redactSecrets,
+  classifyProgressVsLoop,
+  classifyTimeoutKill,
+  detectLoop,
+};
+
+if (process.argv[1] && process.argv[1].endsWith('dispatcher.mjs')) {
+  main().catch((e) => {
+    console.error(redactSecrets(e?.message || e));
+    process.exit(1);
+  });
+}

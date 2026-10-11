@@ -28,10 +28,142 @@ import { ensureTasksFile } from "./init-tasks-md.mjs";
 // thrown away. This collector does the same selection incrementally, so
 // a huge task's tool-call volume no longer has a fixed ceiling -- only
 // CLINE_TIMEOUT_MS bounds it now, not memory.
-function makeStreamingCollector(tailMaxChars = 2000) {
+//
+// AUDIT-10-b (2026-08-31): repeat-call loop detector ported from queue.sh.
+// If any single tool call (name + args) repeats REPEAT_CALL_THRESHOLD times,
+// runDockerStreaming kills the child with SIGKILL early instead of waiting out
+// the full 25-minute CLINE_TIMEOUT_MS timeout.
+const REPEAT_CALL_THRESHOLD = parseInt(process.env.QUEUE_REPEAT_CALL_THRESHOLD || "3", 10);
+
+function canonicalizeJson(obj) {
+  if (Array.isArray(obj)) {
+    return `[${obj.map(canonicalizeJson).join(",")}]`;
+  }
+  if (obj !== null && typeof obj === "object") {
+    const keys = Object.keys(obj).sort();
+    return `{${keys.map(k => `${JSON.stringify(k)}:${canonicalizeJson(obj[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(obj);
+}
+
+function normalizeArgs(args) {
+  if (args === null || args === undefined) return "";
+  if (typeof args === "string") {
+    const trimmed = args.trim();
+    try {
+      const parsed = JSON.parse(trimmed);
+      return canonicalizeJson(parsed);
+    } catch {
+      return trimmed.replace(/\s+/g, " ");
+    }
+  }
+  if (typeof args === "object") {
+    return canonicalizeJson(args);
+  }
+  return String(args).trim();
+}
+
+function extractToolCalls(line) {
+  const calls = [];
+  const cleanLine = line.replace(/\x1b\[[0-9;]*m/g, "").trim();
+  if (!cleanLine) return calls;
+
+  function addCall(name, args) {
+    if (name && typeof name === "string") {
+      calls.push({ name: name.trim(), args: normalizeArgs(args) });
+    }
+  }
+
+  // 1. Structured JSON events (cline --json output)
+  try {
+    const d = JSON.parse(cleanLine);
+    if (d && typeof d === "object") {
+      const type = d.type || d.event;
+      // Direct tool call events: "tool_call", "tool_use", "tool", "action"
+      if (type === "tool_call" || type === "tool_use" || type === "tool" || type === "action") {
+        const name = d.name || d.tool || d.tool_name || d.action || d.function?.name || d.call?.name;
+        const args = d.args ?? d.arguments ?? d.parameters ?? d.input ?? d.function?.arguments ?? d.call?.arguments;
+        addCall(name, args);
+      }
+
+      // OpenAI-style tool_calls array (top-level, or inside message / delta / choices)
+      const toolCalls = d.tool_calls ||
+        d.message?.tool_calls ||
+        d.delta?.tool_calls ||
+        d.choices?.[0]?.message?.tool_calls ||
+        d.choices?.[0]?.delta?.tool_calls;
+
+      if (Array.isArray(toolCalls)) {
+        for (const tc of toolCalls) {
+          const name = tc?.function?.name || tc?.name;
+          const args = tc?.function?.arguments ?? tc?.arguments ?? tc?.input ?? tc?.parameters;
+          addCall(name, args);
+        }
+      }
+
+      // Anthropic-style content array with tool_use blocks
+      const content = d.content || d.message?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block?.type === "tool_use") {
+            addCall(block.name, block.input ?? block.args ?? block.arguments);
+          }
+        }
+      }
+
+      // Cline internal webview/say protocol: say: "tool" or say: "command"
+      if (d.type === "say" && (d.say === "tool" || d.say === "command")) {
+        const text = (d.text || "").trim();
+        const spaceIdx = text.indexOf(" ");
+        if (spaceIdx > 0) {
+          addCall(text.slice(0, spaceIdx), text.slice(spaceIdx + 1));
+        } else if (text) {
+          addCall(text, "");
+        }
+      }
+    }
+  } catch {
+    // Non-JSON line - fall through to bracketed tool call fallback
+  }
+
+  // 2. Bracketed tool call fallback (matches queue.sh & worker/loop-detection.js pattern)
+  // Only checked when no structured tool call was found on this line
+  if (calls.length === 0) {
+    const TOOL_CALL_RE = /\[(read_files|run_commands|search_codebase|write_to_file|replace_in_file|execute_command|browser_action|use_mcp_tool)\]\s*(.{0,150})/g;
+    let match;
+    while ((match = TOOL_CALL_RE.exec(cleanLine)) !== null) {
+      const name = match[1];
+      const args = match[2]?.trim() || "";
+      if (args) {
+        calls.push({ name, args: normalizeArgs(args) });
+      }
+    }
+  }
+
+  return calls;
+}
+
+function makeStreamingCollector(tailMaxCharsOrOpts = 2000, opts = {}) {
+  let tailMaxChars = 2000;
+  let options = {};
+  if (typeof tailMaxCharsOrOpts === "object" && tailMaxCharsOrOpts !== null) {
+    options = tailMaxCharsOrOpts;
+    tailMaxChars = options.tailMaxChars ?? 2000;
+  } else {
+    tailMaxChars = tailMaxCharsOrOpts ?? 2000;
+    options = opts || {};
+  }
+
+  const repeatThreshold = options.repeatThreshold ?? REPEAT_CALL_THRESHOLD;
+  const onRepeatCall = options.onRepeatCall;
+
   let carry = "";      // an incomplete line spanning two chunks
   let lastResult = null;
   let tail = "";        // small, bounded window of raw output for error reports
+  const callCounts = new Map(); // key: "name:normalizedArgs" -> count
+  let repeatDetected = false;
+  let worstRepeat = null;
+
   function consumeLine(line) {
     const t = line.trim();
     if (!t) return;
@@ -41,7 +173,28 @@ function makeStreamingCollector(tailMaxChars = 2000) {
     } catch {
       // non-JSON line (a warning, etc.) - skip, same as the old code did
     }
+
+    // AUDIT-10-b: extract tool calls and check for repeats
+    const toolCalls = extractToolCalls(line);
+    for (const call of toolCalls) {
+      const key = `${call.name}:${call.args}`;
+      const count = (callCounts.get(key) || 0) + 1;
+      callCounts.set(key, count);
+
+      if (!worstRepeat || count > worstRepeat.count) {
+        worstRepeat = { name: call.name, args: call.args, count, threshold: repeatThreshold };
+      }
+
+      if (count >= repeatThreshold && !repeatDetected) {
+        repeatDetected = true;
+        const info = { name: call.name, args: call.args, count, threshold: repeatThreshold };
+        if (typeof onRepeatCall === "function") {
+          onRepeatCall(info);
+        }
+      }
+    }
   }
+
   function push(chunk) {
     tail = (tail + chunk).slice(-tailMaxChars);
     carry += chunk;
@@ -49,22 +202,43 @@ function makeStreamingCollector(tailMaxChars = 2000) {
     carry = lines.pop() ?? ""; // last element may be a partial line - keep it for the next chunk
     for (const line of lines) consumeLine(line);
   }
+
   function finalize() {
     if (carry) consumeLine(carry); // stream may end without a trailing newline
-    return { lastResult, tail };
+    return {
+      lastResult,
+      tail,
+      repeatedCall: worstRepeat,
+      repeatDetected: worstRepeat ? worstRepeat.count >= repeatThreshold : false,
+      callCounts: new Map(callCounts),
+    };
   }
-  return { push, finalize };
+
+  return { push, finalize, getCallCounts: () => new Map(callCounts) };
 }
 
-function runDockerStreaming(dockerArgs, { timeout, env }) {
+function runDockerStreaming(dockerArgs, { timeout, env, repeatThreshold = REPEAT_CALL_THRESHOLD } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn("docker", dockerArgs, { env });
-    const collector = makeStreamingCollector();
     let timedOut = false;
+    let repeatKilled = false;
+    let repeatInfo = null;
+
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGKILL");
     }, timeout);
+
+    const collector = makeStreamingCollector({
+      repeatThreshold,
+      onRepeatCall: (info) => {
+        repeatKilled = true;
+        repeatInfo = info;
+        clearTimeout(timer);
+        console.log(`[${new Date().toISOString()}] REPEAT_CALL_THRESHOLD reached (${info.count}x ${info.name}: ${(info.args || "").slice(0, 80)}). Killing child with SIGKILL.`);
+        child.kill("SIGKILL");
+      }
+    });
 
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => collector.push(chunk));
@@ -75,32 +249,50 @@ function runDockerStreaming(dockerArgs, { timeout, env }) {
 
     child.on("error", (err) => {
       clearTimeout(timer);
-      const { lastResult, tail } = collector.finalize();
+      const { lastResult, tail, repeatedCall } = collector.finalize();
       err.lastResult = lastResult;
       err.outputTail = tail;
+      err.repeatInfo = repeatInfo || repeatedCall;
+      err.repeatKilled = repeatKilled || Boolean(err.repeatInfo && err.repeatInfo.count >= repeatThreshold);
       reject(err);
     });
 
     child.on("close", (code, signal) => {
       clearTimeout(timer);
-      const { lastResult, tail } = collector.finalize();
-      if (code === 0 && !signal) {
+      const { lastResult, tail, repeatedCall } = collector.finalize();
+      const finalRepeatInfo = repeatInfo || repeatedCall;
+      const wasRepeatKilled = repeatKilled || Boolean(finalRepeatInfo && finalRepeatInfo.count >= repeatThreshold);
+
+      if (code === 0 && !signal && !wasRepeatKilled) {
         resolve({ lastResult, tail });
         return;
       }
       const err = new Error(
-        timedOut
+        wasRepeatKilled
+          ? `docker killed: repeated tool call detected (${finalRepeatInfo?.name || "tool"}: ${finalRepeatInfo?.count}x >= ${repeatThreshold})`
+          : timedOut
           ? `docker killed after ${timeout}ms timeout`
           : `docker exited with code ${code}${signal ? `, signal ${signal}` : ""}`
       );
       err.code = code;
       err.signal = signal;
+      err.timedOut = timedOut;
+      err.timeoutKill = timedOut;
+      err.repeatKilled = wasRepeatKilled;
+      err.repeatInfo = finalRepeatInfo;
       err.lastResult = lastResult;
       err.outputTail = tail;
       reject(err);
     });
   });
 }
+
+export {
+  makeStreamingCollector,
+  runDockerStreaming,
+  REPEAT_CALL_THRESHOLD,
+  extractToolCalls,
+};
 
 // Poll interval in milliseconds (10 seconds)
 const POLL_INTERVAL_MS = 10000;
@@ -112,12 +304,9 @@ const MAX_CONCURRENT = 1;
 // 2026-08-31: fixed to actually match queue.sh's TASK_TIMEOUT_MIN=25
 // (same cline#5842 rationale - no legitimate task run needs 120 min, a
 // stuck one has no reason to keep the VM's one MAX_CONCURRENT slot that
-// long). NOTE: poller.mjs still has no equivalent of queue.sh's
-// REPEAT_CALL_THRESHOLD tool-call-repetition detector - that part of the
-// "apply to both stacks" mitigation was never actually ported here
-// despite AGENT-RULES.md #15 saying it was. Porting it needs cline's
-// --json tool-call event schema confirmed first (not yet done, cut short
-// to control cost) - flagged as a follow-up, not silently claimed done.
+// long). Ported in AUDIT-10-b: REPEAT_CALL_THRESHOLD tool-call-repetition
+// detector is now active in makeStreamingCollector() and wired into
+// runDockerStreaming() alongside CLINE_TIMEOUT_MS with child.kill("SIGKILL").
 const CLINE_TIMEOUT_MS = 25 * 60 * 1000;
 
 // Lane → { model, promptFile }
@@ -148,6 +337,48 @@ const LANE_CONFIG = {
 // it needs the same retry-with-recovery-path treatment as everything else
 // here rather than a silent false "готова".
 const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|No deployments available|RateLimitError|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|proxy\/HTTP error|hook dispatch failed|operation timed out|агент ничего не ответил/i;
+
+// AUDIT-05-a / AUDIT-05-b: Marker for tasks killed by CLINE_TIMEOUT_MS watchdog.
+// Deliberately NOT included in CAPACITY_RE: CAPACITY_RE is for transient provider
+// capacity/rate-limit issues where retrying 3 times after a 2-minute pause can succeed.
+// A timeout kill indicates an oversized/overly complex prompt or an infinite tool loop
+// (cline#5842). Retrying the identical prompt unchanged would waste 3 x 25 min = 75 min
+// on a single-concurrency VM (MAX_CONCURRENT=1) and burn tokens. It has dedicated
+// immediate-exit handling in processTask().
+const CLINE_TIMEOUT_KILL_MARKER = "<<CLINE_TIMEOUT_KILL>>";
+
+function isTimeoutKillResult(result) {
+  return Boolean(
+    result && (
+      result.timeoutKill ||
+      (typeof result.message === "string" && result.message.includes(CLINE_TIMEOUT_KILL_MARKER))
+    )
+  );
+}
+
+// AUDIT-10-c (2026-10-09): marker for tasks killed by the AUDIT-10-b repeat
+// detector (REPEAT_CALL_THRESHOLD), plus the escalation model for the retry
+// that follows. Ported from queue.sh's universal loop-escalation rule
+// (escalate_model_for, 2026-08-31: "This applies to EVERY task's retry
+// after a confirmed loop ... regardless of lane or how the task was
+// originally classified - the trigger is the observed behavior (a real
+// detected loop), not a prediction about the task shape"). There the next
+// lane comes from the config.yaml fallback graph via queue-fallback-next.py;
+// the VM poller has neither of those (local-queue infrastructure), so the
+// single hop is pinned here: plexus-research, the vetted anti-loop model
+// queue.sh's own 2026-08-31 rule named for exactly this kill (a real lane
+// in config.yaml, gemini-2.5-pro-backed, confirmed present there today).
+const REPEAT_CALL_KILL_MARKER = "<<REPEAT_CALL_KILL>>";
+const REPEAT_KILL_ESCALATION_MODEL = "plexus-research";
+
+function isRepeatKillResult(result) {
+  return Boolean(
+    result && (
+      result.repeatKill ||
+      (typeof result.message === "string" && result.message.includes(REPEAT_CALL_KILL_MARKER))
+    )
+  );
+}
 // 2026-09-03: CAPACITY_RE нельзя применять к ОТВЕТУ МОДЕЛИ - только к
 // конверту ошибки. У локальной очереди тот же шаблон ловил собственную
 // прозу задачи: подзадача «добавить в CAPACITY_RE термины
@@ -762,10 +993,10 @@ async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane
   }
 
   // Load role-specific prompt and model for this lane. An explicit
-  // modelOverride (from a "coder"/"cheap"/"gemini" button tap) bypasses the
+  // modelOverride (from a "coder"/"cheap"/"gemini" button tap, or set by
+  // processTask's AUDIT-10-c repeat-kill escalation) bypasses the
   // lane's own model choice but keeps its system prompt and history scope -
-  // the founder picked a different model for the same role, not a
-  // different role.
+  // a different model for the same role, not a different role.
   const { model: laneModel, systemPrompt } = await loadRolePrompt(lane);
   const model = modelOverride || laneModel;
 
@@ -894,6 +1125,37 @@ async function doWork(db, text, litellmMasterKey, creatorId, currentTaskId, lane
   console.log(`[${new Date().toISOString()}] Docker failed after ${MAX_ATTEMPTS} attempt(s), final exit code: ${code}`);
   if (err.outputTail) {
     console.log(`[${new Date().toISOString()}] Last ${err.outputTail.length} chars of output before failure:\n${err.outputTail}`);
+  }
+  // AUDIT-05-a / AUDIT-05-b: a CLINE_TIMEOUT_MS kill surfaces as code null / SIGKILL and
+  // would otherwise be indistinguishable from any other docker exit-code
+  // failure on the generic path below. Emit a fixed marker instead.
+  // Set timeoutKill: true and capacitySource explicitly so it never matches
+  // CAPACITY_RE even if stderr/tail contains capacity-like keywords.
+  if (err.timedOut || err.timeoutKill || (typeof err.message === "string" && /docker killed after \d+ms timeout/.test(err.message))) {
+    return {
+      success: false,
+      message: truncate(`${CLINE_TIMEOUT_KILL_MARKER} агент убит по таймауту CLINE_TIMEOUT_MS: ${first}`),
+      timeoutKill: true,
+      capacitySource: CLINE_TIMEOUT_KILL_MARKER,
+    };
+  }
+  // AUDIT-10-b: a REPEAT_CALL_THRESHOLD kill surfaces as code null / SIGKILL.
+  // Emit a fixed marker instead of generic exit-code failure.
+  // AUDIT-10-c: also set repeatKill + capacitySource to the marker itself -
+  // the same shape as the timeout-kill branch above - so processTask's
+  // escalation check can recognize the kill structurally, and CAPACITY_RE
+  // can never false-positive on the repeated tool call's args snippet
+  // embedded in the message (an args string can legitimately contain
+  // capacity-shaped words like "operation timed out").
+  if (err.repeatKilled || (typeof err.message === "string" && /repeated tool call detected/.test(err.message))) {
+    const info = err.repeatInfo;
+    const detail = info ? `${info.count}x ${info.name}: ${(info.args || "").slice(0, 80)}` : first;
+    return {
+      success: false,
+      message: truncate(`${REPEAT_CALL_KILL_MARKER} агент убит по повтору вызова инструмента (${detail})`),
+      repeatKill: true,
+      capacitySource: REPEAT_CALL_KILL_MARKER,
+    };
   }
   return { success: false, message: truncate(`код ${code}: ${first}`) };
 }
@@ -1092,11 +1354,53 @@ async function processTask(db, task, botToken, litellmMasterKey, githubDispatchT
     // before treating it as a real failure. Loop lives here (inside one
     // processTask call), not across poll iterations, so no persisted
     // retry-count state is needed.
+    // AUDIT-10-c: `escalated` is the per-task flag mirroring queue.sh's
+    // counter of the same name (initialized once per task line there,
+    // once per processTask call here) - the repeat-kill escalation below
+    // may fire at most once per task, never once per attempt.
+    let escalated = false;
     let attempt = 0;
     let cancelled = false;
     do {
       attempt++;
       result = await doWork(db, effectiveText, litellmMasterKey, task.creator_id, taskId, lane, modelOverride);
+      // AUDIT-05-b: own handling for timeout-kill (CLINE_TIMEOUT_MS).
+      // A task killed by timeout (oversized prompt, stuck agent / loop) must NOT
+      // auto-retry 3 times like CAPACITY_RE. Retrying an identical oversized prompt
+      // for another 25 minutes will not help, wastes token costs, and blocks the
+      // single-slot VM (MAX_CONCURRENT=1) for ~75 minutes. Break immediately.
+      if (isTimeoutKillResult(result)) {
+        console.log(`[${new Date().toISOString()}] Task ${taskId}: timeout-kill (CLINE_TIMEOUT_MS) detected - skipping retry for oversized/stuck prompt`);
+        break;
+      }
+      // AUDIT-10-c: port of queue.sh's universal loop-escalation rule
+      // (escalate_model_for, 2026-08-31). A repeat-detector kill is a
+      // confirmed cline#5842 loop, not a maybe-busy provider, so it is
+      // handled BEFORE the CAPACITY_RE branch below - same order as in
+      // queue.sh, so a confirmed loop never waits on whether the output
+      // also happens to contain a capacity-shaped string. The next retry
+      // attempt (if this task still has one left in this loop - the
+      // `continue` lands on the same while condition, so a repeat-kill on
+      // the final attempt just ends the loop) runs on plexus-research
+      // instead of the lane's own model, via the same modelOverride
+      // mechanism as a founder's coder/cheap/gemini button pick: a
+      // different model for the same role, keeping the lane's system
+      // prompt and history scope. The `escalated` flag makes this fire at
+      // most once per task; a second repeat-kill, on any model, fails the
+      // task exactly as before. No capacity backoff wait before the
+      // escalated retry - queue.sh's escalation `continue`s immediately
+      // too; the 2-minute pause is for provider recovery, which is not
+      // what happened here.
+      if (!result.success && isRepeatKillResult(result)) {
+        if (escalated || modelOverride === REPEAT_KILL_ESCALATION_MODEL) {
+          console.log(`[${new Date().toISOString()}] Task ${taskId}: repeat-detector kill again${modelOverride === REPEAT_KILL_ESCALATION_MODEL ? " (already running on the escalation model)" : " (already escalated once)"} - failing the task`);
+          break;
+        }
+        escalated = true;
+        modelOverride = REPEAT_KILL_ESCALATION_MODEL;
+        console.log(`[${new Date().toISOString()}] Task ${taskId}: repeat-detector kill (confirmed cline#5842 loop) - next retry attempt escalates to ${REPEAT_KILL_ESCALATION_MODEL} instead of lane ${lane}`);
+        continue;
+      }
       if (result.success || !CAPACITY_RE.test(capacityText(result)) || attempt >= CAPACITY_RETRY_MAX) break;
       if (attempt === 1) {
         await notifyTelegram(
