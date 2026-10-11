@@ -1526,7 +1526,15 @@ async function runDshOnce(provider, text) {
   // <file> --dump-config` run: instructionFileCandidates: ["AGENTS.md"]
   // against plexus-doc's real files produced full AGENTS.md content and
   // zero CLAUDE.md content, saving ~2.4KB/call with no loss.
-  const patchContent = `- id: agent-default-model\n  config:\n    provider: ${provider}\n    model: ${cfg.model}\n- id: agent-instructions\n  config:\n    maxBytes: 32768\n    instructionFileCandidates: ["AGENTS.md"]\n`;
+  // 2026-10-11, PLEXUS-S13-UNBLOCK: для [NO-TRIAGE] не грузим
+  // AGENTS.md вообще. 8K токенов инструкций репозитория перебивают
+  // TPM-лимит 8000 у groq, задача не влезает. Leaf-level задача с
+  // [NO-TRIAGE] не нуждается в repo-инструкциях. Для остальных —
+  // как было (32768, ["AGENTS.md"]).
+  const noTriage = typeof text === "string" && text.includes("[NO-TRIAGE]");
+  const agentsBytes = noTriage ? 1024 : 32768;
+  const agentsFileLine = noTriage ? "" : '\n    instructionFileCandidates: ["AGENTS.md"]';
+  const patchContent = `- id: agent-default-model\n  config:\n    provider: ${provider}\n    model: ${cfg.model}\n- id: agent-instructions\n  config:\n    maxBytes: ${agentsBytes}${agentsFileLine}\n`;
   const patchFile = path.join(os.tmpdir(), `dsh-patch-${Date.now()}-${Math.random().toString(36).slice(2)}.yml`);
   await writeFile(patchFile, patchContent, "utf-8");
   try {
@@ -1916,7 +1924,7 @@ async function triageCheck(text, payloadFact) {
 
 // Inserts each subtask as a real, independent plain-text row - no files,
 // no separate repo, matching this queue's actual `tasks.text` shape.
-//
+// 
 // GHQ2-c, 2026-09-14 (built directly by Claude Code, founder's own
 // real-time call - the local queue's own automated attempts at this
 // exhausted every model without converging). Real gap: subtasks are
@@ -1928,7 +1936,35 @@ async function triageCheck(text, payloadFact) {
 // the order is embedded directly in `text` as a `[SIB i/n parent:P]`
 // marker, parsed back out by siblingOrderOk() below before a subtask is
 // ever allowed to run.
+// 2026-10-11, PLEXUS-S13-UNBLOCK: не дробить глубже 2 уровней.
+// Ребёнок ребёнка редко становится leaf-level; цепочки растут, ни
+// один лист не достигается (rope-asymmetry: 11 диспатчей → 9 сплитов
+// → 1 результат). Если это ребёнок — не дробить, выполнять как есть.
 async function triageSplit(parentTask, decision) {
+  // Вычисляем глубину сплита: парсим [SIB i/n parent:P] из текста родителя
+  // и рекурсивно считаем предков через БД.
+  let depth = 0;
+  const parentInfo = extractParentAndSiblingInfo(parentTask, parentTask.text);
+  if (parentInfo && parentInfo.parentId) {
+    let currentParentId = parentInfo.parentId;
+    while (currentParentId) {
+      depth++;
+      if (depth >= 2) break;
+      const res = await client.execute({
+        sql: "SELECT text FROM tasks WHERE id = ?",
+        args: [currentParentId],
+      });
+      if (!res.rows.length) break;
+      const info = extractParentAndSiblingInfo(null, res.rows[0].text);
+      if (!info || !info.parentId) break;
+      currentParentId = info.parentId;
+    }
+  }
+  if (depth >= 2) {
+    console.log(`[${new Date().toISOString()}] TRIAGE: depth ${depth} reached, not splitting further`);
+    return { split: false, ids: [] };
+  }
+
   const ids = [];
   const total = decision.subtasks.length;
   for (let i = 0; i < total; i++) {
