@@ -242,7 +242,9 @@ jobs:
           # API-ключу. Токен живёт ~1 час — на одну задачу хватает.
           echo "$GCP_SA_KEY" > /tmp/gcp-sa.json
           gcloud auth activate-service-account --key-file=/tmp/gcp-sa.json --quiet
-          echo "VERTEX_ACCESS_TOKEN=$(gcloud auth print-access-token)" >> "$GITHUB_ENV"
+          TOKEN=$(gcloud auth print-access-token)
+          echo "::add-mask::$TOKEN"
+          echo "VERTEX_ACCESS_TOKEN=$TOKEN" >> "$GITHUB_ENV"
           echo "VERTEX_PROJECT_ID=$GCP_PROJECT_ID" >> "$GITHUB_ENV"
           echo "VERTEX_LOCATION=global" >> "$GITHUB_ENV"
           rm -f /tmp/gcp-sa.json
@@ -250,8 +252,8 @@ jobs:
       - name: write dsh direct-provider settings
         run: |
           mkdir -p ~/.dsh
-          # 2026-10-07: разделитель heredoc без кавычек - ${VERTEX_PROJECT_ID} и
-          # ${VERTEX_LOCATION} в vertex-блоке ниже должны раскрыться в реальные
+          # 2026-10-07: разделитель heredoc без кавычек - $VERTEX_PROJECT_ID и
+          # $VERTEX_LOCATION в vertex-блоке ниже должны раскрыться в реальные
           # значения env на момент генерации (приносит шаг vertex-auth выше).
           # В остальных блоках heredoc $ не встречается - разэкранирование
           # ничего в них не меняет.
@@ -299,7 +301,7 @@ jobs:
               # класс пропуска, что у google до 2026-10-04). baseURL собирается
               # из env на момент генерации settings.yaml, значения приносит
               # шаг vertex-auth выше; поэтому heredoc этого шага раскрывает
-              # ${...} (разделитель без кавычек).
+              # <...> (разделитель без кавычек).
               vertex:
                 apiKeyEnv: VERTEX_ACCESS_TOKEN
                 api: openai-completions
@@ -369,6 +371,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
         run: |
+          [ -n "$TELEGRAM_ADMIN_CHAT_ID" ] || exit 0
           message="Task Executor FAILED: workflow '${GITHUB_WORKFLOW}' in ${GITHUB_REPOSITORY} (run ${GITHUB_RUN_NUMBER}, attempt ${GITHUB_RUN_ATTEMPT}) failed. Logs: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           curl -sS --fail -X POST \
             --data-urlencode "chat_id=${TELEGRAM_ADMIN_CHAT_ID}" \
