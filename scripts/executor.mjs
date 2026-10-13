@@ -1442,7 +1442,12 @@ function checkoutTaskBranch(text) {
 // as fallback pair - Google quota errors (RESOURCE_EXHAUSTED, quota
 // exceeded) trigger auto-switch to Vertex. Both use native Google SDK
 // compatible endpoints, not litellm prefixes.
-const PROVIDER_ORDER = ["groq", "nvidia", "mistral", "google", "vertex"];
+// 2026-10-13: groq временно исключён из ротации (провайдер падает
+// capacity-shaped на каждой задаче, причина — GROQ-REASONING-FAILURE
+// в бэклоге). PROVIDER_CONFIG.groq НЕ удалён — вернётся одной строкой,
+// когда причина разобрана. Порядок после исключения: nvidia →
+// mistral → google → vertex.
+const PROVIDER_ORDER = ["nvidia", "mistral", "google", "vertex"];
 const PROVIDER_CONFIG = {
   groq: { baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY", model: "openai/gpt-oss-120b" },
   nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", model: "nvidia/nemotron-3-ultra-550b-a55b" },
