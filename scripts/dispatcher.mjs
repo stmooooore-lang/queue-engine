@@ -44,10 +44,16 @@ import { execFileSync } from "node:child_process";
 import { parseSiblingMarker, makeSiblingOrderOk } from "./sibling-parser.mjs";
 import {
   redactSecrets,
+  redactSecrets as mask_secrets,
+  installSecretRedactionHook,
   classifyProgressVsLoop,
   classifyTimeoutKill,
   detectLoop,
+  detectStuckTask,
 } from "./executor.mjs";
+
+// Ensure all console logs, errors and stream outputs in dispatcher are masked against secret leaks
+installSecretRedactionHook();
 
 const client = createClient({ url: process.env.TURSO_DATABASE_URL || "file::memory:", authToken: process.env.TURSO_AUTH_TOKEN });
 
@@ -65,18 +71,23 @@ const REPO = process.env.GITHUB_REPOSITORY || "stmooooore-lang/queue-engine"; //
 // waits for the next one. `gh run list --json status` returns real GitHub
 // Actions run status strings ("queued", "in_progress", "completed", ...).
 function executorAlreadyRunning() {
-  const out = execFileSync(
-    "gh",
-    ["run", "list", "--workflow", "executor.yml", "--repo", REPO, "--json", "status", "--limit", "20"],
-    { env: process.env }
-  ).toString();
-  const runs = JSON.parse(out);
-  return runs.some((r) => r.status === "queued" || r.status === "in_progress");
+  try {
+    const out = execFileSync(
+      "gh",
+      ["run", "list", "--workflow", "executor.yml", "--repo", REPO, "--json", "status", "--limit", "20"],
+      { env: process.env, stdio: "pipe" }
+    ).toString();
+    const runs = JSON.parse(out);
+    return runs.some((r) => r.status === "queued" || r.status === "in_progress");
+  } catch (e) {
+    console.error(mask_secrets(`[${new Date().toISOString()}] executorAlreadyRunning check failed: ${e.message}`));
+    return false;
+  }
 }
 
 async function main() {
   if (executorAlreadyRunning()) {
-    console.log(`[${new Date().toISOString()}] executor.yml already has a run in flight, dispatching nothing this tick`);
+    console.log(mask_secrets(`[${new Date().toISOString()}] executor.yml already has a run in flight, dispatching nothing this tick`));
     return;
   }
 
@@ -86,22 +97,30 @@ async function main() {
 
   for (const task of pending.rows) {
     if (!(await siblingOrderOk(task))) {
-      console.log(`[${new Date().toISOString()}] task ${task.id}: waiting on an earlier unaccepted sibling, skipping`);
+      console.log(mask_secrets(`[${new Date().toISOString()}] task ${task.id}: waiting on an earlier unaccepted sibling, skipping`));
+      continue;
+    }
+    const stuckCheck = detectStuckTask(task);
+    if (stuckCheck.stuck) {
+      console.log(mask_secrets(`[${new Date().toISOString()}] task ${task.id}: detected stuck loop (${stuckCheck.reason}), skipping dispatch`));
       continue;
     }
     try {
-      execFileSync("gh", ["workflow", "run", "executor.yml", "--repo", REPO, "-f", `taskId=${task.id}`], {
-        stdio: "inherit",
+      const out = execFileSync("gh", ["workflow", "run", "executor.yml", "--repo", REPO, "-f", `taskId=${task.id}`], {
+        stdio: "pipe",
         env: process.env,
       });
-      console.log(`[${new Date().toISOString()}] dispatched executor.yml for task ${task.id}, stopping - one at a time`);
+      if (out && out.length > 0) {
+        console.log(mask_secrets(out.toString().trim()));
+      }
+      console.log(mask_secrets(`[${new Date().toISOString()}] dispatched executor.yml for task ${task.id}, stopping - one at a time`));
       return;
     } catch (e) {
-      console.error(`[${new Date().toISOString()}] failed to dispatch task ${task.id}: ${redactSecrets(e.message)}`);
+      console.error(mask_secrets(`[${new Date().toISOString()}] failed to dispatch task ${task.id}: ${e.message}`));
     }
   }
 
-  console.log(`[${new Date().toISOString()}] tick done: nothing ready to dispatch out of ${pending.rows.length} pending`);
+  console.log(mask_secrets(`[${new Date().toISOString()}] tick done: nothing ready to dispatch out of ${pending.rows.length} pending`));
 }
 
 export {
@@ -111,14 +130,17 @@ export {
   main,
   client,
   redactSecrets,
+  mask_secrets,
+  installSecretRedactionHook,
   classifyProgressVsLoop,
   classifyTimeoutKill,
   detectLoop,
+  detectStuckTask,
 };
 
 if (process.argv[1] && process.argv[1].endsWith('dispatcher.mjs')) {
   main().catch((e) => {
-    console.error(redactSecrets(e?.message || e));
+    console.error(mask_secrets(e?.stack || e?.message || e));
     process.exit(1);
   });
 }

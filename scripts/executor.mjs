@@ -44,6 +44,180 @@ import {
   makeSiblingOrderOk,
 } from "./sibling-parser.mjs";
 
+// Preserve original console and stream write methods for clean internal logging
+const originalConsoleLog = console.log.bind(console);
+const originalConsoleError = console.error.bind(console);
+const originalConsoleWarn = console.warn.bind(console);
+const originalConsoleInfo = console.info.bind(console);
+
+let hookInstalled = false;
+let inHook = false;
+
+/**
+ * Sanitizes arguments passed to console and stream output.
+ */
+function sanitizeLogArg(arg) {
+  if (typeof arg === "string") {
+    return redactSecrets(arg);
+  }
+  if (arg instanceof Error) {
+    const err = new Error(redactSecrets(arg.message));
+    err.name = arg.name;
+    for (const key of Object.keys(arg)) {
+      if (key !== "message" && key !== "stack" && key !== "name") {
+        try {
+          err[key] = typeof arg[key] === "string" ? redactSecrets(arg[key]) : arg[key];
+        } catch {}
+      }
+    }
+    if (arg.stack) err.stack = redactSecrets(arg.stack);
+    return err;
+  }
+  if (typeof arg === "object" && arg !== null) {
+    try {
+      const json = JSON.stringify(arg);
+      if (json) {
+        return JSON.parse(redactSecrets(json));
+      }
+    } catch {
+      return arg;
+    }
+  }
+  return arg;
+}
+
+/**
+ * Installs logging hooks on console and standard output/error streams
+ * to ensure sensitive credentials are never leaked to logs or terminals.
+ */
+function installSecretRedactionHook() {
+  if (hookInstalled) return;
+  hookInstalled = true;
+
+  console.log = function (...args) {
+    if (inHook) {
+      originalConsoleLog(...args);
+      return;
+    }
+    inHook = true;
+    try {
+      originalConsoleLog(...args.map(sanitizeLogArg));
+    } finally {
+      inHook = false;
+    }
+  };
+
+  console.error = function (...args) {
+    if (inHook) {
+      originalConsoleError(...args);
+      return;
+    }
+    inHook = true;
+    try {
+      originalConsoleError(...args.map(sanitizeLogArg));
+    } finally {
+      inHook = false;
+    }
+  };
+
+  console.warn = function (...args) {
+    if (inHook) {
+      originalConsoleWarn(...args);
+      return;
+    }
+    inHook = true;
+    try {
+      originalConsoleWarn(...args.map(sanitizeLogArg));
+    } finally {
+      inHook = false;
+    }
+  };
+
+  console.info = function (...args) {
+    if (inHook) {
+      originalConsoleInfo(...args);
+      return;
+    }
+    inHook = true;
+    try {
+      originalConsoleInfo(...args.map(sanitizeLogArg));
+    } finally {
+      inHook = false;
+    }
+  };
+
+  const hookStream = (stream) => {
+    if (!stream || typeof stream.write !== "function") return;
+    const origWrite = stream.write.bind(stream);
+    stream.write = function (chunk, encoding, callback) {
+      if (inHook) {
+        return origWrite(chunk, encoding, callback);
+      }
+      inHook = true;
+      try {
+        if (typeof chunk === "string") {
+          return origWrite(redactSecrets(chunk), encoding, callback);
+        }
+        return origWrite(chunk, encoding, callback);
+      } finally {
+        inHook = false;
+      }
+    };
+  };
+
+  hookStream(process.stdout);
+  hookStream(process.stderr);
+}
+
+// Automatically install secret redaction hook on module load
+installSecretRedactionHook();
+
+/**
+ * Gathers active sensitive credentials from environment variables and loaded configs
+ * for dynamic literal value redaction.
+ */
+function getLiveSecrets() {
+  const secrets = [];
+  const sensitiveKeyRe = /(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTH|CREDENTIAL|PRIVATE)/i;
+  const skipValues = new Set([
+    "true", "false", "none", "null", "undefined", "memory", "default",
+    "localhost", "danger-full-access", "unused", "file::memory:", "standard",
+  ]);
+
+  if (typeof process !== "undefined" && process.env) {
+    for (const [key, val] of Object.entries(process.env)) {
+      if (!val || typeof val !== "string") continue;
+      const trimmed = val.trim();
+      if (trimmed.length < 8) continue;
+      if (skipValues.has(trimmed.toLowerCase())) continue;
+
+      if (
+        sensitiveKeyRe.test(key) ||
+        key.startsWith("TURSO_") ||
+        key.startsWith("TELEGRAM_") ||
+        key.startsWith("REPO_") ||
+        key.startsWith("DISPATCH_") ||
+        key.startsWith("GH_") ||
+        key.startsWith("GITHUB_")
+      ) {
+        secrets.push({ name: key, value: trimmed });
+      }
+    }
+  }
+
+  try {
+    if (typeof tursoCreds !== "undefined" && tursoCreds?.authToken) {
+      const trimmed = String(tursoCreds.authToken).trim();
+      if (trimmed.length >= 8 && !skipValues.has(trimmed.toLowerCase())) {
+        secrets.push({ name: "TURSO_AUTH_TOKEN", value: trimmed });
+      }
+    }
+  } catch {}
+
+  secrets.sort((a, b) => b.value.length - a.value.length);
+  return secrets;
+}
+
 /**
  * Loads Turso database credentials from environment variables or keys.txt.
  * Falls back to in-memory database if no credentials are configured.
@@ -1536,34 +1710,142 @@ function sanitizeModelText(text) {
   return t;
 }
 
-// GHQ2-e, 2026-09-14: reuses the exact same three real credential shapes
-// `scripts/pre-commit-secret-scan.sh` already checks for at commit time -
-// same repo, same real secrets it actually handles, just applied to a
-// model's runtime output instead of staged git content. Fails safe: a
-// regex that doesn't match anything just leaves the text untouched, never
-// throws.
+// GHQ2-e, 2026-09-14: credential redaction guard.
+// CLOUD-MAINT-c-e-progress-loop-distinction-b: comprehensive secret sanitization
+// covering API keys, tokens, passwords, private keys, cloud service account credentials,
+// and dynamic environment secrets before logging, printing, or storage.
 function redactSecrets(text) {
   let out = String(text || "");
   let hit = false;
-  // GCP service-account JSON key - both markers together, same
-  // specificity rule as the pre-commit script (avoids flagging ordinary
-  // text that only mentions one of the two in isolation).
+
+  // 1. GCP service-account JSON key - both markers together (preserves contract of test-chat-alerts)
   if (/"type"\s*:\s*"service_account"/.test(out) && /BEGIN PRIVATE KEY/.test(out)) {
     out = out.replace(/\{[^{}]*"type"\s*:\s*"service_account"[\s\S]*?\}/g, "[REDACTED: GCP service-account JSON key]");
     hit = true;
   }
-  // LiteLLM sk-... style key
-  if (/sk-[A-Za-z0-9_-]{20,}/.test(out)) {
-    out = out.replace(/sk-[A-Za-z0-9_-]{20,}/g, "[REDACTED: sk-... key]");
+
+  // 2. Standalone PEM private keys (RSA, EC, DSA, OPENSSH, or unlabelled)
+  const pemKeyRe = /-----BEGIN (?:[A-Z0-9_-]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9_-]+ )?PRIVATE KEY-----/g;
+  if (pemKeyRe.test(out)) {
+    out = out.replace(pemKeyRe, "[REDACTED: private key]");
     hit = true;
   }
-  // *MASTER_KEY* assigned a 64-char hex value (openssl rand -hex 32 shape)
+
+  // 3. LiteLLM / OpenAI / Anthropic sk-... style key
+  if (/\bsk-[A-Za-z0-9_-]{20,}/.test(out)) {
+    out = out.replace(/\bsk-[A-Za-z0-9_-]{20,}/g, "[REDACTED: sk-... key]");
+    hit = true;
+  }
+
+  // 4. *MASTER_KEY* assigned a 64-char hex value (openssl rand -hex 32 shape)
   const masterKeyRe = /(MASTER_KEY|LITELLM_MASTER_KEY)([\s]*[:=][\s]*)["']?[a-f0-9]{64}["']?/gi;
   if (masterKeyRe.test(out)) {
     out = out.replace(masterKeyRe, "$1$2[REDACTED: master key]");
     hit = true;
   }
-  if (hit) console.log(`[${new Date().toISOString()}] secret-leak guard: redacted real credential shape(s) from task result before writing/notifying`);
+
+  // 5. Provider-specific API keys & tokens
+  // Groq API keys (gsk_...)
+  if (/\bgsk_[A-Za-z0-9_-]{20,}\b/.test(out)) {
+    out = out.replace(/\bgsk_[A-Za-z0-9_-]{20,}\b/g, "[REDACTED: groq key]");
+    hit = true;
+  }
+  // NVIDIA API keys (nvapi-...)
+  if (/\bnvapi-[A-Za-z0-9_-]{20,}\b/.test(out)) {
+    out = out.replace(/\bnvapi-[A-Za-z0-9_-]{20,}\b/g, "[REDACTED: nvidia key]");
+    hit = true;
+  }
+  // Google / Gemini API keys (AIzaSy...)
+  if (/\bAIzaSy[A-Za-z0-9_-]{20,}\b/.test(out)) {
+    out = out.replace(/\bAIzaSy[A-Za-z0-9_-]{20,}\b/g, "[REDACTED: google key]");
+    hit = true;
+  }
+  // Vertex AI OAuth2 access tokens (ya29....)
+  if (/\bya29\.[A-Za-z0-9_-]{20,}\b/.test(out)) {
+    out = out.replace(/\bya29\.[A-Za-z0-9_-]{20,}\b/g, "[REDACTED: vertex token]");
+    hit = true;
+  }
+  // GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_, github_pat_)
+  const ghTokenRe = /\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g;
+  if (ghTokenRe.test(out)) {
+    out = out.replace(ghTokenRe, "[REDACTED: GitHub token]");
+    hit = true;
+  }
+
+  // 6. Telegram Bot tokens & URLs
+  const tgUrlRe = /(https:\/\/api\.telegram\.org\/bot)[^\/\s]+(\/[^\s]*)?/gi;
+  if (tgUrlRe.test(out)) {
+    out = out.replace(tgUrlRe, "$1[REDACTED: Telegram bot token]$2");
+    hit = true;
+  }
+  const tgTokenRe = /\b\d{8,12}:[A-Za-z0-9_-]{35}\b/g;
+  if (tgTokenRe.test(out)) {
+    out = out.replace(tgTokenRe, "[REDACTED: Telegram bot token]");
+    hit = true;
+  }
+
+  // 7. Embedded basic authentication credentials in URLs (e.g. https://user:pass@host)
+  const urlCredsRe = /(https?:\/\/)([^:\/\s@]+):([^@\/\s]+)@/g;
+  if (urlCredsRe.test(out)) {
+    out = out.replace(urlCredsRe, "$1$2:[REDACTED]@");
+    hit = true;
+  }
+
+  // 8. Sensitive URL query parameters (authToken=..., token=..., password=...)
+  const urlParamRe = /([?&](?:authToken|access_token|api[_-]?key|bot_token|token|password|passwd|secret)=)([^&\s]+)/gi;
+  if (urlParamRe.test(out)) {
+    out = out.replace(urlParamRe, "$1[REDACTED]");
+    hit = true;
+  }
+
+  // 9. Bearer tokens
+  const bearerRe = /(Bearer\s+)[A-Za-z0-9_\-\.+=]{16,}/gi;
+  if (bearerRe.test(out)) {
+    out = out.replace(bearerRe, "$1[REDACTED: token]");
+    hit = true;
+  }
+
+  // 10. JWT tokens
+  const jwtRe = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g;
+  if (jwtRe.test(out)) {
+    out = out.replace(jwtRe, "[REDACTED: JWT token]");
+    hit = true;
+  }
+
+  // 11. Sensitive assignment lines (VAR=value, VAR: value) in configs/env-dumps/logs
+  const assignRe = /\b([A-Za-z0-9_-]*(?:API_KEY|AUTH_TOKEN|ACCESS_TOKEN|BOT_TOKEN|REPO_TOKEN|DISPATCH_TOKEN|TURSO_AUTH|ADMIN_BOT_TOKEN|TELEGRAM_BOT_TOKEN|PRIVATE_KEY|PASSWORD|PASSWD|SECRET|CLIENT_SECRET)[A-Za-z0-9_-]*)\s*([:=])\s*(["']?)([^"'\s\r\n]{4,})\3/gi;
+  if (assignRe.test(out)) {
+    out = out.replace(assignRe, "$1$2$3[REDACTED: $1]$3");
+    hit = true;
+  }
+
+  // 12. JSON sensitive key-value pairs ("password": "...", "apiKey": "...")
+  const jsonKeyRe = /(["'](?:[^"']*(?:api[_-]?key|auth[_-]?token|access[_-]?token|bot[_-]?token|repo[_-]?token|token|password|passwd|secret|private[_-]?key)[^"']*)["']\s*:\s*)(["'])([^"'\r\n]{4,})\2/gi;
+  if (jsonKeyRe.test(out)) {
+    out = out.replace(jsonKeyRe, "$1$2[REDACTED]$2");
+    hit = true;
+  }
+
+  // 13. CLI command-line flags with secrets (--password=..., --token ...)
+  const cliOptionRe = /(--(?:password|token|api[_-]?key|secret|auth|access[_-]?token)[=\s]+)(["']?)[^\s"']+\2/gi;
+  if (cliOptionRe.test(out)) {
+    out = out.replace(cliOptionRe, "$1$2[REDACTED]$2");
+    hit = true;
+  }
+
+  // 14. Dynamic redaction of live environment secrets and loaded tokens
+  const liveSecrets = getLiveSecrets();
+  for (const s of liveSecrets) {
+    if (out.includes(s.value)) {
+      out = out.replaceAll(s.value, `[REDACTED: ${s.name}]`);
+      hit = true;
+    }
+  }
+
+  if (hit) {
+    const logFn = typeof originalConsoleLog === "function" ? originalConsoleLog : console.log;
+    logFn(`[${new Date().toISOString()}] secret-leak guard: redacted real credential shape(s) from task result before writing/notifying`);
+  }
   return out;
 }
 
@@ -1579,28 +1861,101 @@ function redactSecrets(text) {
 // progress reads as different text turn to turn even about the same
 // file (low overlap). Returns exactly "loop" or "progress" - matching
 // the local version's own two-value taxonomy, no third state invented.
-function classifyTimeoutKill(text) {
-  const clean = String(text || "").replace(/\x1b\[[0-9;]*m/g, "");
-  const segs = clean
-    .split(/^dsh: reasoning:\s*$/m)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (segs.length < 2) return "loop";
-  const words = (s) => new Set((s.toLowerCase().match(/[a-z0-9а-я_./-]{3,}/g)) || []);
+
+/**
+ * Classifies whether task execution represents forward progress or a repeating loop / stuck state.
+ *
+ * Compares consecutive reasoning segments using Jaccard word-set similarity.
+ *
+ * @param {string|string[]} input - dsh reasoning text or array of reasoning segments
+ * @param {object} [options]
+ * @param {number} [options.threshold=0.5] - Similarity threshold. avgSimilarity >= threshold -> "loop"
+ * @returns {{verdict: "progress"|"loop", avgSimilarity: number, segmentsCount: number, isLoop: boolean, isProgress: boolean}}
+ */
+function classifyProgressVsLoop(input, options = {}) {
+  const threshold = options.threshold ?? 0.5;
+  let segs = [];
+  if (Array.isArray(input)) {
+    segs = input.map((s) => String(s || "").trim()).filter(Boolean);
+  } else {
+    const clean = String(input || "").replace(/\x1b\[[0-9;]*m/g, "");
+    segs = clean
+      .split(/^dsh: reasoning:\s*$/m)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  // Fail-closed guard: if < 2 segments, cannot verify progression -> default to loop
+  if (segs.length < 2) {
+    return {
+      verdict: "loop",
+      avgSimilarity: 1.0,
+      segmentsCount: segs.length,
+      isLoop: true,
+      isProgress: false,
+    };
+  }
+
+  const words = (s) => new Set(s.toLowerCase().match(/[a-z0-9а-яё_./-]{3,}/gi) || []);
   let total = 0;
-  let count = 0;
+  let pairsCount = 0;
+
   for (let i = 1; i < segs.length; i++) {
     const wa = words(segs[i - 1]);
     const wb = words(segs[i]);
-    if (wa.size === 0 || wb.size === 0) { total += 0; count++; continue; }
+    // 2026-10-09 fix: if either segment has 0 recognizable words (e.g. non-Latin/non-Cyrillic,
+    // raw binary/ANSI corruption), do NOT count it as 0 similarity (which would falsely pull avg down
+    // and label verbatim repetition as "progress"). Skip the unreadable pair.
+    if (wa.size === 0 || wb.size === 0) {
+      continue;
+    }
     let inter = 0;
-    for (const w of wa) if (wb.has(w)) inter++;
-    const union = new Set([...wa, [...wb]]).size;
+    for (const w of wa) {
+      if (wb.has(w)) inter++;
+    }
+    const union = new Set([...wa, ...wb]).size;
     total += union === 0 ? 0 : inter / union;
-    count++;
+    pairsCount++;
   }
-  const avg = count > 0 ? total / count : 0;
-  return avg < 0.5 ? "progress" : "loop";
+
+  // If no valid word pairs could be compared, fail closed to 1.0 (loop)
+  const avg = pairsCount > 0 ? total / pairsCount : 1.0;
+  const isLoop = avg >= threshold;
+  const isProgress = !isLoop;
+  const verdict = isProgress ? "progress" : "loop";
+
+  return {
+    verdict,
+    avgSimilarity: avg,
+    segmentsCount: segs.length,
+    isLoop,
+    isProgress,
+  };
+}
+
+function classifyTimeoutKill(text) {
+  return classifyProgressVsLoop(text).verdict;
+}
+
+function detectLoop(input, threshold = 0.5) {
+  return classifyProgressVsLoop(input, { threshold }).isLoop;
+}
+
+/**
+ * Detects whether a task or execution is stuck in a loop across attempts/iterations.
+ *
+ * @param {object} task - Task record
+ * @param {object} [options]
+ * @param {number} [options.maxIterations=3] - Maximum allowed retry/loop iterations
+ * @returns {{stuck: boolean, reason?: string, iterationCount: number}}
+ */
+function detectStuckTask(task, options = {}) {
+  const maxIterations = options.maxIterations || 3;
+  const iterations = Number(task?.iteration_count || task?.retry_count || 0);
+  if (iterations >= maxIterations) {
+    return { stuck: true, reason: `Exceeded max iterations (${iterations}/${maxIterations})`, iterationCount: iterations };
+  }
+  return { stuck: false, iterationCount: iterations };
 }
 
 /**
@@ -2230,6 +2585,7 @@ export {
   claimTask,
   loadTursoCredentials,
   redactSecrets,
+  installSecretRedactionHook,
   notifyTelegram,
   escalateToFounder,
   checkoutTaskBranch,
@@ -2241,10 +2597,23 @@ export {
   parseDiagnosis,
   DIAGNOSE_VERDICTS,
   PERMANENT_VERDICTS,
+  // Provider contracts
+  PROVIDER_ORDER,
+  PROVIDER_CONFIG,
+  CAPACITY_RE,
+  nextProvider,
+  runDshOnce,
+  resolveVertexBaseURL,
+  client,
   // From sibling-parser.mjs (re-exported)
   parseSiblingMarker,
   buildSiblingMarker,
   makeSiblingOrderOk,
+  // Progress vs Loop & Stuck detection
+  classifyProgressVsLoop,
+  classifyTimeoutKill,
+  detectLoop,
+  detectStuckTask,
 };
 
 if (process.argv[1] && process.argv[1].endsWith('executor.mjs')) {
