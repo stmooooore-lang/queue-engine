@@ -228,7 +228,7 @@ function getLiveSecrets() {
 function loadTursoCredentials() {
   let url = process.env.TURSO_DATABASE_URL;
   let authToken = process.env.TURSO_AUTH_TOKEN;
-  if (url && authToken) {
+  if (url && (authToken || url.startsWith("file:"))) {
     return { url, authToken };
   }
 
@@ -1572,7 +1572,7 @@ async function pushTaskArtifacts() {
     console.log(`[${new Date().toISOString()}] push: committed and pushed ${status.split('\n').length} file(s) to origin/${branch}`);
     return true;
   } catch (err) {
-    console.log(`[${new Date().toISOString()}] push: FAILED - ${err.message}`);
+    console.log(`[${new Date().toISOString()}] push: FAILED - ${redactSecrets(err.message)}`);
     return false;
   }
 }
@@ -1587,7 +1587,7 @@ async function pushTaskArtifacts() {
 // (alnum, dot, dash, underscore, slash) - never interpolated unsanitized
 // into a shell command.
 function checkoutTaskBranch(text) {
-  const m = String(text || "").match(/\bbranch[:\s]+([A-Za-z0-9][A-Za-z0-9._\/-]*)/i);
+  const m = String(text || "").match(/\bbranch[:\s]+(?!directive\b)([A-Za-z0-9][A-Za-z0-9._\/-]*)/i);
   if (!m) {
     console.log(`[${new Date().toISOString()}] branch: none named in task text, staying on default checkout`);
     return null;
@@ -1600,7 +1600,7 @@ function checkoutTaskBranch(text) {
     console.log(`[${new Date().toISOString()}] branch: task named "${branch}", checked out (git reports: ${actual})`);
     return actual;
   } catch (err) {
-    console.log(`[${new Date().toISOString()}] branch: task named "${branch}" but checkout failed (${err.message}) - staying on default checkout`);
+    console.log(`[${new Date().toISOString()}] branch: task named "${branch}" but checkout failed (${redactSecrets(err.message)}) - staying on default checkout`);
     return null;
   }
 }
@@ -1668,7 +1668,7 @@ function resolveVertexBaseURL(cfg) {
 //
 // 2026-09-15 (CONFIG-ENRICH-b): added Google quota errors (RESOURCE_EXHAUSTED,
 // quota exceeded, 429) to trigger auto-switch from Google to Vertex.
-const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|No deployments available|RateLimitError|RATE_LIMIT|rate_limit_exceeded|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|hook dispatch failed|operation timed out|timed out after|RESOURCE_EXHAUSTED|quota exceeded|429|rate limit/i;
+const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|Service Unavailable|503|No deployments available|RateLimitError|RATE_LIMIT|rate_limit_exceeded|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|hook dispatch failed|operation timed out|timed out after|RESOURCE_EXHAUSTED|quota exceeded|429|413|Payload Too Large|rate limit/i;
 
 function nextProvider(current, tried) {
   const remaining = PROVIDER_ORDER.filter((p) => !tried.has(p));
@@ -1847,6 +1847,165 @@ function redactSecrets(text) {
     logFn(`[${new Date().toISOString()}] secret-leak guard: redacted real credential shape(s) from task result before writing/notifying`);
   }
   return out;
+}
+
+// ============================================================================
+// Structured Error Handling (CLOUD-MAINT-b-e)
+// Machine-readable error codes, contextual metadata, and recovery hints.
+// Ensures errors are structured objects rather than unstructured string blobs,
+// maintaining backward compatibility with standard Error semantics.
+// ============================================================================
+
+/**
+ * Standard machine-readable error codes.
+ */
+const ERROR_CODES = {
+  RATE_LIMIT: "ERR_RATE_LIMIT",
+  PAYLOAD_TOO_LARGE: "ERR_PAYLOAD_TOO_LARGE",
+  SERVICE_UNAVAILABLE: "ERR_SERVICE_UNAVAILABLE",
+  CAPACITY_EXHAUSTED: "ERR_CAPACITY_EXHAUSTED",
+  AUTH_FAILURE: "ERR_AUTH_FAILURE",
+  PERMISSION_DENIED: "ERR_PERMISSION_DENIED",
+  TIMEOUT_PROGRESS: "ERR_TIMEOUT_PROGRESS",
+  TIMEOUT_LOOP: "ERR_TIMEOUT_LOOP",
+  PROCESS_EXIT: "ERR_PROCESS_EXIT",
+  EMPTY_OUTPUT: "ERR_EMPTY_OUTPUT",
+  COMMAND_FAILED: "ERR_COMMAND_FAILED",
+  BOOTSTRAP_FAILURE: "ERR_BOOTSTRAP_FAILURE",
+  UNKNOWN: "ERR_UNKNOWN",
+};
+
+/**
+ * Standard recovery hints for structured failure remediation.
+ */
+const RECOVERY_HINTS = {
+  ROTATE_PROVIDER: "rotate_provider",
+  SPLIT_SUBTASKS: "split_subtasks",
+  ESCALATE_FOUNDER: "escalate_founder",
+  PERMANENT_BLOCKER: "permanent_blocker",
+  CHECK_CREDENTIALS: "check_credentials",
+  INSPECT_LOGS: "inspect_logs",
+  RETRY: "retry",
+};
+
+/**
+ * StructuredError encapsulates an error code, context metadata, and recovery hint.
+ * Inherits from standard Error to preserve message, stack, and instanceof Error checks.
+ */
+class StructuredError extends Error {
+  /**
+   * @param {string} message - Human-readable error message (redacted)
+   * @param {object} [options]
+   * @param {string} [options.code] - Machine-readable error code (from ERROR_CODES)
+   * @param {string} [options.category] - Error category ('capacity', 'auth', 'timeout', 'process', 'bootstrap')
+   * @param {object} [options.context] - Structured contextual metadata (provider, taskId, exitCode, snippets)
+   * @param {string} [options.recoveryHint] - Actionable recovery hint (from RECOVERY_HINTS)
+   * @param {string} [options.timestamp] - ISO timestamp
+   * @param {Error} [options.cause] - Underlying causal error
+   */
+  constructor(message, options = {}) {
+    const redactedMsg = redactSecrets(message || "An error occurred");
+    super(redactedMsg);
+    this.name = "StructuredError";
+    this.code = options.code || ERROR_CODES.UNKNOWN;
+    this.category = options.category || "unknown";
+    this.context = options.context ? JSON.parse(redactSecrets(JSON.stringify(options.context))) : {};
+    this.recoveryHint = options.recoveryHint || RECOVERY_HINTS.INSPECT_LOGS;
+    this.timestamp = options.timestamp || new Date().toISOString();
+    if (options.cause) {
+      this.cause = options.cause;
+    }
+    // Backward-compatibility properties
+    if (options.timeoutVerdict) this.timeoutVerdict = options.timeoutVerdict;
+    if (options.isLoop !== undefined) this.isLoop = options.isLoop;
+    if (options.failedPlugins) this.failedPlugins = options.failedPlugins;
+  }
+
+  toJSON() {
+    return {
+      name: this.name,
+      code: this.code,
+      category: this.category,
+      message: this.message,
+      context: this.context,
+      recoveryHint: this.recoveryHint,
+      timestamp: this.timestamp,
+    };
+  }
+}
+
+/**
+ * Maps raw error strings, exit codes, or Error instances into a StructuredError.
+ *
+ * @param {Error|string|unknown} rawError - Incoming error
+ * @param {object} [context] - Contextual metadata (provider, taskId, exitCode, etc.)
+ * @returns {StructuredError}
+ */
+function createStructuredError(rawError, context = {}) {
+  if (rawError instanceof StructuredError) {
+    if (context && Object.keys(context).length > 0) {
+      rawError.context = { ...rawError.context, ...context };
+    }
+    return rawError;
+  }
+
+  const msg = redactSecrets(rawError?.message || String(rawError || ""));
+  const exitCode = context.exitCode ?? rawError?.exitCode ?? (typeof rawError?.code === "number" ? rawError.code : null);
+
+  let code = ERROR_CODES.UNKNOWN;
+  let category = "unknown";
+  let recoveryHint = RECOVERY_HINTS.INSPECT_LOGS;
+
+  if (/401|unauthorized|invalid api key|invalid_api_key/i.test(msg)) {
+    code = ERROR_CODES.AUTH_FAILURE;
+    category = "auth";
+    recoveryHint = RECOVERY_HINTS.CHECK_CREDENTIALS;
+  } else if (/403|forbidden|permission denied|access denied/i.test(msg)) {
+    code = ERROR_CODES.PERMISSION_DENIED;
+    category = "auth";
+    recoveryHint = RECOVERY_HINTS.PERMANENT_BLOCKER;
+  } else if (/413|payload too large|token limit.*exceeded/i.test(msg)) {
+    code = ERROR_CODES.PAYLOAD_TOO_LARGE;
+    category = "capacity";
+    recoveryHint = RECOVERY_HINTS.SPLIT_SUBTASKS;
+  } else if (/429|rate_limit|rate limit|quota exceeded|RESOURCE_EXHAUSTED/i.test(msg)) {
+    code = ERROR_CODES.RATE_LIMIT;
+    category = "capacity";
+    recoveryHint = RECOVERY_HINTS.ROTATE_PROVIDER;
+  } else if (/503|service unavailable|overloaded|connection refused|ECONNREFUSED/i.test(msg)) {
+    code = ERROR_CODES.SERVICE_UNAVAILABLE;
+    category = "capacity";
+    recoveryHint = RECOVERY_HINTS.ROTATE_PROVIDER;
+  } else if (CAPACITY_RE.test(msg)) {
+    code = ERROR_CODES.CAPACITY_EXHAUSTED;
+    category = "capacity";
+    recoveryHint = RECOVERY_HINTS.ROTATE_PROVIDER;
+  } else if (/timed out/i.test(msg)) {
+    code = ERROR_CODES.TIMEOUT_LOOP;
+    category = "timeout";
+    recoveryHint = RECOVERY_HINTS.ROTATE_PROVIDER;
+  } else if (exitCode !== null && exitCode !== 0) {
+    code = ERROR_CODES.PROCESS_EXIT;
+    category = "process";
+    recoveryHint = RECOVERY_HINTS.INSPECT_LOGS;
+  }
+
+  const structured = new StructuredError(msg, {
+    code,
+    category,
+    context: {
+      ...context,
+      exitCode,
+    },
+    recoveryHint,
+    cause: rawError instanceof Error ? rawError : undefined,
+  });
+
+  if (rawError?.timeoutVerdict) structured.timeoutVerdict = rawError.timeoutVerdict;
+  if (rawError?.isLoop !== undefined) structured.isLoop = rawError.isLoop;
+  if (rawError?.failedPlugins) structured.failedPlugins = rawError.failedPlugins;
+
+  return structured;
 }
 
 // GHQ2-d / TIMECEIL-CLOUD, 2026-09-14: real progress-vs-loop
@@ -2048,22 +2207,24 @@ async function runDshOnce(provider, text) {
         // Real repetition restates nearly the same sentence (high overlap);
         // real progress reads as different text turn to turn even about
         // the same file (low overlap).
-        const timeoutErr = new Error("dsh timed out after 8min");
-        // TIMECEIL-CLOUD, 2026-09-14: real classification, not just a
-        // boolean - "progress" routes to re-decomposition below instead
-        // of a same-task model-swap retry.
-        // 2026-10-04: real bug found via run 37178108573 (task 64, nvidia
-        // attempt ran the full 8 minutes) - this classified `out` (stdout),
-        // but the "dsh: reasoning:" markers never appear on stdout: dsh
-        // writes them to stderr and the final answer to stdout (verified in
-        // the installed package). stdout therefore held one blob with no
-        // markers, classifyTimeoutKill saw <2 segments and returned "loop"
-        // by its own `segs.length < 2` default - the re-decomposition branch
-        // below was unreachable dead code, and every timeout rotated
-        // providers instead of splitting a genuinely progressing task. The
-        // classifier is fed the reasoning stream now.
-        timeoutErr.timeoutVerdict = classifyTimeoutKill(reasoning);
-        timeoutErr.isLoop = timeoutErr.timeoutVerdict === "loop";
+        const timeoutVerdict = classifyTimeoutKill(reasoning);
+        const isLoop = timeoutVerdict === "loop";
+        const code = isLoop ? ERROR_CODES.TIMEOUT_LOOP : ERROR_CODES.TIMEOUT_PROGRESS;
+        const recoveryHint = isLoop ? RECOVERY_HINTS.ROTATE_PROVIDER : RECOVERY_HINTS.SPLIT_SUBTASKS;
+        const timeoutErr = new StructuredError("dsh timed out after 8min", {
+          code,
+          category: "timeout",
+          context: {
+            provider,
+            timeoutMinutes: 8,
+            timeoutVerdict,
+            isLoop,
+            reasoningLength: reasoning.length,
+          },
+          recoveryHint,
+          timeoutVerdict,
+          isLoop,
+        });
         reject(timeoutErr);
       }, 8 * 60 * 1000);
       child.stdout.setEncoding("utf8");
@@ -2083,7 +2244,20 @@ async function runDshOnce(provider, text) {
         clearTimeout(timer);
         const trimmed = out.trim();
         if (code === 0 && trimmed === "" && err.trim() !== "") {
-          reject(new Error(redactSecrets(`dsh exited 0 with empty stdout, stderr: ${err.slice(-1500)}`)));
+          const structuredErr = new StructuredError(
+            redactSecrets(`dsh exited 0 with empty stdout, stderr: ${err.slice(-1500)}`),
+            {
+              code: ERROR_CODES.EMPTY_OUTPUT,
+              category: "process",
+              context: {
+                provider,
+                exitCode: 0,
+                stderrSnippet: redactSecrets(err.slice(-1500)),
+              },
+              recoveryHint: RECOVERY_HINTS.ROTATE_PROVIDER,
+            }
+          );
+          reject(structuredErr);
         } else if (code === 0) {
           resolve(redactSecrets(trimmed));
         } else {
@@ -2099,10 +2273,21 @@ async function runDshOnce(provider, text) {
           // prefer `err` whenever it has real content, `out` only as a
           // last-resort fallback if `err` is genuinely empty too.
           const body = err.trim() !== "" ? err : out;
-          reject(new Error(`dsh exited ${code}: ${body.slice(-1500)}`));
+          const msg = redactSecrets(`dsh exited ${code}: ${body.slice(-1500)}`);
+          const structuredErr = createStructuredError(msg, {
+            provider,
+            exitCode: code,
+            stderrSnippet: redactSecrets(err.slice(-1500)),
+            stdoutSnippet: redactSecrets(out.slice(-500)),
+          });
+          reject(structuredErr);
         }
       });
-      child.on("error", (err) => { clearTimeout(timer); reject(err); });
+      child.on("error", (err) => {
+        clearTimeout(timer);
+        const structuredErr = createStructuredError(err, { provider });
+        reject(structuredErr);
+      });
     });
   } finally {
     await unlink(patchFile).catch(() => {});
@@ -2131,7 +2316,7 @@ async function doWork(text, task) {
 
   // Direct shell command execution for regular jobs (bypasses LLM/dsh, standard 5-minute timeout)
   if (command !== null) {
-    console.log(`[${new Date().toISOString()}] RUN_COMMAND: executing ${command} (standard 5-minute timeout)`);
+    console.log(`[${new Date().toISOString()}] RUN_COMMAND: executing ${redactSecrets(command)} (standard 5-minute timeout)`);
     const cmdResult = await runCommand(command, { isLongCompute: false });
     const output = cmdResult.success
       ? `Команда выполнена успешно (exit ${cmdResult.exitCode}).\nSTDOUT: ${cmdResult.stdout || '(пусто)'}\nSTDERR: ${cmdResult.stderr || '(пусто)'}`
@@ -2160,7 +2345,8 @@ async function doWork(text, task) {
       return { success: ok, message: truncate(ok ? body : `empty: ${body}`) };
     } catch (err) {
       lastErr = err;
-      const msg = String(err.message || err);
+      const structuredErr = createStructuredError(err, { provider, attempt, taskId: task?.id });
+      const msg = redactSecrets(String(err.message || err));
       attemptLog += `--- attempt on ${provider} ---\n${msg}\n\n`;
       // TIMECEIL-CLOUD, 2026-09-14 (built directly by Claude Code,
       // founder's own real-time call - ports the real fix already landed
@@ -2198,11 +2384,12 @@ async function doWork(text, task) {
       }
       if (!CAPACITY_RE.test(msg)) {
         const diag = await diagnose(text, attemptLog).catch(() => null);
-        const base = `код ${err.code ?? "?"}: ${msg.split("\n")[0]}`;
+        const base = `код ${err.code ?? structuredErr.code ?? "?"}: ${msg.split("\n")[0]}`;
         return {
           success: false,
           message: truncate(diag ? `${base}\n\n${diag.line}` : base),
           permanent: diag ? diag.permanent : false,
+          error: structuredErr.toJSON(),
         };
       }
       const next = nextProvider(provider, tried);
@@ -2212,7 +2399,13 @@ async function doWork(text, task) {
     }
   }
   // Все провайдеры исчерпаны
-  const msg = String(lastErr?.message || lastErr || "unknown error");
+  // CLOUD-MAINT-c-e-progress-loop-distinction-b--c, 2026-10-13: mask the
+  // last provider error BEFORE it is reused below (CAPACITY_RE test +
+  // failure-message construction) - the per-attempt path above already
+  // builds its msg via redactSecrets before that same test; this copy was
+  // the remaining spot forming logging/storage text from raw provider
+  // output (run()'s sink-side redaction still applies on top).
+  const msg = redactSecrets(String(lastErr?.message || lastErr || "unknown error"));
   // 2026-10-04: decompose on exhausted-provider capacity failure, not only on
   // timeout-progress. Real case, run 37214241683 / task 64: the payload
   // (12457 tokens) exceeds groq's on-demand TPM (8000) before the model even
@@ -2242,24 +2435,34 @@ async function doWork(text, task) {
       }
     }
   }
-  const finalError = String(lastErr?.message || lastErr || "unknown error");
+  const finalError = redactSecrets(String(lastErr?.message || lastErr || "unknown error"));
   await escalateToFounder(process.env.TASK_ID, finalError, provider).catch(() => {});
   const diag = await diagnose(text, attemptLog).catch(() => null);
-  const base = `код ${lastErr?.code ?? "?"}: ${msg.split("\n")[0]}`;
+  const structuredLastErr = createStructuredError(lastErr, {
+    provider,
+    allProvidersExhausted: true,
+    taskId: task?.id,
+  });
+  const base = `код ${lastErr?.code ?? structuredLastErr.code ?? "?"}: ${msg.split("\n")[0]}`;
   return {
     success: false,
     message: truncate(diag ? `${base}\n\n${diag.line}` : base),
     permanent: diag ? diag.permanent : false,
+    error: structuredLastErr.toJSON(),
   };
 }
 
 async function notifyTelegram(chatId, message) {
   const url = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-  await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text: message })
-  });
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: redactSecrets(message) })
+    });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] notifyTelegram failed: ${redactSecrets(err?.message || err)}`);
+  }
 }
 
 /**
@@ -2270,6 +2473,225 @@ async function escalateToFounder(taskId, error, provider) {
   const founderChatId = "1568126"; // founder's personal Telegram chat_id
   const msg = `🚨 ЭСКАЛЯЦИЯ: задача ${taskId} провалилась на ${provider}\nОшибка: ${error}\nВсе провайдеры исчерпаны или зациклены.`;
   await notifyTelegram(founderChatId, msg);
+}
+
+/**
+ * Initializes chat_alerts table in database if it does not exist.
+ */
+async function initChatAlertsTable(db = client) {
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS chat_alerts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      type TEXT NOT NULL,
+      task TEXT NOT NULL,
+      from_provider TEXT,
+      to_provider TEXT,
+      error TEXT,
+      details TEXT
+    )
+  `);
+}
+
+/**
+ * Writes a structured alert record to chat_alerts table and logs it.
+ * Redacts secrets before persistence and output.
+ */
+async function writeChatAlert(alert, db = client) {
+  const ts = alert.ts || new Date().toISOString();
+  const type = String(alert.type || "failure");
+  const task = String(alert.task || "");
+  const from = alert.from ?? null;
+  const to = alert.to ?? null;
+  const error = alert.error ? redactSecrets(String(alert.error)) : null;
+  const details = alert.details ? redactSecrets(String(alert.details)) : null;
+
+  try {
+    await initChatAlertsTable(db);
+    await db.execute({
+      sql: "INSERT INTO chat_alerts (ts, type, task, from_provider, to_provider, error, details) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      args: [ts, type, task, from, to, error, details],
+    });
+  } catch (err) {
+    console.error(`[${ts}] writeChatAlert failed: ${redactSecrets(err?.message || err)}`);
+  }
+
+  const alertJson = { ts, type, task, from, to, error, details };
+  console.log(`[${ts}] [chat_alert] ${JSON.stringify(alertJson)}`);
+  return { success: true, alert: alertJson };
+}
+
+/**
+ * Extracts failed plugin names from dsh startup/container logs.
+ */
+function parseFailedPlugins(log) {
+  const text = String(log || "");
+  const plugins = new Set();
+  const patterns = [
+    /plugin\(s\)\s+failed to load:\s*(\S+)/g,
+    /plugin tree failed to load:\s*(\S+)/g,
+    /Failed to load plugin:\s*(\S+)/g,
+  ];
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      plugins.add(m[1].trim());
+    }
+  }
+  return [...plugins];
+}
+
+/**
+ * Smoke check of dsh headless profile initialization beyond `dsh --version`.
+ * Spawns an actual dsh container with a patch to confirm plugin attachments.
+ */
+async function smokeCheckProfile(options = {}) {
+  const provider = options.provider || "nvidia";
+  const model = options.model || (PROVIDER_CONFIG[provider]?.model || "default-model");
+  const patchContent = `- id: agent-default-model\n  config:\n    provider: ${provider}\n    model: ${model}\n`;
+  const patchFile = path.join(os.tmpdir(), `dsh-smoke-${Date.now()}-${Math.random().toString(36).slice(2)}.yml`);
+  await writeFile(patchFile, patchContent, "utf-8");
+
+  try {
+    return await new Promise((resolve, reject) => {
+      const child = spawn("dsh", ["--profile", "headless", "--patch", patchFile, "boot check"], {
+        cwd: WORKDIR,
+        env: {
+          ...process.env,
+          DSH_PERMISSION_MODE: "danger-full-access",
+          DSH_PROXY_DUMMY_KEY: "unused",
+        },
+      });
+      let out = "";
+      let err = "";
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new StructuredError("smokeCheckProfile timed out", {
+          code: ERROR_CODES.TIMEOUT_LOOP,
+          category: "bootstrap",
+          context: { provider, model, timeoutMs: 30000 },
+          recoveryHint: RECOVERY_HINTS.INSPECT_LOGS,
+        }));
+      }, 30000);
+
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (d) => (out += d));
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (d) => (err += d));
+
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        const combined = `${out}\n${err}`;
+        const failedPlugins = parseFailedPlugins(combined);
+        if (failedPlugins.length > 0) {
+          const e = new StructuredError(`plugin(s) failed to load: ${failedPlugins.join(", ")}`, {
+            code: ERROR_CODES.BOOTSTRAP_FAILURE,
+            category: "bootstrap",
+            context: { provider, failedPlugins, exitCode: code },
+            recoveryHint: RECOVERY_HINTS.INSPECT_LOGS,
+            failedPlugins,
+          });
+          e.failedPlugins = failedPlugins;
+          return reject(e);
+        }
+        if (/Cordis startup failed/i.test(combined) || /Error initializing profile/i.test(combined)) {
+          // CLOUD-MAINT-c-e-progress-loop-distinction-b--c, 2026-10-13: dsh
+          // raw output is secret-capable (provider/config errors echo
+          // request or auth details) - mask at capture time, same as
+          // runDshOnce does for its own dsh output, before this Error
+          // text can reach any logging or print.
+          return reject(new StructuredError(`Cordis profile startup failed: ${redactSecrets(err || out)}`, {
+            code: ERROR_CODES.BOOTSTRAP_FAILURE,
+            category: "bootstrap",
+            context: { provider, exitCode: code },
+            recoveryHint: RECOVERY_HINTS.INSPECT_LOGS,
+          }));
+        }
+        if (code === 0 || /AUTH|Unauthorized|401/i.test(combined)) {
+          return resolve({ ok: true, status: "initialized" });
+        }
+        if (code !== 0) {
+          // CLOUD-MAINT-c-e-progress-loop-distinction-b--c, 2026-10-13: same
+          // capture-time masking as above - raw dsh stderr must not travel
+          // into an Error that later gets logged or printed unmasked.
+          const e = new StructuredError(`dsh smoke check exited ${code}: ${redactSecrets(err.slice(-500))}`, {
+            code: ERROR_CODES.BOOTSTRAP_FAILURE,
+            category: "bootstrap",
+            context: { provider, exitCode: code, failedPlugins },
+            recoveryHint: RECOVERY_HINTS.INSPECT_LOGS,
+            failedPlugins,
+          });
+          e.failedPlugins = failedPlugins;
+          return reject(e);
+        }
+        resolve({ ok: true, status: "initialized" });
+      });
+
+      child.on("error", (e) => {
+        clearTimeout(timer);
+        reject(createStructuredError(e, { provider, category: "bootstrap" }));
+      });
+    });
+  } finally {
+    await unlink(patchFile).catch(() => {});
+  }
+}
+
+/**
+ * Checks homogeneity of @deepseek-ai npm package versions to prevent task 64 regressions.
+ */
+function verifyDshTreeHomogeneity(rootPath) {
+  const scopeDir = path.join(rootPath, "@deepseek-ai");
+  if (!existsSync(scopeDir)) {
+    return { ok: true, coreVersion: null, mismatches: [] };
+  }
+  const corePkgJson = path.join(scopeDir, "dsh", "package.json");
+  if (!existsSync(corePkgJson)) {
+    return { ok: true, coreVersion: null, mismatches: [] };
+  }
+  let coreVersion = null;
+  try {
+    const parsed = JSON.parse(readFileSync(corePkgJson, "utf-8"));
+    coreVersion = parsed.version;
+  } catch {
+    return { ok: false, coreVersion: null, mismatches: ["unreadable core package.json"] };
+  }
+
+  const mismatches = [];
+  try {
+    const entries = readdirSync(scopeDir, { withFileTypes: true });
+    for (const ent of entries) {
+      if (!ent.isDirectory() || ent.name === "dsh") continue;
+      const pkgPath = path.join(scopeDir, ent.name, "package.json");
+      if (existsSync(pkgPath)) {
+        try {
+          const pkgData = JSON.parse(readFileSync(pkgPath, "utf-8"));
+          if (pkgData.version && pkgData.version !== coreVersion) {
+            mismatches.push(`@deepseek-ai/${ent.name}@${pkgData.version}`);
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  return {
+    ok: mismatches.length === 0,
+    coreVersion,
+    mismatches,
+  };
+}
+
+/**
+ * High-level bootstrap verification helper.
+ */
+async function verifyBootstrap(options = {}) {
+  const smoke = await smokeCheckProfile(options);
+  return {
+    ok: smoke.ok,
+    profileBooted: true,
+    pluginsOk: true,
+    status: smoke.status,
+  };
 }
 
 // ============================================================================
@@ -2609,13 +3031,25 @@ export {
   parseSiblingMarker,
   buildSiblingMarker,
   makeSiblingOrderOk,
+  siblingOrderOk,
   // Progress vs Loop & Stuck detection
   classifyProgressVsLoop,
   classifyTimeoutKill,
   detectLoop,
   detectStuckTask,
+  // Chat alerts
+  initChatAlertsTable,
+  writeChatAlert,
+  // Bootstrap & plugin verification
+  parseFailedPlugins,
+  smokeCheckProfile,
+  verifyDshTreeHomogeneity,
+  verifyBootstrap,
 };
 
 if (process.argv[1] && process.argv[1].endsWith('executor.mjs')) {
-  run().catch(console.error);
+  run().catch((err) => {
+    console.error(redactSecrets(err?.stack || err?.message || err));
+    process.exit(1);
+  });
 }
