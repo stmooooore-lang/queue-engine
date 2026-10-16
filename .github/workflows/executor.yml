@@ -296,6 +296,15 @@ jobs:
                 baseURL: https://generativelanguage.googleapis.com/v1beta/openai/
                 models:
                   - id: gemini-3.8-flash
+                    # 2026-10-16: Google's OpenAI-compat endpoint rejects the
+                    # `store` field with HTTP 400 "Unknown name \"store\"" -
+                    # pi-ai sends it because google is not in its nonStandard
+                    # list; the array-wrapped 400 body then reads as "(no body)"
+                    # upstream and misclassifies as CONTEXT_WINDOW_EXCEEDED.
+                    # Full dsh request shape without `store` returns HTTP 200
+                    # (verified 2026-10-16 against the live endpoint).
+                    compat:
+                      supportsStore: false
               # 2026-10-07: vertex был последним в PROVIDER_ORDER, но не был
               # объявлен здесь - ротация дойдёт и упадёт NO_ADAPTER (тот же
               # класс пропуска, что у google до 2026-10-04). baseURL собирается
