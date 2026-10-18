@@ -2345,6 +2345,13 @@ async function doWork(text, task) {
       return { success: ok, message: truncate(ok ? body : `empty: ${body}`) };
     } catch (err) {
       lastErr = err;
+      // DEBUG ONLY (2026-10-18): capture raw 400 body from google before it is dropped upstream.
+      if (provider === 'google') {
+        const has400 = /400/.test(String(err?.message || err || "")) || /400/.test(String(err?.status || err?.code || ""));
+        if (has400) {
+          console.error(`[DEBUG RAW 400 BODY google] body=${String(err?.body || err?.response?.body || err?.response?.data || err?.message || err || "none")}`);
+        }
+      }
       const structuredErr = createStructuredError(err, { provider, attempt, taskId: task?.id });
       const msg = redactSecrets(String(err.message || err));
       attemptLog += `--- attempt on ${provider} ---\n${msg}\n\n`;
