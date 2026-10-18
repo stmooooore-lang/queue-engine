@@ -1621,7 +1621,18 @@ function checkoutTaskBranch(text) {
 // в бэклоге). PROVIDER_CONFIG.groq НЕ удалён — вернётся одной строкой,
 // когда причина разобрана. Порядок после исключения: nvidia →
 // mistral → google → vertex.
-const PROVIDER_ORDER = ["nvidia", "mistral", "google", "vertex"];
+// 2026-10-18: google временно исключён из ротации тем же паттерном.
+// Его OpenAI-compat endpoint отвергает какое-то поле dsh-запроса (400,
+// класс CONTEXT_WINDOW_EXCEEDED — терминальный, не capacity, ротация
+// на нём останавливается), а тело 400 дропается самим dsh ("no body"):
+// имя поля недоступно ни через compat (run 39158906926 — полный
+// non-OpenAI набор на уровне провайдера не спас), ни на executor-слое
+// (run 39169576462 — сырого тела нет). Причина передана бэклог-задаче
+// про «умный конфиг» (редизайн ротатора и эскалаций). PROVIDER_CONFIG.google
+// НЕ удалён, settings.yaml google-блок не тронут (dsh валидирует все
+// объявленные провайдеры на старте). Порядок после исключения:
+// nvidia → mistral → vertex.
+const PROVIDER_ORDER = ["nvidia", "mistral", "vertex"];
 const PROVIDER_CONFIG = {
   groq: { baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY", model: "openai/gpt-oss-120b" },
   nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", model: "nvidia/nemotron-3-ultra-550b-a55b" },
