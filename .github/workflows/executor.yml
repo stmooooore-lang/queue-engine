@@ -294,17 +294,33 @@ jobs:
                 apiKeyEnv: GOOGLE_API_KEY
                 api: openai-completions
                 baseURL: https://generativelanguage.googleapis.com/v1beta/openai/
+                # 2026-10-18: full non-OpenAI switch set at PROVIDER level.
+                # Both levels are schema-valid - dsh-llm-pi-ai resolveModelCompat
+                # merges model compat over route compat field by field - but run
+                # 39037912727 (2026-10-17) failed on google WITH the 2026-10-16
+                # model-level supportsStore false active in the written
+                # settings.yaml, so store alone was not the offender. pi-ai sends
+                # the full OpenAI extras set to any provider its catalog does not
+                # describe; the switches below mirror what the pi-ai catalog
+                # declares for every non-OpenAI vendor on openai-completions
+                # (moonshotai/baseten/cloudflare pattern): no store, no
+                # developer role, no reasoning_effort, the max_tokens spelling,
+                # no tool strict mode. Google's array-wrapped 400 body is
+                # dropped upstream as "no body", so the real field name is
+                # invisible in logs; this suppresses the whole OpenAI-only set
+                # instead of guessing one field at a time.
+                # NOTE: this heredoc delimiter is UNQUOTED (vertex needs env
+                # expansion below) - never put backticks in these comments:
+                # run 39037912727 executed the old comment's backticked word
+                # as a shell command twice (line 7: store: command not found).
+                compat:
+                  supportsStore: false
+                  supportsDeveloperRole: false
+                  supportsReasoningEffort: false
+                  maxTokensField: max_tokens
+                  supportsStrictMode: false
                 models:
                   - id: gemini-3.8-flash
-                    # 2026-10-16: Google's OpenAI-compat endpoint rejects the
-                    # `store` field with HTTP 400 "Unknown name \"store\"" -
-                    # pi-ai sends it because google is not in its nonStandard
-                    # list; the array-wrapped 400 body then reads as "(no body)"
-                    # upstream and misclassifies as CONTEXT_WINDOW_EXCEEDED.
-                    # Full dsh request shape without `store` returns HTTP 200
-                    # (verified 2026-10-16 against the live endpoint).
-                    compat:
-                      supportsStore: false
               # 2026-10-07: vertex был последним в PROVIDER_ORDER, но не был
               # объявлен здесь - ротация дойдёт и упадёт NO_ADAPTER (тот же
               # класс пропуска, что у google до 2026-10-04). baseURL собирается
