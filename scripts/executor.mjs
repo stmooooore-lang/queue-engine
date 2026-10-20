@@ -157,6 +157,14 @@ function installSecretRedactionHook() {
       try {
         if (typeof chunk === "string") {
           return origWrite(redactSecrets(chunk), encoding, callback);
+        } else if (Buffer.isBuffer(chunk)) {
+          const enc = typeof encoding === "string" ? encoding : "utf8";
+          const str = chunk.toString(enc);
+          const redacted = redactSecrets(str);
+          if (redacted !== str) {
+            const cb = typeof encoding === "function" ? encoding : callback;
+            return origWrite(Buffer.from(redacted, enc), cb);
+          }
         }
         return origWrite(chunk, encoding, callback);
       } finally {
@@ -1632,7 +1640,7 @@ function checkoutTaskBranch(text) {
 // НЕ удалён, settings.yaml google-блок не тронут (dsh валидирует все
 // объявленные провайдеры на старте). Порядок после исключения:
 // nvidia → mistral → vertex.
-const PROVIDER_ORDER = ["nvidia", "mistral", "vertex"];
+const PROVIDER_ORDER = ["nvidia", "mistral", "openrouter"];
 const PROVIDER_CONFIG = {
   groq: { baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY", model: "openai/gpt-oss-120b" },
   nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", model: "nvidia/nemotron-3-ultra-550b-a55b" },
@@ -1749,9 +1757,9 @@ function redactSecrets(text) {
   }
 
   // 4. *MASTER_KEY* assigned a 64-char hex value (openssl rand -hex 32 shape)
-  const masterKeyRe = /(MASTER_KEY|LITELLM_MASTER_KEY)([\s]*[:=][\s]*)["']?[a-f0-9]{64}["']?/gi;
+  const masterKeyRe = /(MASTER_KEY|LITELLM_MASTER_KEY)([\s]*[:=][\s]*)(["']?)[a-f0-9]{64}\3/gi;
   if (masterKeyRe.test(out)) {
-    out = out.replace(masterKeyRe, "$1$2[REDACTED: master key]");
+    out = out.replace(masterKeyRe, "$1$2$3[REDACTED: master key]$3");
     hit = true;
   }
 
@@ -1900,6 +1908,31 @@ const RECOVERY_HINTS = {
 };
 
 /**
+ * Standard task execution statuses for tracking progress vs loop and outcomes.
+ */
+const TASK_STATUSES = {
+  PENDING: "ожидает",
+  RUNNING: "выполняется",
+  COMPLETED: "готова",
+  FAILED: "провал",
+  BLOCKED: "заблокирована",
+  PARTIAL: "partial",
+  LOOP: "loop",
+  PROGRESS: "progress",
+};
+
+/**
+ * Standard execution event types for telemetry, chat alerts, and stuck detection.
+ */
+const EXECUTION_EVENTS = {
+  PROGRESS: "progress",
+  LOOP: "loop",
+  TIMEOUT_PROGRESS: "timeout_progress",
+  TIMEOUT_LOOP: "timeout_loop",
+  STUCK_TASK: "stuck_task",
+};
+
+/**
  * StructuredError encapsulates an error code, context metadata, and recovery hint.
  * Inherits from standard Error to preserve message, stack, and instanceof Error checks.
  */
@@ -1929,6 +1962,9 @@ class StructuredError extends Error {
     // Backward-compatibility properties
     if (options.timeoutVerdict) this.timeoutVerdict = options.timeoutVerdict;
     if (options.isLoop !== undefined) this.isLoop = options.isLoop;
+    if (options.isProgress !== undefined) this.isProgress = options.isProgress;
+    if (options.avgSimilarity !== undefined) this.avgSimilarity = options.avgSimilarity;
+    if (options.iterationCount !== undefined) this.iterationCount = options.iterationCount;
     if (options.failedPlugins) this.failedPlugins = options.failedPlugins;
   }
 
@@ -2014,6 +2050,9 @@ function createStructuredError(rawError, context = {}) {
 
   if (rawError?.timeoutVerdict) structured.timeoutVerdict = rawError.timeoutVerdict;
   if (rawError?.isLoop !== undefined) structured.isLoop = rawError.isLoop;
+  if (rawError?.isProgress !== undefined) structured.isProgress = rawError.isProgress;
+  if (rawError?.avgSimilarity !== undefined) structured.avgSimilarity = rawError.avgSimilarity;
+  if (rawError?.iterationCount !== undefined) structured.iterationCount = rawError.iterationCount;
   if (rawError?.failedPlugins) structured.failedPlugins = rawError.failedPlugins;
 
   return structured;
@@ -2121,7 +2160,24 @@ function detectLoop(input, threshold = 0.5) {
  */
 function detectStuckTask(task, options = {}) {
   const maxIterations = options.maxIterations || 3;
-  const iterations = Number(task?.iteration_count || task?.retry_count || 0);
+  let iterations = Number(
+    task?.iteration_count ||
+    task?.retry_count ||
+    task?.attempts ||
+    task?.iterations ||
+    options?.currentIteration ||
+    0
+  );
+  if (!iterations && typeof task?.text === "string") {
+    const match = task.text.match(/\[(?:iteration|retry|attempt):\s*(\d+)\]/i) ||
+                  task.text.match(/(?:iteration|retry|attempt)\s*#?\s*(\d+)/i);
+    if (match) {
+      iterations = parseInt(match[1], 10);
+    }
+  }
+  if (task?.status === "loop" || task?.status === "stuck") {
+    return { stuck: true, reason: `Task marked with status ${task.status}`, iterationCount: iterations };
+  }
   if (iterations >= maxIterations) {
     return { stuck: true, reason: `Exceeded max iterations (${iterations}/${maxIterations})`, iterationCount: iterations };
   }
@@ -2218,8 +2274,11 @@ async function runDshOnce(provider, text) {
         // Real repetition restates nearly the same sentence (high overlap);
         // real progress reads as different text turn to turn even about
         // the same file (low overlap).
-        const timeoutVerdict = classifyTimeoutKill(reasoning);
-        const isLoop = timeoutVerdict === "loop";
+        const classification = classifyProgressVsLoop(reasoning);
+        const timeoutVerdict = classification.verdict;
+        const isLoop = classification.isLoop;
+        const isProgress = classification.isProgress;
+        const avgSimilarity = classification.avgSimilarity;
         const code = isLoop ? ERROR_CODES.TIMEOUT_LOOP : ERROR_CODES.TIMEOUT_PROGRESS;
         const recoveryHint = isLoop ? RECOVERY_HINTS.ROTATE_PROVIDER : RECOVERY_HINTS.SPLIT_SUBTASKS;
         const timeoutErr = new StructuredError("dsh timed out after 8min", {
@@ -2230,11 +2289,15 @@ async function runDshOnce(provider, text) {
             timeoutMinutes: 8,
             timeoutVerdict,
             isLoop,
+            isProgress,
+            avgSimilarity,
             reasoningLength: reasoning.length,
           },
           recoveryHint,
           timeoutVerdict,
           isLoop,
+          isProgress,
+          avgSimilarity,
         });
         reject(timeoutErr);
       }, 8 * 60 * 1000);
@@ -2376,6 +2439,13 @@ async function doWork(text, task) {
       // via triageCheck()/triageSplit() instead, same machinery already
       // used before a task is ever first attempted.
       if (err.timeoutVerdict === "progress" && task) {
+        await writeChatAlert({
+          type: EXECUTION_EVENTS.TIMEOUT_PROGRESS,
+          task: task?.id || "",
+          from: provider,
+          to: null,
+          details: `Task execution showed forward progress before timeout (avgSimilarity: ${err.avgSimilarity ?? "n/a"})`,
+        }).catch(() => {});
         const decision = await triageCheck(text).catch(() => ({ split: false }));
         if (decision.split) {
           const subtaskIds = await triageSplit(task, decision).catch(() => null);
@@ -2395,6 +2465,14 @@ async function doWork(text, task) {
       // looped cannot help, a different model can.
       if (err.isLoop) {
         const next = nextProvider(provider, tried);
+        await writeChatAlert({
+          type: EXECUTION_EVENTS.TIMEOUT_LOOP,
+          task: task?.id || "",
+          from: provider,
+          to: next,
+          error: "Loop detected: repetitive reasoning segments or stuck state",
+          details: `Repetitive loop detected on provider ${provider} (similarity: ${err.avgSimilarity ?? ">=0.5"})`,
+        }).catch(() => {});
         if (next === null) break;
         console.log(`[${new Date().toISOString()}] loop-detected failure on ${provider} - switching to ${next}`);
         provider = next;
@@ -3055,6 +3133,8 @@ export {
   classifyTimeoutKill,
   detectLoop,
   detectStuckTask,
+  TASK_STATUSES,
+  EXECUTION_EVENTS,
   // Chat alerts
   initChatAlertsTable,
   writeChatAlert,

@@ -327,6 +327,18 @@ jobs:
               # из env на момент генерации settings.yaml, значения приносит
               # шаг vertex-auth выше; поэтому heredoc этого шага раскрывает
               # <...> (разделитель без кавычек).
+
+              openrouter:
+                apiKeyEnv: OPENROUTER_API_KEY
+                api: openai-completions
+                baseURL: https://openrouter.ai/api/v1
+                models:
+                  - id: meta-llama/llama-3.3-70b-instruct
+                    name: Llama 3.3 70B
+                    contextWindow: 131072
+                    compat:
+                      supportsStore: false
+
               vertex:
                 apiKeyEnv: VERTEX_ACCESS_TOKEN
                 api: openai-completions
@@ -350,6 +362,7 @@ jobs:
           # that exists (verified: a GOOGLE_API_KEY secret does not exist;
           # the removed 2026-09-20 Google block did the same bridging).
           GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           # 2026-10-07: vertex-провайдер (последний fallback) читает
           # OAuth2-токен из сервис-аккаунта - env приносит шаг vertex-auth
           # выше, секретов с этими именами в репо нет (реальные:
