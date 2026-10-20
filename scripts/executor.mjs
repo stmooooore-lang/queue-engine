@@ -1659,15 +1659,11 @@ const PROVIDER_CONFIG = {
   // по умолчанию global — Gemini 3.x на региональных endpoint'ах не
   // находит эти модели.
   vertex: { baseURL: "https://${VERTEX_LOCATION:-global}-aiplatform.googleapis.com/v1/projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION:-global}/endpoints/openapi", apiKeyEnv: "VERTEX_ACCESS_TOKEN", model: "gemini-3.8-flash" },
-  openrouter: { 
+  openrouter: {
     api: 'openai-completions',
-    baseURL: 'https://openrouter.ai/api/v1', 
-    apiKeyEnv: 'OPENROUTER_API_KEY', 
-    defaultModel: 'nvidia/nemotron-3-ultra-550b-a55b',
-    fallbackModels: [
-      'thinking-machines/inkling:free',
-      'z-ai/glm-5.2:free'
-    ],
+    baseURL: 'https://openrouter.ai/api/v1',
+    apiKeyEnv: 'OPENROUTER_API_KEY',
+    model: 'thinking-machines/inkling:free',
   },
 };
 
