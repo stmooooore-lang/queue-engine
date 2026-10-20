@@ -1659,6 +1659,7 @@ const PROVIDER_CONFIG = {
   // по умолчанию global — Gemini 3.x на региональных endpoint'ах не
   // находит эти модели.
   vertex: { baseURL: "https://${VERTEX_LOCATION:-global}-aiplatform.googleapis.com/v1/projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION:-global}/endpoints/openapi", apiKeyEnv: "VERTEX_ACCESS_TOKEN", model: "gemini-3.8-flash" },
+  openrouter: { baseURL: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY", model: "meta-llama/llama-3.3-70b-instruct" },
 };
 
 // Helper to resolve Vertex baseURL with env vars at runtime (shell-style ${VAR:-default} not interpolated in JS)
