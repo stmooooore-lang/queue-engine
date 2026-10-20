@@ -1659,7 +1659,16 @@ const PROVIDER_CONFIG = {
   // по умолчанию global — Gemini 3.x на региональных endpoint'ах не
   // находит эти модели.
   vertex: { baseURL: "https://${VERTEX_LOCATION:-global}-aiplatform.googleapis.com/v1/projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION:-global}/endpoints/openapi", apiKeyEnv: "VERTEX_ACCESS_TOKEN", model: "gemini-3.8-flash" },
-  openrouter: { baseURL: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY", model: "meta-llama/llama-3.3-70b-instruct" },
+  openrouter: { 
+    api: 'openai-completions',
+    baseURL: 'https://openrouter.ai/api/v1', 
+    apiKeyEnv: 'OPENROUTER_API_KEY', 
+    defaultModel: 'nvidia/nemotron-3-ultra-550b-a55b',
+    fallbackModels: [
+      'thinking-machines/inkling:free',
+      'z-ai/glm-5.2:free'
+    ],
+  },
 };
 
 // Helper to resolve Vertex baseURL with env vars at runtime (shell-style ${VAR:-default} not interpolated in JS)
@@ -1880,7 +1889,9 @@ function redactSecrets(text) {
  * Standard machine-readable error codes.
  */
 const ERROR_CODES = {
+  QUOTA: "QUOTA",
   RATE_LIMIT: "ERR_RATE_LIMIT",
+  CONTEXT_WINDOW_EXCEEDED: "CONTEXT_WINDOW_EXCEEDED",
   PAYLOAD_TOO_LARGE: "ERR_PAYLOAD_TOO_LARGE",
   SERVICE_UNAVAILABLE: "ERR_SERVICE_UNAVAILABLE",
   CAPACITY_EXHAUSTED: "ERR_CAPACITY_EXHAUSTED",
@@ -1906,7 +1917,226 @@ const RECOVERY_HINTS = {
   CHECK_CREDENTIALS: "check_credentials",
   INSPECT_LOGS: "inspect_logs",
   RETRY: "retry",
+  COOLDOWN: "cooldown",
+  ROTATE: "rotate",
+  FAIL: "fail",
 };
+
+/**
+ * Parses dsh's structured JSON output and extracts error.code and metadata.
+ * Implements the error code mapping:
+ *   QUOTA                   -> rotate   (switch to next provider immediately)
+ *   RATE_LIMIT              -> cooldown (pause per retryDelay or backoff, retry same provider)
+ *   CONTEXT_WINDOW_EXCEEDED -> fail     (immediate failure, retries/rotations useless)
+ *
+ * @param {string} text - Raw stderr / stdout text from dsh execution
+ * @returns {{errorCode: string, action: "rotate"|"cooldown"|"fail", retryDelay: number, errorMsg: string, rawErrorObj: object|null}|null}
+ */
+function parseDshStructuredError(text) {
+  if (!text || typeof text !== "string") return null;
+
+  // Strip ANSI escape codes
+  const clean = text.replace(/\x1b\[[0-9;]*m/g, "");
+  let errorCode = null;
+  let action = null;
+  let retryDelay = 0;
+  let errorMsg = "";
+  let rawErrorObj = null;
+
+  function inspectObj(data) {
+    if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+
+    const err = data.error;
+    let code = null;
+    let status = null;
+    let msg = "";
+    let details = [];
+
+    if (err && typeof err === "object" && !Array.isArray(err)) {
+      code = err.code ?? null;
+      status = err.status ?? null;
+      msg = err.message ?? "";
+      details = Array.isArray(err.details) ? err.details : [];
+    } else if (typeof err === "string") {
+      code = err;
+    }
+
+    let reason = null;
+    if (data.event && typeof data.event === "object") {
+      reason = data.event.data?.reason;
+    }
+    if (!reason && data.data && typeof data.data === "object") {
+      reason = data.data.reason || data.data.chunk?.reason;
+    }
+    if (!reason && data.reason && typeof data.reason === "object") {
+      reason = data.reason;
+    }
+
+    if (reason && typeof reason === "object" && reason.kind === "error") {
+      const f = reason.error || reason.failure;
+      if (f && typeof f === "object") {
+        if (!code && f.code) code = f.code;
+        if (!msg && f.message) msg = f.message;
+        if (details.length === 0 && Array.isArray(f.details)) details = f.details;
+      } else if (typeof f === "string" && !code) {
+        code = f;
+      }
+    }
+
+    if (details.length === 0 && Array.isArray(data.details)) {
+      details = data.details;
+    }
+
+    if (!code && data.code) code = data.code;
+    if (!code && data.error_code) code = data.error_code;
+    if (!status && data.status) status = data.status;
+
+    let hasPerMinute = false;
+    if (Array.isArray(details)) {
+      for (const d of details) {
+        if (d && typeof d === "object") {
+          if (d.retryDelay) {
+            const dm = String(d.retryDelay).match(/(\d+)/);
+            if (dm) retryDelay = parseInt(dm[1], 10);
+          }
+          const qid = String(d.quotaId || "");
+          if (qid.includes("PerMinute")) {
+            hasPerMinute = true;
+          }
+        }
+      }
+    }
+
+    if (!code && status) {
+      code = status;
+    }
+
+    if (code !== null && code !== undefined) {
+      const cStr = String(code);
+      let objCode = cStr;
+      if (cStr === "429") {
+        if ((status === "RESOURCE_EXHAUSTED" || status === "QUOTA_EXHAUSTED") && !hasPerMinute) {
+          objCode = "QUOTA";
+        } else {
+          objCode = "RATE_LIMIT";
+        }
+      }
+
+      if (!errorCode || ["SERVER", "API_ERROR", "ERROR"].includes(errorCode)) {
+        errorCode = objCode;
+      } else if (errorCode === "QUOTA" && objCode === "RATE_LIMIT" && !hasPerMinute) {
+        // Keep QUOTA
+      } else if (["QUOTA", "RATE_LIMIT", "CONTEXT_WINDOW_EXCEEDED"].includes(objCode)) {
+        errorCode = objCode;
+      }
+
+      if (msg) {
+        errorMsg = String(msg);
+      }
+      rawErrorObj = data;
+      return true;
+    }
+    return false;
+  }
+
+  const stripped = clean.trim();
+  const lines = stripped.split(/\r?\n/);
+
+  // 1. Check lines in reverse
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    // Check dsh: <CODE>: <REST>
+    const m = line.match(/^dsh:\s*([A-Z][A-Z0-9_]*):\s*(.*)$/);
+    if (m) {
+      const prefixCode = m[1];
+      const rest = m[2].trim();
+      errorCode = prefixCode;
+      errorMsg = rest;
+      const sIdx = rest.indexOf("{");
+      const eIdx = rest.lastIndexOf("}");
+      if (sIdx !== -1 && eIdx > sIdx) {
+        try {
+          const robj = JSON.parse(rest.slice(sIdx, eIdx + 1));
+          inspectObj(robj);
+        } catch {}
+      }
+      break;
+    }
+
+    // Check if line contains JSON object
+    const startIdx = line.indexOf("{");
+    const endIdx = line.lastIndexOf("}");
+    if (startIdx !== -1 && endIdx > startIdx) {
+      try {
+        const obj = JSON.parse(line.slice(startIdx, endIdx + 1));
+        if (inspectObj(obj)) break;
+      } catch {}
+    }
+  }
+
+  // 2. Try parsing full text as JSON or multiline JSON blocks if errorCode not found
+  if (!errorCode && clean.includes("{") && clean.includes("}")) {
+    try {
+      const parsed = JSON.parse(stripped);
+      if (typeof parsed === "object" && parsed !== null) {
+        inspectObj(parsed);
+      }
+    } catch {}
+  }
+
+  if (!errorCode && clean.includes("{") && clean.includes("}")) {
+    const jsonMatches = clean.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g);
+    if (jsonMatches) {
+      for (let i = jsonMatches.length - 1; i >= 0; i--) {
+        try {
+          const obj = JSON.parse(jsonMatches[i]);
+          if (inspectObj(obj)) break;
+        } catch {}
+      }
+    }
+  }
+
+  // Final code and action normalization
+  if (errorCode) {
+    const ecUpper = String(errorCode).toUpperCase();
+    if (
+      ecUpper.includes("CONTEXT_WINDOW") ||
+      ecUpper.includes("CONTEXT_LENGTH") ||
+      ecUpper === "REQUEST_TOO_LARGE" ||
+      ecUpper === "MAX_TOKENS"
+    ) {
+      errorCode = "CONTEXT_WINDOW_EXCEEDED";
+      action = "fail";
+    } else if (
+      ecUpper.includes("QUOTA") ||
+      ecUpper === "RESOURCE_EXHAUSTED" ||
+      ecUpper === "QUOTA_EXHAUSTED" ||
+      ecUpper === "DAILY_QUOTA"
+    ) {
+      errorCode = "QUOTA";
+      action = "rotate";
+    } else if (
+      ecUpper.includes("RATE_LIMIT") ||
+      ecUpper === "429" ||
+      ecUpper === "RATE_LIMIT_EXCEEDED"
+    ) {
+      errorCode = "RATE_LIMIT";
+      action = "cooldown";
+    }
+  }
+
+  if (!errorCode) return null;
+
+  return {
+    errorCode,
+    action,
+    retryDelay,
+    errorMsg,
+    rawErrorObj,
+  };
+}
 
 /**
  * Standard task execution statuses for tracking progress vs loop and outcomes.
@@ -1957,6 +2187,9 @@ class StructuredError extends Error {
     this.context = options.context ? JSON.parse(redactSecrets(JSON.stringify(options.context))) : {};
     this.recoveryHint = options.recoveryHint || RECOVERY_HINTS.INSPECT_LOGS;
     this.timestamp = options.timestamp || new Date().toISOString();
+    if (options.dshError) {
+      this.dshError = options.dshError;
+    }
     if (options.cause) {
       this.cause = options.cause;
     }
@@ -1978,6 +2211,7 @@ class StructuredError extends Error {
       context: this.context,
       recoveryHint: this.recoveryHint,
       timestamp: this.timestamp,
+      ...(this.dshError ? { dshError: this.dshError } : {}),
     };
   }
 }
@@ -1993,6 +2227,9 @@ function createStructuredError(rawError, context = {}) {
   if (rawError instanceof StructuredError) {
     if (context && Object.keys(context).length > 0) {
       rawError.context = { ...rawError.context, ...context };
+      if (context.dshError) {
+        rawError.dshError = context.dshError;
+      }
     }
     return rawError;
   }
@@ -2000,11 +2237,45 @@ function createStructuredError(rawError, context = {}) {
   const msg = redactSecrets(rawError?.message || String(rawError || ""));
   const exitCode = context.exitCode ?? rawError?.exitCode ?? (typeof rawError?.code === "number" ? rawError.code : null);
 
+  const textToScan = [
+    context.stderrSnippet,
+    context.stdoutSnippet,
+    rawError?.stderr,
+    rawError?.stdout,
+    rawError?.body,
+    msg,
+  ].filter(Boolean).join("\n");
+
+  const dshError = context.dshError || parseDshStructuredError(textToScan);
+
   let code = ERROR_CODES.UNKNOWN;
   let category = "unknown";
   let recoveryHint = RECOVERY_HINTS.INSPECT_LOGS;
 
-  if (/401|unauthorized|invalid api key|invalid_api_key/i.test(msg)) {
+  if (dshError && dshError.errorCode) {
+    code = dshError.errorCode;
+    if (dshError.errorCode === "CONTEXT_WINDOW_EXCEEDED") {
+      category = "capacity";
+      recoveryHint = RECOVERY_HINTS.FAIL;
+    } else if (dshError.errorCode === "QUOTA") {
+      category = "capacity";
+      recoveryHint = RECOVERY_HINTS.ROTATE_PROVIDER;
+    } else if (dshError.errorCode === "RATE_LIMIT") {
+      category = "capacity";
+      recoveryHint = RECOVERY_HINTS.COOLDOWN;
+    } else {
+      if (dshError.action === "rotate") {
+        category = "capacity";
+        recoveryHint = RECOVERY_HINTS.ROTATE_PROVIDER;
+      } else if (dshError.action === "cooldown") {
+        category = "capacity";
+        recoveryHint = RECOVERY_HINTS.COOLDOWN;
+      } else if (dshError.action === "fail") {
+        category = "auth";
+        recoveryHint = RECOVERY_HINTS.PERMANENT_BLOCKER;
+      }
+    }
+  } else if (/401|unauthorized|invalid api key|invalid_api_key/i.test(msg)) {
     code = ERROR_CODES.AUTH_FAILURE;
     category = "auth";
     recoveryHint = RECOVERY_HINTS.CHECK_CREDENTIALS;
@@ -2044,8 +2315,10 @@ function createStructuredError(rawError, context = {}) {
     context: {
       ...context,
       exitCode,
+      ...(dshError ? { dshError } : {}),
     },
     recoveryHint,
+    dshError,
     cause: rawError instanceof Error ? rawError : undefined,
   });
 
@@ -2309,6 +2582,11 @@ async function runDshOnce(provider, text) {
       // captured (bounded) instead of thrown away.
       child.stderr.setEncoding("utf8");
       child.stderr.on("data", (d) => { if (err.length < 4000) err += d; });
+      let fullStderr = "";
+      child.stderr.on("data", (d) => {
+        fullStderr += d;
+        if (fullStderr.length > 100000) fullStderr = fullStderr.slice(-100000);
+      });
       // 2026-10-04: the reasoning stream for the timeout classifier - see the
       // comment above the `reasoning` declaration. Tail-capped, not head-capped.
       child.stderr.on("data", (d) => {
@@ -2318,18 +2596,23 @@ async function runDshOnce(provider, text) {
       child.on("close", (code) => {
         clearTimeout(timer);
         const trimmed = out.trim();
+        const dshError = parseDshStructuredError(fullStderr || err) || parseDshStructuredError(out);
         if (code === 0 && trimmed === "" && err.trim() !== "") {
           const structuredErr = new StructuredError(
             redactSecrets(`dsh exited 0 with empty stdout, stderr: ${err.slice(-1500)}`),
             {
-              code: ERROR_CODES.EMPTY_OUTPUT,
+              code: dshError?.errorCode || ERROR_CODES.EMPTY_OUTPUT,
               category: "process",
               context: {
                 provider,
                 exitCode: 0,
                 stderrSnippet: redactSecrets(err.slice(-1500)),
+                dshError,
               },
-              recoveryHint: RECOVERY_HINTS.ROTATE_PROVIDER,
+              recoveryHint: dshError?.action === "cooldown"
+                ? RECOVERY_HINTS.COOLDOWN
+                : (dshError?.action === "fail" ? RECOVERY_HINTS.FAIL : RECOVERY_HINTS.ROTATE_PROVIDER),
+              dshError,
             }
           );
           reject(structuredErr);
@@ -2354,6 +2637,7 @@ async function runDshOnce(provider, text) {
             exitCode: code,
             stderrSnippet: redactSecrets(err.slice(-1500)),
             stdoutSnippet: redactSecrets(out.slice(-500)),
+            dshError,
           });
           reject(structuredErr);
         }
@@ -2409,6 +2693,7 @@ async function doWork(text, task) {
   let provider = PROVIDER_ORDER[0];
   let lastErr = null;
   let attemptLog = "";
+  const cooldownCounts = {};
   for (let attempt = 0; attempt < PROVIDER_ORDER.length; attempt++) {
     tried.add(provider);
     try {
@@ -2424,7 +2709,7 @@ async function doWork(text, task) {
       if (provider === 'google') {
         const has400 = /400/.test(String(err?.message || err || "")) || /400/.test(String(err?.status || err?.code || ""));
         if (has400) {
-          console.error(`[DEBUG RAW 400 BODY google] body=${String(err?.body || err?.response?.body || err?.response?.data || err?.message || err || "none")}`);
+          console.error(`[DEBUG RAW 400 BODY google] body=${String(err?.body || err?.response?.body || err?.response?.data || err?.context?.stderrSnippet || err?.message || err || "none")}`);
         }
       }
       const structuredErr = createStructuredError(err, { provider, attempt, taskId: task?.id });
@@ -2479,6 +2764,54 @@ async function doWork(text, task) {
         provider = next;
         continue;
       }
+
+      // 2026-10-21 (QUEUE-FIX-STRUCTURED-ERRORS-d): parse structured JSON error from dsh output
+      // and map error.code:
+      //   QUOTA                   -> rotate   (switch provider immediately)
+      //   RATE_LIMIT              -> cooldown (pause per retryDelay, retry same provider)
+      //   CONTEXT_WINDOW_EXCEEDED -> fail     (immediate failure, do not rotate)
+      const dshError = err.dshError || structuredErr.dshError || parseDshStructuredError(msg);
+
+      if (dshError?.errorCode === "CONTEXT_WINDOW_EXCEEDED" || dshError?.action === "fail") {
+        console.log(`[${new Date().toISOString()}] structured error.code=${dshError.errorCode} on ${provider} -> action: fail (immediate failure, no rotation)`);
+        const diag = await diagnose(text, attemptLog).catch(() => null);
+        const base = `код ${dshError.errorCode || err.code || structuredErr.code || "?"}: ${msg.split("\n")[0]}`;
+        return {
+          success: false,
+          message: truncate(diag ? `${base}\n\n${diag.line}` : base),
+          permanent: diag ? diag.permanent : false,
+          error: structuredErr.toJSON(),
+        };
+      }
+
+      if (dshError?.errorCode === "RATE_LIMIT" || dshError?.action === "cooldown") {
+        const delaySec = dshError.retryDelay > 0 ? (dshError.retryDelay + 5) : 15;
+        const cappedDelaySec = Math.min(delaySec, 60);
+        const count = cooldownCounts[provider] || 0;
+        if (count < 2) {
+          cooldownCounts[provider] = count + 1;
+          console.log(`[${new Date().toISOString()}] structured error.code=RATE_LIMIT on ${provider} (retryDelay: ${dshError.retryDelay}s) -> action: cooldown (pause ${cappedDelaySec}s, retry attempt ${count + 1}/2 on same provider)`);
+          await new Promise((r) => setTimeout(r, cappedDelaySec * 1000));
+          attempt--;
+          continue;
+        } else {
+          console.log(`[${new Date().toISOString()}] RATE_LIMIT persisted on ${provider} after ${count} cooldowns — rotating to next provider`);
+          const next = nextProvider(provider, tried);
+          if (next === null) break;
+          provider = next;
+          continue;
+        }
+      }
+
+      if (dshError?.errorCode === "QUOTA" || dshError?.action === "rotate") {
+        const next = nextProvider(provider, tried);
+        if (next === null) break;
+        console.log(`[${new Date().toISOString()}] structured error.code=QUOTA on ${provider} -> action: rotate (switching to ${next})`);
+        provider = next;
+        continue;
+      }
+
+      // Fallback for unparsed legacy output: text regex parsing (CAPACITY_RE)
       if (!CAPACITY_RE.test(msg)) {
         const diag = await diagnose(text, attemptLog).catch(() => null);
         const base = `код ${err.code ?? structuredErr.code ?? "?"}: ${msg.split("\n")[0]}`;
@@ -2503,6 +2836,8 @@ async function doWork(text, task) {
   // the remaining spot forming logging/storage text from raw provider
   // output (run()'s sink-side redaction still applies on top).
   const msg = redactSecrets(String(lastErr?.message || lastErr || "unknown error"));
+  const lastDshError = lastErr?.dshError || parseDshStructuredError(msg);
+  const isCapacity = (lastDshError?.errorCode === "QUOTA" || lastDshError?.errorCode === "RATE_LIMIT" || lastDshError?.action === "rotate" || lastDshError?.action === "cooldown") || CAPACITY_RE.test(msg);
   // 2026-10-04: decompose on exhausted-provider capacity failure, not only on
   // timeout-progress. Real case, run 37214241683 / task 64: the payload
   // (12457 tokens) exceeds groq's on-demand TPM (8000) before the model even
@@ -2514,7 +2849,7 @@ async function doWork(text, task) {
   // payload fact now also states every provider already rejected it.
   // AUTH failures do not match CAPACITY_RE and keep the ordinary failure
   // path - no decomposition on auth.
-  if (CAPACITY_RE.test(msg) && task) {
+  if (isCapacity && lastDshError?.errorCode !== "CONTEXT_WINDOW_EXCEEDED" && task) {
     // 2026-10-07: [NO-TRIAGE] marker (hasNoTriageMarker below) - never
     // decompose a self-declared leaf-level task even here; fall through to
     // the ordinary failure path below (provider rotation has already fully
@@ -3122,6 +3457,7 @@ export {
   CAPACITY_RE,
   nextProvider,
   runDshOnce,
+  parseDshStructuredError,
   resolveVertexBaseURL,
   client,
   // From sibling-parser.mjs (re-exported)
@@ -3139,6 +3475,11 @@ export {
   // Chat alerts
   initChatAlertsTable,
   writeChatAlert,
+  // Structured error handling
+  StructuredError,
+  createStructuredError,
+  ERROR_CODES,
+  RECOVERY_HINTS,
   // Bootstrap & plugin verification
   parseFailedPlugins,
   smokeCheckProfile,
