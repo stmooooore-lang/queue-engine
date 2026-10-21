@@ -1643,7 +1643,7 @@ function checkoutTaskBranch(text) {
 const PROVIDER_ORDER = ["nvidia", "mistral", "openrouter"];
 const PROVIDER_CONFIG = {
   groq: { baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY", model: "openai/gpt-oss-120b" },
-  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", model: "nvidia/nemotron-3-ultra-550b-a55b" },
+  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" },
   mistral: { baseURL: "https://api.mistral.ai/v1", apiKeyEnv: "MISTRAL_API_KEY", model: "mistral-medium-3-5" },
   // 2026-10-04: model was gemini-1.5-pro - verified dead against the real
   // endpoint (HTTP 404 "no longer available to new users"; every pro-tier
@@ -2520,15 +2520,18 @@ async function runDshOnce(provider, text) {
       // non-empty provider reasoning delta to stderr under a `dsh: reasoning:`
       // heading, then prints the final answer on stdout"). Capped to the last
       // MAX_OUTPUT chars: the timeout classifier compares consecutive
-      // segments, so it needs the recent tail, not the first bytes of an
-      // 8-minute run.
+      // segments, so it needs the recent tail, not the first bytes of a
+      // 20-minute run.
       let reasoning = "";
       // Job-level cap in executor.yml is 30 min total (checkout + install +
-      // settings write leaves ~27 min of work budget). Up to 3 providers can
-      // be tried in rotation, so each single attempt gets 8 min, not the
-      // 120 min a lone cline call could afford - a shorter, self-reported
-      // timeout that still notifies Telegram beats a silent hard kill by
-      // Actions' own job timeout with no result written at all.
+      // settings write leaves ~27 min of work budget). 2026-10-21 (task-110
+      // chain, founder's call): single-attempt window raised 8 -> 20 min so a
+      // real task can finish on one provider instead of dying at the 8-min
+      // mark. At 20 min per attempt only ~one full attempt fits the job cap:
+      // a rotation into a second 20-min attempt risks Actions' own hard kill
+      // with no result written at all - the self-reported timeout below is
+      // the only graceful exit, so the first provider that boots must carry
+      // the task.
       const timer = setTimeout(() => {
         child.kill("SIGKILL");
         // GHQ2-d, 2026-09-14 (built directly by Claude Code, founder's own
@@ -2551,12 +2554,12 @@ async function runDshOnce(provider, text) {
         const avgSimilarity = classification.avgSimilarity;
         const code = isLoop ? ERROR_CODES.TIMEOUT_LOOP : ERROR_CODES.TIMEOUT_PROGRESS;
         const recoveryHint = isLoop ? RECOVERY_HINTS.ROTATE_PROVIDER : RECOVERY_HINTS.SPLIT_SUBTASKS;
-        const timeoutErr = new StructuredError("dsh timed out after 8min", {
+        const timeoutErr = new StructuredError("dsh timed out after 20min", {
           code,
           category: "timeout",
           context: {
             provider,
-            timeoutMinutes: 8,
+            timeoutMinutes: 20,
             timeoutVerdict,
             isLoop,
             isProgress,
@@ -2570,7 +2573,7 @@ async function runDshOnce(provider, text) {
           avgSimilarity,
         });
         reject(timeoutErr);
-      }, 8 * 60 * 1000);
+      }, 20 * 60 * 1000);
       child.stdout.setEncoding("utf8");
       child.stdout.on("data", (d) => (out += d));
       // 2026-09-12: was `child.stderr.resume()` (discard) - real bug found
@@ -2715,7 +2718,7 @@ async function doWork(text, task) {
       // founder's own real-time call - ports the real fix already landed
       // in the local queue's queue.sh for TIMECEIL, not a new design).
       // A timeout that shows genuine, distinct progress (not real
-      // repetition) is a task too large for one 8-minute window, not a
+      // repetition) is a task too large for one 20-minute window, not a
       // model problem - retrying it on a different provider just repeats
       // the same too-big-for-one-window failure. Real re-decomposition
       // via triageCheck()/triageSplit() instead, same machinery already
