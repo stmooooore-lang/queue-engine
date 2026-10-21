@@ -271,7 +271,8 @@ jobs:
                 api: openai-completions
                 baseURL: https://integrate.api.nvidia.com/v1
                 models:
-                  - id: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning
+                  - id: nvidia/nemotron-3-ultra-550b-a55b
+                    contextWindow: 131072
               mistral:
                 apiKeyEnv: MISTRAL_API_KEY
                 api: openai-completions

@@ -1643,7 +1643,7 @@ function checkoutTaskBranch(text) {
 const PROVIDER_ORDER = ["nvidia", "mistral", "openrouter"];
 const PROVIDER_CONFIG = {
   groq: { baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY", model: "openai/gpt-oss-120b" },
-  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" },
+  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", model: "nvidia/nemotron-3-ultra-550b-a55b" },
   mistral: { baseURL: "https://api.mistral.ai/v1", apiKeyEnv: "MISTRAL_API_KEY", model: "mistral-medium-3-5" },
   // 2026-10-04: model was gemini-1.5-pro - verified dead against the real
   // endpoint (HTTP 404 "no longer available to new users"; every pro-tier
@@ -1693,7 +1693,16 @@ function resolveVertexBaseURL(cfg) {
 //
 // 2026-09-15 (CONFIG-ENRICH-b): added Google quota errors (RESOURCE_EXHAUSTED,
 // quota exceeded, 429) to trigger auto-switch from Google to Vertex.
-const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|Service Unavailable|503|No deployments available|RateLimitError|RATE_LIMIT|rate_limit_exceeded|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|hook dispatch failed|operation timed out|timed out after|RESOURCE_EXHAUSTED|quota exceeded|429|413|Payload Too Large|rate limit/i;
+// 2026-10-21 (QUEUE-FIX-STRUCTURED-ERRORS-e): RESOURCE_?EXHAUSTED with
+// optional underscore - NVIDIA's NIM emits gRPC camelCase "ResourceExhausted"
+// (real failure, task 110 run 39551690008: "ResourceExhausted: Worker local
+// total request limit reached (16/16)") while the classic snake_case
+// RESOURCE_EXHAUSTED spelling covers Vertex/gRPC-JSON shapes; plain /i cannot
+// bridge the underscore, so the old RESOURCE_EXHAUSTED token let a genuine
+// capacity failure through to the fatal path with no rotation. "request
+// limit reached" and the explicit 16/16 ratio catch the same NVIDIA worker
+// message by its own words.
+const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|Service Unavailable|503|No deployments available|RateLimitError|RATE_LIMIT|rate_limit_exceeded|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|hook dispatch failed|operation timed out|timed out after|RESOURCE_?EXHAUSTED|quota exceeded|request limit reached|16\/16|429|413|Payload Too Large|rate limit/i;
 
 function nextProvider(current, tried) {
   const remaining = PROVIDER_ORDER.filter((p) => !tried.has(p));
