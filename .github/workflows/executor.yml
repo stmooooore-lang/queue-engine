@@ -333,9 +333,9 @@ jobs:
                 api: openai-completions
                 baseURL: https://openrouter.ai/api/v1
                 models:
-                  - id: thinkingmachines/inkling:free
-                    name: Thinking Machines Inkling (Free)
-                    contextWindow: 1048576
+                  - id: nvidia/nemotron-3-ultra-550b-a55b:free
+                    name: NVIDIA Nemotron 3 Ultra (free)
+                    contextWindow: 131072
                     compat:
                       supportsStore: false
                   - id: meta-llama/llama-3.3-70b-instruct
