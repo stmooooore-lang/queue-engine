@@ -333,9 +333,9 @@ jobs:
                 api: openai-completions
                 baseURL: https://openrouter.ai/api/v1
                 models:
-                  - id: thinking-machines/inkling:free
+                  - id: thinkingmachines/inkling:free
                     name: Thinking Machines Inkling (Free)
-                    contextWindow: 131072
+                    contextWindow: 1048576
                     compat:
                       supportsStore: false
                   - id: meta-llama/llama-3.3-70b-instruct

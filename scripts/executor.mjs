@@ -1663,7 +1663,7 @@ const PROVIDER_CONFIG = {
     api: 'openai-completions',
     baseURL: 'https://openrouter.ai/api/v1',
     apiKeyEnv: 'OPENROUTER_API_KEY',
-    model: 'thinking-machines/inkling:free',
+    model: 'thinkingmachines/inkling:free',
   },
 };
 
