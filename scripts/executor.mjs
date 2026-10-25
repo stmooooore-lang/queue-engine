@@ -1481,9 +1481,15 @@ async function run() {
   // persistent "заблокирована" status instead of "провал" - retrying the
   // same brief on a different provider cannot fix any of these, mirroring
   // queue.sh's own queue-blocked.txt semantics.
+  // 2026-10-24 (founder brief): a daily-rate-limit pause (result.paused,
+  // set in doWork's exhausted-rotation path when the last error carries the
+  // daily-limit signature) returns the task to 'ожидает' - the queue then
+  // retries it after the provider's quota reset instead of burying the
+  // chain under a 'провал'.
   const status = result.success
     ? 'готова'
-    : (result.partial || result.status === 'partial' ? 'partial' : (result.permanent ? 'заблокирована' : 'провал'));
+    : (result.paused ? 'ожидает'
+      : (result.partial || result.status === 'partial' ? 'partial' : (result.permanent ? 'заблокирована' : 'провал')));
   const minutesUsed = Math.ceil((workEnd - workStart) / 60000);
   const secondsToFirstWork = Math.floor((workStart - startTime) / 1000);
 
@@ -1513,6 +1519,20 @@ async function run() {
   if (status === 'провал' || status === 'заблокирована') {
     await writeChatAlert({
       type: "failure",
+      task: taskId,
+      from: result.provider || null,
+      to: null,
+      error: String(result.message).split("\n")[0],
+      details: result.message,
+    });
+  }
+
+  // 2026-10-24: a daily-rate-limit pause gets its own chat_alerts type so
+  // lifecycle consumers can tell "provider sleeps, will retry" apart from
+  // a real failure. The task itself already carries the reason in result.
+  if (result.paused && status === 'ожидает') {
+    await writeChatAlert({
+      type: EXECUTION_EVENTS.RATE_LIMIT_PAUSE,
       task: taskId,
       from: result.provider || null,
       to: null,
@@ -1704,6 +1724,41 @@ function resolveVertexBaseURL(cfg) {
 // message by its own words.
 const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|Service Unavailable|503|No deployments available|RateLimitError|RATE_LIMIT|rate_limit_exceeded|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|hook dispatch failed|operation timed out|timed out after|RESOURCE_?EXHAUSTED|quota exceeded|request limit reached|16\/16|429|413|Payload Too Large|rate limit/i;
 
+// 2026-10-24 (founder brief, "провайдер спит"): signature of a DAILY quota
+// exhaustion inside a 429 body - distinct from a per-minute 429, which the
+// cooldown retries in doWork can outwait. Real case, task 115 (runs
+// 40120100601 / 40126610771): openrouter's 429 carries
+// "X-RateLimit-Remaining":"0", "X-RateLimit-Reset":"<ms epoch>" and
+// limit_source "openrouter_free_tier_daily" / "free-models-per-day".
+// [^0-9]{0,5} bridges the JSON punctuation ("":"") between the header name
+// and its value, and (?!\d) keeps "Remaining":"50" from matching as 0.
+const DAILY_RATE_LIMIT_RE = /X-RateLimit-Remaining[^0-9]{0,5}0(?!\d)|Remaining:\s*0\b/i;
+const DAILY_RATE_LIMIT_SOURCE_RE = /limit_source[^,}\n]{0,60}daily|free-models-per-day|per[_ -]day|daily\s+(?:reset|limit|quota)/i;
+const RATE_LIMIT_RESET_RE = /X-RateLimit-Reset[^0-9]{0,5}(\d{10,})/i;
+
+/**
+ * Detects a daily rate-limit signature in a (possibly JSON-embedded) error
+ * message. Returns null when the message carries no daily-limit evidence.
+ *
+ * @param {string} msgText - raw (already redacted) error message
+ * @returns {{remainingZero: boolean, dailySource: boolean, resetMs: number|null, resetIso: string|null}|null}
+ */
+function detectDailyRateLimit(msgText) {
+  const text = String(msgText || "");
+  const remainingZero = DAILY_RATE_LIMIT_RE.test(text);
+  const dailySource = DAILY_RATE_LIMIT_SOURCE_RE.test(text);
+  if (!remainingZero && !dailySource) return null;
+  const resetMatch = text.match(RATE_LIMIT_RESET_RE);
+  const resetMs = resetMatch ? Number(resetMatch[1]) : null;
+  const resetOk = Number.isFinite(resetMs) && resetMs > 0 ? resetMs : null;
+  return {
+    remainingZero,
+    dailySource,
+    resetMs: resetOk,
+    resetIso: resetOk ? new Date(resetOk).toISOString() : null,
+  };
+}
+
 function nextProvider(current, tried) {
   const remaining = PROVIDER_ORDER.filter((p) => !tried.has(p));
   if (remaining.length === 0) return null;
@@ -1717,6 +1772,15 @@ function nextProvider(current, tried) {
 
 // Telegram caps a message at 4096 characters; keep well under it.
 const MAX_OUTPUT = 60000;
+
+// 2026-10-24 (founder brief): single-attempt dsh window, in minutes.
+// Raised 20 -> 40: task 115 was cut at the 20-min mark twice in a row with
+// real forward progress both times (runs 40120100601 / 40126610771,
+// timeout_progress avgSimilarity ~0.24 - working, not looping), so the
+// task simply needs more than one 20-min window. One named constant for
+// the timer, the error message and the error context so they cannot
+// drift apart again.
+const ATTEMPT_TIMEOUT_MINUTES = 40;
 
 function truncate(s) {
   return s.length > MAX_OUTPUT ? `${s.slice(0, MAX_OUTPUT)}\n… (обрезано)` : s;
@@ -2166,6 +2230,7 @@ const EXECUTION_EVENTS = {
   TIMEOUT_PROGRESS: "timeout_progress",
   TIMEOUT_LOOP: "timeout_loop",
   STUCK_TASK: "stuck_task",
+  RATE_LIMIT_PAUSE: "rate_limit_pause",
 };
 
 /**
@@ -2532,15 +2597,16 @@ async function runDshOnce(provider, text) {
       // segments, so it needs the recent tail, not the first bytes of a
       // 20-minute run.
       let reasoning = "";
-      // Job-level cap in executor.yml is 30 min total (checkout + install +
-      // settings write leaves ~27 min of work budget). 2026-10-21 (task-110
-      // chain, founder's call): single-attempt window raised 8 -> 20 min so a
-      // real task can finish on one provider instead of dying at the 8-min
-      // mark. At 20 min per attempt only ~one full attempt fits the job cap:
-      // a rotation into a second 20-min attempt risks Actions' own hard kill
-      // with no result written at all - the self-reported timeout below is
-      // the only graceful exit, so the first provider that boots must carry
-      // the task.
+      // Job-level cap in executor.yml is 50 min total (682f382, was 30).
+      // 2026-10-21 (task-110 chain, founder's call): single-attempt window
+      // raised 8 -> 20 min so a real task can finish on one provider
+      // instead of dying at the 8-min mark. 2026-10-24 (founder brief,
+      // task 115 cut at 20 min twice with real progress): raised 20 -> 40
+      // min via ATTEMPT_TIMEOUT_MINUTES. At 40 min the first booted
+      // provider alone must carry the task - a rotation into a second full
+      // attempt no longer fits the job cap, and Actions' own hard kill
+      // would leave the task claimed with no result written at all; the
+      // self-reported timeout below is the only graceful exit.
       const timer = setTimeout(() => {
         child.kill("SIGKILL");
         // GHQ2-d, 2026-09-14 (built directly by Claude Code, founder's own
@@ -2563,12 +2629,12 @@ async function runDshOnce(provider, text) {
         const avgSimilarity = classification.avgSimilarity;
         const code = isLoop ? ERROR_CODES.TIMEOUT_LOOP : ERROR_CODES.TIMEOUT_PROGRESS;
         const recoveryHint = isLoop ? RECOVERY_HINTS.ROTATE_PROVIDER : RECOVERY_HINTS.SPLIT_SUBTASKS;
-        const timeoutErr = new StructuredError("dsh timed out after 20min", {
+        const timeoutErr = new StructuredError(`dsh timed out after ${ATTEMPT_TIMEOUT_MINUTES}min`, {
           code,
           category: "timeout",
           context: {
             provider,
-            timeoutMinutes: 20,
+            timeoutMinutes: ATTEMPT_TIMEOUT_MINUTES,
             timeoutVerdict,
             isLoop,
             isProgress,
@@ -2582,7 +2648,7 @@ async function runDshOnce(provider, text) {
           avgSimilarity,
         });
         reject(timeoutErr);
-      }, 20 * 60 * 1000);
+      }, ATTEMPT_TIMEOUT_MINUTES * 60 * 1000);
       child.stdout.setEncoding("utf8");
       child.stdout.on("data", (d) => (out += d));
       // 2026-09-12: was `child.stderr.resume()` (discard) - real bug found
@@ -2846,6 +2912,35 @@ async function doWork(text, task) {
   const msg = redactSecrets(String(lastErr?.message || lastErr || "unknown error"));
   const lastDshError = lastErr?.dshError || parseDshStructuredError(msg);
   const isCapacity = (lastDshError?.errorCode === "QUOTA" || lastDshError?.errorCode === "RATE_LIMIT" || lastDshError?.action === "rotate" || lastDshError?.action === "cooldown") || CAPACITY_RE.test(msg);
+  // 2026-10-24 (founder brief, "провайдер спит"): when the provider chain is
+  // exhausted AND the last error carries a DAILY rate-limit signature, this
+  // is not a task failure - the provider is asleep until its quota resets
+  // (real case: task 115, runs 40120100601/40126610771 - openrouter's 429
+  // free-models-per-day was recorded as 'провал', parking every later SIB
+  // behind the sibling guard). Return the task to 'ожидает' with the reason
+  // (and reset time, when known) recorded in result: the queue then retries
+  // it and the first awake provider picks it up. Deliberately BEFORE the
+  // payload-decomposition block below - a sleeping provider says nothing
+  // about the payload size - and BEFORE escalateToFounder/diagnose: a pause
+  // is not an emergency and must not burn quota on a triage model.
+  const rateLimitShaped = /\b429\b|RATE_LIMIT|rate limit/i.test(msg);
+  const dailyLimit = rateLimitShaped ? detectDailyRateLimit(msg) : null;
+  if (dailyLimit) {
+    console.log(`[${new Date().toISOString()}] daily rate limit on ${provider} (Remaining: 0${dailyLimit.resetIso ? `, сброс квоты ${dailyLimit.resetIso}` : ""}) - провайдер спит: задача возвращается в 'ожидает' вместо 'провал'`);
+    return {
+      success: false,
+      paused: true,
+      provider,
+      message: truncate(`ПАУЗА (провайдер спит): ${provider} исчерпал дневной лимит (429, X-RateLimit-Remaining: 0${dailyLimit.resetIso ? `, сброс квоты ${dailyLimit.resetIso}` : ""}). Задача возвращена в 'ожидает' и будет повторена, когда квота провайдера сбросится. Последняя ошибка: ${msg.split("\n")[0]}`),
+      error: createStructuredError(lastErr, {
+        provider,
+        allProvidersExhausted: true,
+        dailyRateLimit: true,
+        dailyRateLimitReset: dailyLimit.resetIso,
+        taskId: task?.id,
+      }).toJSON(),
+    };
+  }
   // 2026-10-04: decompose on exhausted-provider capacity failure, not only on
   // timeout-progress. Real case, run 37214241683 / task 64: the payload
   // (12457 tokens) exceeds groq's on-demand TPM (8000) before the model even
@@ -3464,6 +3559,7 @@ export {
   PROVIDER_CONFIG,
   CAPACITY_RE,
   nextProvider,
+  detectDailyRateLimit,
   runDshOnce,
   parseDshStructuredError,
   resolveVertexBaseURL,
