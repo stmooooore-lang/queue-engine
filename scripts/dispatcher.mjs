@@ -50,6 +50,9 @@ import {
   classifyTimeoutKill,
   detectLoop,
   detectStuckTask,
+  TASK_STATUSES,
+  EXECUTION_EVENTS,
+  writeChatAlert,
 } from "./executor.mjs";
 
 // Ensure all console logs, errors and stream outputs in dispatcher are masked against secret leaks
@@ -92,7 +95,7 @@ async function main() {
   }
 
   const pending = await client.execute({
-    sql: "SELECT id, text FROM tasks WHERE status = 'ожидает' ORDER BY id ASC",
+    sql: "SELECT id, text FROM tasks WHERE status = 'ожидает' AND (paused_until IS NULL OR paused_until <= CURRENT_TIMESTAMP) ORDER BY id ASC",
   });
 
   for (const task of pending.rows) {
@@ -103,6 +106,12 @@ async function main() {
     const stuckCheck = detectStuckTask(task);
     if (stuckCheck.stuck) {
       console.log(mask_secrets(`[${new Date().toISOString()}] task ${task.id}: detected stuck loop (${stuckCheck.reason}), skipping dispatch`));
+      await writeChatAlert({
+        type: EXECUTION_EVENTS.STUCK_TASK,
+        task: task.id,
+        error: stuckCheck.reason,
+        details: `Task ${task.id} stuck in loop: ${stuckCheck.reason}`,
+      }, client).catch(() => {});
       continue;
     }
     try {
@@ -136,6 +145,9 @@ export {
   classifyTimeoutKill,
   detectLoop,
   detectStuckTask,
+  TASK_STATUSES,
+  EXECUTION_EVENTS,
+  writeChatAlert,
 };
 
 if (process.argv[1] && process.argv[1].endsWith('dispatcher.mjs')) {

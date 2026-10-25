@@ -1494,8 +1494,8 @@ async function run() {
   const secondsToFirstWork = Math.floor((workStart - startTime) / 1000);
 
   await client.execute({
-    sql: 'UPDATE tasks SET status = ?, result = ?, actions_run_id = ?, seconds_to_first_work = ?, minutes_used = ? WHERE id = ?',
-    args: [status, result.message, process.env.GITHUB_RUN_ID, secondsToFirstWork, minutesUsed, taskId]
+    sql: 'UPDATE tasks SET status = ?, result = ?, actions_run_id = ?, seconds_to_first_work = ?, minutes_used = ?, paused_until = ? WHERE id = ?',
+    args: [status, result.message, process.env.GITHUB_RUN_ID, secondsToFirstWork, minutesUsed, result.pausedUntil || null, taskId]
   });
 
   // Ensure correct tree completion when jobs are completed or resumed
@@ -2930,6 +2930,7 @@ async function doWork(text, task) {
     return {
       success: false,
       paused: true,
+      pausedUntil: dailyLimit.resetIso || null,
       provider,
       message: truncate(`ПАУЗА (провайдер спит): ${provider} исчерпал дневной лимит (429, X-RateLimit-Remaining: 0${dailyLimit.resetIso ? `, сброс квоты ${dailyLimit.resetIso}` : ""}). Задача возвращена в 'ожидает' и будет повторена, когда квота провайдера сбросится. Последняя ошибка: ${msg.split("\n")[0]}`),
       error: createStructuredError(lastErr, {
