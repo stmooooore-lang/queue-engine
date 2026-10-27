@@ -1662,31 +1662,30 @@ function checkoutTaskBranch(text) {
 // nvidia → mistral → vertex.
 const PROVIDER_ORDER = ["nvidia", "mistral", "openrouter"];
 const PROVIDER_CONFIG = {
-  groq: { baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY", model: "openai/gpt-oss-120b" },
-  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", model: "nvidia/nemotron-3-ultra-550b-a55b" },
-  mistral: { baseURL: "https://api.mistral.ai/v1", apiKeyEnv: "MISTRAL_API_KEY", model: "mistral-medium-3-5" },
+  groq: { baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY", models: ["openai/gpt-oss-120b"] },
+  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", models: ["deepseek-ai/deepseek-v4.1-flash", "nvidia/nemotron-3-ultra-550b-a55b", "z-ai/glm-5.3"] },
+  mistral: { baseURL: "https://api.mistral.ai/v1", apiKeyEnv: "MISTRAL_API_KEY", models: ["mistral-medium-3-5"] },
   // 2026-10-04: model was gemini-1.5-pro - verified dead against the real
   // endpoint (HTTP 404 "no longer available to new users"; every pro-tier
   // model carries free-tier limit 0 on the current key, 429). gemini-3.8-flash
   // verified with a real HTTP 200 chat completion. Same id now in the
   // workflow's settings.yaml google entry - the dsh --patch overlay (line
   // 473) selects the model from HERE, so code and yaml must agree.
-  google: { baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", apiKeyEnv: "GOOGLE_API_KEY", model: "gemini-3.8-flash" },
+  google: { baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", apiKeyEnv: "GOOGLE_API_KEY", models: ["gemini-3.8-flash"] },
   // 2026-10-07: baseURL переведён на OpenAI-совместимый endpoint Vertex
   // (/endpoints/openapi), потому что код ниже склеивает к нему
   // /chat/completions. Native путь /publishers/google/models/ не подходит.
   // model обновлена на gemini-3.8-flash (1.5-pro мертва, 404). location
   // по умолчанию global — Gemini 3.x на региональных endpoint'ах не
-  // находит эти модели.
-  vertex: { baseURL: "https://${VERTEX_LOCATION:-global}-aiplatform.googleapis.com/v1/projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION:-global}/endpoints/openapi", apiKeyEnv: "VERTEX_ACCESS_TOKEN", model: "gemini-3.8-flash" },
+  // находят эти модели.
+  vertex: { baseURL: "https://${VERTEX_LOCATION:-global}-aiplatform.googleapis.com/v1/projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION:-global}/endpoints/openapi", apiKeyEnv: "VERTEX_ACCESS_TOKEN", models: ["gemini-3.8-flash"] },
   openrouter: {
     api: 'openai-completions',
     baseURL: 'https://openrouter.ai/api/v1',
     apiKeyEnv: 'OPENROUTER_API_KEY',
-    model: 'nvidia/nemotron-3-ultra-550b-a55b:free',
+    models: ['nvidia/nemotron-3-ultra-550b-a55b:free', 'thinking-machines/inkling:free'],
   },
 };
-
 // Helper to resolve Vertex baseURL with env vars at runtime (shell-style ${VAR:-default} not interpolated in JS)
 function resolveVertexBaseURL(cfg) {
   if (cfg.baseURL.includes("${")) {
@@ -1780,7 +1779,14 @@ const MAX_OUTPUT = 60000;
 // task simply needs more than one 20-min window. One named constant for
 // the timer, the error message and the error context so they cannot
 // drift apart again.
-const ATTEMPT_TIMEOUT_MINUTES = 40;
+// 2026-10-25 (founder brief, intra-provider rotation): lowered 40 -> 20.
+// With models rotating inside a provider and providers rotating after
+// that, 40 min for the FIRST attempt left no room for a second one inside
+// the job cap. Now the job cap is 90 min (executor.yml) and one attempt
+// is 20 min, so a task can genuinely burn through several
+// model/provider pairs before the runner itself is killed - the same
+// reason the job cap was raised in the same change.
+const ATTEMPT_TIMEOUT_MINUTES = 20;
 
 function truncate(s) {
   return s.length > MAX_OUTPUT ? `${s.slice(0, MAX_OUTPUT)}\n… (обрезано)` : s;
@@ -2536,8 +2542,12 @@ function detectStuckTask(task, options = {}) {
  * other real dsh call this project has made tonight - a headless runner has
  * no human to approve tool calls interactively.
  */
-async function runDshOnce(provider, text) {
+async function runDshOnce(provider, text, model) {
   const cfg = PROVIDER_CONFIG[provider];
+  // 2026-10-25 (intra-provider rotation): the model to run is now passed
+  // in by the caller (doWork's model loop); fall back to the provider's
+  // first model when no explicit one is given (smoke checks, direct calls).
+  const modelToUse = model || cfg.models[0];
   // 2026-09-13: real bug found via plexus-doc-ce's Groq 413s on trivial
   // tasks after WORKDIR became the real plexus-doc repo (commit e84a572).
   // dsh's own "standard" preset (dsh-agent-presets/presets/standard/
@@ -2575,7 +2585,7 @@ async function runDshOnce(provider, text) {
   const noTriage = typeof text === "string" && text.includes("[NO-TRIAGE]");
   const agentsBytes = noTriage ? 1024 : 32768;
   const agentsFileLine = noTriage ? "" : '\n    instructionFileCandidates: ["AGENTS.md"]';
-  const patchContent = `- id: agent-default-model\n  config:\n    provider: ${provider}\n    model: ${cfg.model}\n- id: agent-instructions\n  config:\n    maxBytes: ${agentsBytes}${agentsFileLine}\n`;
+  const patchContent = `- id: agent-default-model\n  config:\n    provider: ${provider}\n    model: ${modelToUse}\n- id: agent-instructions\n  config:\n    maxBytes: ${agentsBytes}${agentsFileLine}\n`;
   const patchFile = path.join(os.tmpdir(), `dsh-patch-${Date.now()}-${Math.random().toString(36).slice(2)}.yml`);
   await writeFile(patchFile, patchContent, "utf-8");
   try {
@@ -2597,16 +2607,17 @@ async function runDshOnce(provider, text) {
       // segments, so it needs the recent tail, not the first bytes of a
       // 20-minute run.
       let reasoning = "";
-      // Job-level cap in executor.yml is 50 min total (682f382, was 30).
+      // Job-level cap in executor.yml is 90 min total (2026-10-25, was 50).
       // 2026-10-21 (task-110 chain, founder's call): single-attempt window
       // raised 8 -> 20 min so a real task can finish on one provider
       // instead of dying at the 8-min mark. 2026-10-24 (founder brief,
       // task 115 cut at 20 min twice with real progress): raised 20 -> 40
-      // min via ATTEMPT_TIMEOUT_MINUTES. At 40 min the first booted
-      // provider alone must carry the task - a rotation into a second full
-      // attempt no longer fits the job cap, and Actions' own hard kill
+      // min via ATTEMPT_TIMEOUT_MINUTES. 2026-10-25 (intra-provider
+      // rotation): returned to 20 min, because the job cap went 50 -> 90 -
+      // at 20 min per attempt a task can now spend several attempts
+      // alternating models and providers before Actions' own hard kill
       // would leave the task claimed with no result written at all; the
-      // self-reported timeout below is the only graceful exit.
+      // self-reported timeout below remains the only graceful exit.
       const timer = setTimeout(() => {
         child.kill("SIGKILL");
         // GHQ2-d, 2026-09-14 (built directly by Claude Code, founder's own
@@ -2763,15 +2774,74 @@ async function doWork(text, task) {
       message: cmdResult.success ? (cmdResult.stdout || 'Command executed successfully') : (failureMsg || 'Command failed')
     };
   }
+  // 2026-10-25 (intra-provider rotation): the rotation loop is two-level now
+  // - an OUTER walk over PROVIDER_ORDER and an INNER walk over
+  // PROVIDER_CONFIG[provider].models. A model that fails is replaced by the
+  // NEXT MODEL OF THE SAME PROVIDER; only when that provider's whole model
+  // list is exhausted does the walk move on to the next provider.
+  // `tried` keeps its old meaning (PROVIDERS fully exhausted - it is what
+  // nextProvider() consumes), `triedModels` tracks individual
+  // `provider:model` pairs so one pair is never attempted twice in a run.
   const tried = new Set();
+  const triedModels = new Set();
   let provider = PROVIDER_ORDER[0];
+  let modelIdx = 0;
   let lastErr = null;
+  let lastModel = null;
   let attemptLog = "";
+  // Cooldown bookkeeping is per provider:model now - a per-minute 429 on one
+  // model says nothing about the next model of the same provider.
   const cooldownCounts = {};
-  for (let attempt = 0; attempt < PROVIDER_ORDER.length; attempt++) {
-    tried.add(provider);
+  // Bound of the whole two-level walk: each (provider, model) pair once.
+  const totalModelAttempts = PROVIDER_ORDER.reduce(
+    (n, p) => n + Math.max(1, (PROVIDER_CONFIG[p]?.models || []).length),
+    0
+  );
+  for (let attempt = 0; attempt < totalModelAttempts; attempt++) {
+    const providerModels = PROVIDER_CONFIG[provider]?.models || [];
+    const model = providerModels[Math.min(modelIdx, Math.max(0, providerModels.length - 1))] || "";
+    lastModel = model;
+    triedModels.add(`${provider}:${model}`);
+    // The single forward step of the walk: next model of THIS provider
+    // first, and only then the next provider. Returns false when the whole
+    // chain is exhausted. `tried` is mutated only on the provider step, so
+    // nextProvider()/the exhaustion path keep seeing the same picture as
+    // before this change.
+    const advanceTarget = () => {
+      const models = PROVIDER_CONFIG[provider]?.models || [];
+      for (let mi = modelIdx + 1; mi < models.length; mi++) {
+        if (!triedModels.has(`${provider}:${models[mi]}`)) {
+          modelIdx = mi;
+          return true;
+        }
+      }
+      const next = nextProvider(provider, tried);
+      // nextProvider() can return the CURRENT provider itself when every
+      // other provider is already in `tried` but the current one is not
+      // (it is added to `tried` only when the walk advances AWAY from it -
+      // and on the last provider that never happens). That is not a step
+      // forward but a silent cycle back to the provider's first model -
+      // caught live by the 2026-10-25 smoke run, whose final rotation
+      // logged "switching to openrouter/nvidia/...:free" while standing on
+      // openrouter. Treat it as chain exhaustion.
+      if (next === null || next === provider) return false;
+      tried.add(provider);
+      provider = next;
+      modelIdx = 0;
+      return true;
+    };
+    // What advanceTarget() WOULD pick, without applying it - used for the
+    // `to:` field of chat_alerts, which is written before the step is taken.
+    const peekNextTarget = () => {
+      const models = PROVIDER_CONFIG[provider]?.models || [];
+      for (let mi = modelIdx + 1; mi < models.length; mi++) {
+        if (!triedModels.has(`${provider}:${models[mi]}`)) return `${provider}/${models[mi]}`;
+      }
+      const remaining = PROVIDER_ORDER.filter((p) => p !== provider && !tried.has(p));
+      return remaining.length > 0 ? remaining[0] : null;
+    };
     try {
-      const rawBody = await runDshOnce(provider, text);
+      const rawBody = await runDshOnce(provider, text, model);
       const sanitized = rawBody ? sanitizeModelText(rawBody) : "";
       const isGarbage = rawBody !== "" && sanitized !== rawBody;
       const body = rawBody ? sanitized : "(агент ничего не ответил)";
@@ -2786,9 +2856,9 @@ async function doWork(text, task) {
           console.error(`[DEBUG RAW 400 BODY google] body=${String(err?.body || err?.response?.body || err?.response?.data || err?.context?.stderrSnippet || err?.message || err || "none")}`);
         }
       }
-      const structuredErr = createStructuredError(err, { provider, attempt, taskId: task?.id });
+      const structuredErr = createStructuredError(err, { provider, model, attempt, taskId: task?.id });
       const msg = redactSecrets(String(err.message || err));
-      attemptLog += `--- attempt on ${provider} ---\n${msg}\n\n`;
+      attemptLog += `--- attempt on ${provider}/${model} ---\n${msg}\n\n`;
       // TIMECEIL-CLOUD, 2026-09-14 (built directly by Claude Code,
       // founder's own real-time call - ports the real fix already landed
       // in the local queue's queue.sh for TIMECEIL, not a new design).
@@ -2824,18 +2894,21 @@ async function doWork(text, task) {
       // retrying the identical prompt on the identical provider that just
       // looped cannot help, a different model can.
       if (err.isLoop) {
-        const next = nextProvider(provider, tried);
+        const fromLabel = `${provider}/${model}`;
+        const toLabel = peekNextTarget();
         await writeChatAlert({
           type: EXECUTION_EVENTS.TIMEOUT_LOOP,
           task: task?.id || "",
-          from: provider,
-          to: next,
+          from: fromLabel,
+          to: toLabel,
           error: "Loop detected: repetitive reasoning segments or stuck state",
-          details: `Repetitive loop detected on provider ${provider} (similarity: ${err.avgSimilarity ?? ">=0.5"})`,
+          details: `Repetitive loop detected on ${fromLabel} (similarity: ${err.avgSimilarity ?? ">=0.5"})`,
         }).catch(() => {});
-        if (next === null) break;
-        console.log(`[${new Date().toISOString()}] loop-detected failure on ${provider} - switching to ${next}`);
-        provider = next;
+        // A different MODEL of the same provider is a genuinely different
+        // attempt for a looped prompt, so the model step is taken first
+        // here too - same order as a capacity failure.
+        if (!advanceTarget()) break;
+        console.log(`[${new Date().toISOString()}] loop-detected failure on ${fromLabel} - switching to ${provider}/${PROVIDER_CONFIG[provider]?.models?.[modelIdx] || "?"}`);
         continue;
       }
 
@@ -2861,27 +2934,28 @@ async function doWork(text, task) {
       if (dshError?.errorCode === "RATE_LIMIT" || dshError?.action === "cooldown") {
         const delaySec = dshError.retryDelay > 0 ? (dshError.retryDelay + 5) : 15;
         const cappedDelaySec = Math.min(delaySec, 60);
-        const count = cooldownCounts[provider] || 0;
+        const cooldownKey = `${provider}:${model}`;
+        const count = cooldownCounts[cooldownKey] || 0;
         if (count < 2) {
-          cooldownCounts[provider] = count + 1;
-          console.log(`[${new Date().toISOString()}] structured error.code=RATE_LIMIT on ${provider} (retryDelay: ${dshError.retryDelay}s) -> action: cooldown (pause ${cappedDelaySec}s, retry attempt ${count + 1}/2 on same provider)`);
+          cooldownCounts[cooldownKey] = count + 1;
+          console.log(`[${new Date().toISOString()}] structured error.code=RATE_LIMIT on ${cooldownKey} (retryDelay: ${dshError.retryDelay}s) -> action: cooldown (pause ${cappedDelaySec}s, retry attempt ${count + 1}/2 on same model)`);
           await new Promise((r) => setTimeout(r, cappedDelaySec * 1000));
           attempt--;
           continue;
         } else {
-          console.log(`[${new Date().toISOString()}] RATE_LIMIT persisted on ${provider} after ${count} cooldowns — rotating to next provider`);
-          const next = nextProvider(provider, tried);
-          if (next === null) break;
-          provider = next;
+          // A per-minute cooldown that did not clear: stop spending time on
+          // this pair. Next model of the same provider first, next provider
+          // only after that - the model rotation this change introduces.
+          console.log(`[${new Date().toISOString()}] RATE_LIMIT persisted on ${cooldownKey} after ${count} cooldowns — rotating to next model/provider`);
+          if (!advanceTarget()) break;
           continue;
         }
       }
 
       if (dshError?.errorCode === "QUOTA" || dshError?.action === "rotate") {
-        const next = nextProvider(provider, tried);
-        if (next === null) break;
-        console.log(`[${new Date().toISOString()}] structured error.code=QUOTA on ${provider} -> action: rotate (switching to ${next})`);
-        provider = next;
+        const fromLabel = `${provider}/${model}`;
+        if (!advanceTarget()) break;
+        console.log(`[${new Date().toISOString()}] structured error.code=QUOTA on ${fromLabel} -> action: rotate (switching to ${provider}/${PROVIDER_CONFIG[provider]?.models?.[modelIdx] || "?"})`);
         continue;
       }
 
@@ -2896,10 +2970,9 @@ async function doWork(text, task) {
           error: structuredErr.toJSON(),
         };
       }
-      const next = nextProvider(provider, tried);
-      if (next === null) break;
-      console.log(`[${new Date().toISOString()}] capacity-shaped failure on ${provider} (${msg.split("\n")[0]}) - switching to ${next}`);
-      provider = next;
+      const fromLabel = `${provider}/${model}`;
+      if (!advanceTarget()) break;
+      console.log(`[${new Date().toISOString()}] capacity-shaped failure on ${fromLabel} (${msg.split("\n")[0]}) - switching to ${provider}/${PROVIDER_CONFIG[provider]?.models?.[modelIdx] || "?"}`);
     }
   }
   // Все провайдеры исчерпаны
@@ -2926,18 +2999,47 @@ async function doWork(text, task) {
   const rateLimitShaped = /\b429\b|RATE_LIMIT|rate limit/i.test(msg);
   const dailyLimit = rateLimitShaped ? detectDailyRateLimit(msg) : null;
   if (dailyLimit) {
-    console.log(`[${new Date().toISOString()}] daily rate limit on ${provider} (Remaining: 0${dailyLimit.resetIso ? `, сброс квоты ${dailyLimit.resetIso}` : ""}) - провайдер спит: задача возвращается в 'ожидает' вместо 'провал'`);
+    // 2026-10-25 (founder brief, "агрессивная пауза"): WHERE in the chain the
+    // daily-limit 429 came from now decides how long the task sleeps.
+    // Before this fix any daytime 429 parked the task until the reporting
+    // provider's own X-RateLimit-Reset (typically midnight), so a 429 from
+    // the LAST provider (openrouter) put the whole queue to sleep until
+    // midnight even though the chain is retried from the TOP on the next
+    // dispatch and the FIRST provider's quota has usually recovered by
+    // then. Rules:
+    //  - LAST provider of PROVIDER_ORDER: short pause (now + 15 min) - the
+    //    head of the chain gets a fresh chance almost immediately.
+    //  - FIRST provider of PROVIDER_ORDER: its reset time IS the chain's
+    //    real wait - keep the X-RateLimit-Reset pause, as before.
+    //  - Middle providers keep the reset-based pause too: the recorded
+    //    reset is the honest signal available and this is not the reported
+    //    bug. If first and last are the same provider (single-entry chain),
+    //    the first-provider rule wins - the reset time is then the only
+    //    honest wait.
+    const isFirstProvider = provider === PROVIDER_ORDER[0];
+    const isLastProvider = provider === PROVIDER_ORDER[PROVIDER_ORDER.length - 1];
+    const SHORT_PAUSE_MINUTES = 15;
+    const shortPause = isLastProvider && !isFirstProvider;
+    const shortPauseIso = new Date(Date.now() + SHORT_PAUSE_MINUTES * 60 * 1000).toISOString();
+    const pausedUntil = shortPause ? shortPauseIso : (dailyLimit.resetIso || null);
+    const pauseReason = shortPause
+      ? `короткая пауза ${SHORT_PAUSE_MINUTES} мин: 429 от последнего провайдера цепочки (${provider}), следующий диспатч начнёт цепочку заново с ${PROVIDER_ORDER[0]}`
+      : `пауза до сброса квоты: 429 от ${isFirstProvider ? "первого" : "промежуточного"} провайдера цепочки (${provider}), быстрее сброса ждать нечего`;
+    console.log(`[${new Date().toISOString()}] daily rate limit on ${provider}/${lastModel || "?"} (Remaining: 0${dailyLimit.resetIso ? `, сброс квоты ${dailyLimit.resetIso}` : ""}) - провайдер спит: задача возвращается в 'ожидает' вместо 'провал' (${pauseReason})`);
     return {
       success: false,
       paused: true,
-      pausedUntil: dailyLimit.resetIso || null,
+      pausedUntil,
       provider,
-      message: truncate(`ПАУЗА (провайдер спит): ${provider} исчерпал дневной лимит (429, X-RateLimit-Remaining: 0${dailyLimit.resetIso ? `, сброс квоты ${dailyLimit.resetIso}` : ""}). Задача возвращена в 'ожидает' и будет повторена, когда квота провайдера сбросится. Последняя ошибка: ${msg.split("\n")[0]}`),
+      message: truncate(`ПАУЗА (провайдер спит): ${provider}${lastModel ? `/${lastModel}` : ""} исчерпал дневной лимит (429, X-RateLimit-Remaining: 0${dailyLimit.resetIso ? `, сброс квоты ${dailyLimit.resetIso}` : ""}). ${pauseReason}. Задача возвращена в 'ожидает' и будет повторена${pausedUntil ? ` не раньше ${pausedUntil}` : ""}. Последняя ошибка: ${msg.split("\n")[0]}`),
       error: createStructuredError(lastErr, {
         provider,
+        model: lastModel,
         allProvidersExhausted: true,
         dailyRateLimit: true,
         dailyRateLimitReset: dailyLimit.resetIso,
+        pauseStrategy: shortPause ? "short" : "reset",
+        pausedUntil,
         taskId: task?.id,
       }).toJSON(),
     };
@@ -3083,7 +3185,7 @@ function parseFailedPlugins(log) {
  */
 async function smokeCheckProfile(options = {}) {
   const provider = options.provider || "nvidia";
-  const model = options.model || (PROVIDER_CONFIG[provider]?.model || "default-model");
+  const model = options.model || (PROVIDER_CONFIG[provider]?.models?.[0] || "default-model");
   const patchContent = `- id: agent-default-model\n  config:\n    provider: ${provider}\n    model: ${model}\n`;
   const patchFile = path.join(os.tmpdir(), `dsh-smoke-${Date.now()}-${Math.random().toString(36).slice(2)}.yml`);
   await writeFile(patchFile, patchContent, "utf-8");
@@ -3330,7 +3432,7 @@ async function triageCheck(text, payloadFact) {
       // 2026-10-04: the payload fact (when given) sits between the prompt's
       // own instructions and the task text - the model decides with the real
       // numbers in view, not on the brief's size alone.
-      body: JSON.stringify({ model: cfg.model, messages: [{ role: "user", content: TRIAGE_PROMPT + (payloadFact ? `ФАКТ О РАЗМЕРЕ PAYLOAD (проверен, не оценка):\n${payloadFact}\n\n---\n` : "") + text }] }),
+      body: JSON.stringify({ model: cfg.models[0], messages: [{ role: "user", content: TRIAGE_PROMPT + (payloadFact ? `ФАКТ О РАЗМЕРЕ PAYLOAD (проверен, не оценка):\n${payloadFact}\n\n---\n` : "") + text }] }),
       signal: AbortSignal.timeout(30000),
     });
     if (!res.ok) return { split: false };
@@ -3504,7 +3606,7 @@ async function diagnose(brief, log) {
     const res = await fetch(`${cfg.baseURL.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model: cfg.model, messages: [{ role: "user", content: prompt }] }),
+      body: JSON.stringify({ model: cfg.models[0], messages: [{ role: "user", content: prompt }] }),
       signal: AbortSignal.timeout(30000),
     });
     if (!res.ok) return null;

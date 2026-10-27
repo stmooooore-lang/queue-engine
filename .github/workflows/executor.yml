@@ -29,7 +29,7 @@ concurrency:
 jobs:
   execute:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -270,8 +270,17 @@ jobs:
                 apiKeyEnv: NVIDIA_API_KEY
                 api: openai-completions
                 baseURL: https://integrate.api.nvidia.com/v1
+                # 2026-10-25 (intra-provider rotation): the whole models array
+                # from PROVIDER_CONFIG.nvidia must be declared here too - the
+                # dsh --patch overlay selects the model from executor.mjs, so
+                # code and yaml must agree, or rotation dies with
+                # NO_ADAPTER/model-not-registered on the undeclared ids.
                 models:
+                  - id: deepseek-ai/deepseek-v4.1-flash
+                    contextWindow: 131072
                   - id: nvidia/nemotron-3-ultra-550b-a55b
+                    contextWindow: 131072
+                  - id: z-ai/glm-5.3
                     contextWindow: 131072
               mistral:
                 apiKeyEnv: MISTRAL_API_KEY
@@ -333,9 +342,17 @@ jobs:
                 apiKeyEnv: OPENROUTER_API_KEY
                 api: openai-completions
                 baseURL: https://openrouter.ai/api/v1
+                # 2026-10-25 (intra-provider rotation): thinking-machines/inkling:free
+                # is the second model of PROVIDER_CONFIG.openrouter - declared
+                # here for the same reason as the nvidia ids above.
                 models:
                   - id: nvidia/nemotron-3-ultra-550b-a55b:free
                     name: NVIDIA Nemotron 3 Ultra (free)
+                    contextWindow: 131072
+                    compat:
+                      supportsStore: false
+                  - id: thinking-machines/inkling:free
+                    name: Thinking Machines Inkling (free)
                     contextWindow: 131072
                     compat:
                       supportsStore: false
