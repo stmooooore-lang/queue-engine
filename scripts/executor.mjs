@@ -928,6 +928,7 @@ async function uploadTaskCheckpointsAndArtifacts(taskId, options = {}) {
 
     const branch = execSync("git branch --show-current", { cwd: targetDir, stdio: "pipe" }).toString().trim();
     if (branch) {
+      execSync(`git pull --rebase origin ${branch}`, { cwd: targetDir, stdio: "pipe" });
       execSync(`git push origin ${branch}`, { cwd: targetDir, stdio: "pipe" });
       console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: committed and pushed ${status.split('\n').length} file(s) (${modeLabel}) to origin/${branch}`);
     } else {
@@ -1596,6 +1597,7 @@ async function pushTaskArtifacts() {
     const commitMsg = `task ${process.env.TASK_ID}: ${firstFile}`;
     execSync(`git commit -m "${commitMsg.replace(/"/g, '\"')}"`, { cwd: WORKDIR, stdio: "pipe" });
     const branch = execSync("git branch --show-current", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
+    execSync(`git pull --rebase origin ${branch}`, { cwd: WORKDIR, stdio: "pipe" });
     execSync(`git push origin ${branch}`, { cwd: WORKDIR, stdio: "pipe" });
     console.log(`[${new Date().toISOString()}] push: committed and pushed ${status.split('\n').length} file(s) to origin/${branch}`);
     return true;
