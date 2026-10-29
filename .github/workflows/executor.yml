@@ -342,22 +342,20 @@ jobs:
                 apiKeyEnv: OPENROUTER_API_KEY
                 api: openai-completions
                 baseURL: https://openrouter.ai/api/v1
-                # 2026-10-25 (intra-provider rotation): thinking-machines/inkling:free
-                # is the second model of PROVIDER_CONFIG.openrouter - declared
-                # here for the same reason as the nvidia ids above.
+                # 2026-10-25 (intra-provider rotation): updated to valid model IDs from OpenRouter catalog
                 models:
                   - id: nvidia/nemotron-3-ultra-550b-a55b:free
                     name: NVIDIA Nemotron 3 Ultra (free)
                     contextWindow: 131072
                     compat:
                       supportsStore: false
-                  - id: thinking-machines/inkling:free
+                  - id: thinkingmachines/inkling:free
                     name: Thinking Machines Inkling (free)
                     contextWindow: 131072
                     compat:
                       supportsStore: false
-                  - id: meta-llama/llama-3.3-70b-instruct
-                    name: Llama 3.3 70B
+                  - id: thinkingmachines/inkling-small:free
+                    name: Thinking Machines Inkling Small (free)
                     contextWindow: 131072
                     compat:
                       supportsStore: false

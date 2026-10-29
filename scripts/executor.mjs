@@ -1377,6 +1377,9 @@ async function run() {
   const task = taskRes.rows[0];
   if (!task) { console.log('No pending or partial task found'); return; }
 
+  // Preflight model validation (once per run)
+  await preflightCheckModels();
+
   // GHQ2-c, 2026-09-14: a triage-split subtask does not run before its
   // earlier, still-unaccepted sibling - leaves status untouched ('ожидает')
   // so a future dispatch for this same taskId gets a fresh chance once the
@@ -1685,7 +1688,7 @@ const PROVIDER_CONFIG = {
     api: 'openai-completions',
     baseURL: 'https://openrouter.ai/api/v1',
     apiKeyEnv: 'OPENROUTER_API_KEY',
-    models: ['nvidia/nemotron-3-ultra-550b-a55b:free', 'thinking-machines/inkling:free'],
+    models: ['nvidia/nemotron-3-ultra-550b-a55b:free', 'thinkingmachines/inkling:free', 'thinkingmachines/inkling-small:free'],
   },
 };
 // Helper to resolve Vertex baseURL with env vars at runtime (shell-style ${VAR:-default} not interpolated in JS)
@@ -1725,6 +1728,8 @@ function resolveVertexBaseURL(cfg) {
 // message by its own words.
 const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|Service Unavailable|503|No deployments available|RateLimitError|RATE_LIMIT|rate_limit_exceeded|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|hook dispatch failed|operation timed out|timed out after|RESOURCE_?EXHAUSTED|quota exceeded|request limit reached|16\/16|429|410|404|413|Payload Too Large|rate limit|MODEL_NOT_FOUND/i;
 
+const INVALID_MODEL_RE = /not a valid model|invalid model|model not found/i;
+
 // 2026-10-24 (founder brief, "провайдер спит"): signature of a DAILY quota
 // exhaustion inside a 429 body - distinct from a per-minute 429, which the
 // cooldown retries in doWork can outwait. Real case, task 115 (runs
@@ -1736,6 +1741,82 @@ const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|Service Unav
 const DAILY_RATE_LIMIT_RE = /X-RateLimit-Remaining[^0-9]{0,5}0(?!\d)|Remaining:\s*0\b/i;
 const DAILY_RATE_LIMIT_SOURCE_RE = /limit_source[^,}\n]{0,60}daily|free-models-per-day|per[_ -]day|daily\s+(?:reset|limit|quota)/i;
 const RATE_LIMIT_RESET_RE = /X-RateLimit-Reset[^0-9]{0,5}(\d{10,})/i;
+
+/**
+ * Preflight model check: validates each model in PROVIDER_CONFIG by making a
+ * lightweight request to the provider's /models endpoint (or a cheap
+ * completion with max_tokens=1). Models that return 400/404/410 with
+ * "model not found" are pruned. Results are cached for the duration of the run.
+ */
+async function preflightCheckModels() {
+  for (const provider of PROVIDER_ORDER) {
+    const cfg = PROVIDER_CONFIG[provider];
+    if (!cfg || !cfg.models || cfg.models.length === 0) continue;
+    const baseURL = cfg.baseURL;
+    const apiKey = process.env[cfg.apiKeyEnv];
+    if (!apiKey) {
+      console.log(`[${new Date().toISOString()}] PREFLIGHT: ${provider} missing API key, skipping`);
+      continue;
+    }
+    const validModels = [];
+    for (const model of cfg.models) {
+      try {
+        // Lightweight GET /models (most OpenAI-compatible providers support it)
+        const resp = await fetch(`${baseURL.replace(/\/chat\/completions$/, '')}/models`, {
+          headers: { Authorization: `Bearer ${apiKey}` },
+          signal: AbortSignal.timeout(5000),
+        });
+        let modelFound = false;
+        if (resp.ok) {
+          const data = await resp.json();
+          const ids = new Set((data.data || []).map(m => m.id));
+          if (ids.has(model)) {
+            modelFound = true;
+          }
+        }
+        if (!modelFound) {
+          // Fallback cheap completion (max_tokens=1) to verify model exists
+          const compResp = await fetch(`${baseURL}/chat/completions`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 }),
+            signal: AbortSignal.timeout(5000),
+          });
+          if (compResp.ok) {
+            modelFound = true;
+          } else if (compResp.status === 400 || compResp.status === 404 || compResp.status === 410) {
+            const txt = await compResp.text().catch(() => '');
+            if (INVALID_MODEL_RE.test(txt) || /model not found|does not exist|invalid model/i.test(txt)) {
+              console.log(`[${new Date().toISOString()}] PRUNE: model ${model} removed from rotation for ${provider}`);
+              continue; // prune
+            }
+            // other 400 errors -> keep model (could be transient)
+            modelFound = true;
+          } else {
+            // other errors -> keep model
+            modelFound = true;
+          }
+        }
+        if (modelFound) {
+          validModels.push(model);
+        }
+      } catch (e) {
+        // network/timeout -> keep model to avoid false prune
+        console.log(`[${new Date().toISOString()}] PREFLIGHT: error checking ${provider}/${model}: ${e.message}`);
+        validModels.push(model);
+      }
+    }
+    if (validModels.length === 0) {
+      console.log(`[${new Date().toISOString()}] NO_VALID_MODELS for provider ${provider}`);
+    } else {
+      cfg.models = validModels;
+      console.log(`[${new Date().toISOString()}] PREFLIGHT: ${provider} valid models: ${validModels.join(', ')}`);
+    }
+  }
+}
 
 /**
  * Detects a daily rate-limit signature in a (possibly JSON-embedded) error
@@ -2958,6 +3039,14 @@ async function doWork(text, task) {
         const fromLabel = `${provider}/${model}`;
         if (!advanceTarget()) break;
         console.log(`[${new Date().toISOString()}] structured error.code=QUOTA on ${fromLabel} -> action: rotate (switching to ${provider}/${PROVIDER_CONFIG[provider]?.models?.[modelIdx] || "?"})`);
+        continue;
+      }
+
+      // Invalid model (400 with "not a valid model" etc.) -> rotate to next model
+      if (INVALID_MODEL_RE.test(msg)) {
+        const fromLabel = `${provider}/${model}`;
+        if (!advanceTarget()) break;
+        console.log(`[${new Date().toISOString()}] invalid model error on ${fromLabel} -> rotating`);
         continue;
       }
 
