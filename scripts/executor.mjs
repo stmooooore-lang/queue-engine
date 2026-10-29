@@ -1665,7 +1665,7 @@ function checkoutTaskBranch(text) {
 const PROVIDER_ORDER = ["nvidia", "mistral", "openrouter"];
 const PROVIDER_CONFIG = {
   groq: { baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY", models: ["openai/gpt-oss-120b"] },
-  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", models: ["deepseek-ai/deepseek-v4.1-flash", "nvidia/nemotron-3-ultra-550b-a55b", "z-ai/glm-5.3"] },
+  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", models: ["deepseek-ai/deepseek-v4.1-flash", "nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"] },
   mistral: { baseURL: "https://api.mistral.ai/v1", apiKeyEnv: "MISTRAL_API_KEY", models: ["mistral-medium-3-5"] },
   // 2026-10-04: model was gemini-1.5-pro - verified dead against the real
   // endpoint (HTTP 404 "no longer available to new users"; every pro-tier
@@ -1723,7 +1723,7 @@ function resolveVertexBaseURL(cfg) {
 // capacity failure through to the fatal path with no rotation. "request
 // limit reached" and the explicit 16/16 ratio catch the same NVIDIA worker
 // message by its own words.
-const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|Service Unavailable|503|No deployments available|RateLimitError|RATE_LIMIT|rate_limit_exceeded|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|hook dispatch failed|operation timed out|timed out after|RESOURCE_?EXHAUSTED|quota exceeded|request limit reached|16\/16|429|413|Payload Too Large|rate limit/i;
+const CAPACITY_RE = /MidStreamFallbackError|ServiceUnavailableError|Service Unavailable|503|No deployments available|RateLimitError|RATE_LIMIT|rate_limit_exceeded|Service temporarily overloaded|APIConnectionError|ECONNREFUSED|Connection error|high demand|UNAVAILABLE|hook dispatch failed|operation timed out|timed out after|RESOURCE_?EXHAUSTED|quota exceeded|request limit reached|16\/16|429|410|404|413|Payload Too Large|rate limit|MODEL_NOT_FOUND/i;
 
 // 2026-10-24 (founder brief, "провайдер спит"): signature of a DAILY quota
 // exhaustion inside a 429 body - distinct from a per-minute 429, which the
