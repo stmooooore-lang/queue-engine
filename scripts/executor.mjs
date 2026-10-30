@@ -2671,6 +2671,22 @@ async function runDshOnce(provider, text, model) {
   const patchContent = `- id: agent-default-model\n  config:\n    provider: ${provider}\n    model: ${modelToUse}\n- id: agent-instructions\n  config:\n    maxBytes: ${agentsBytes}${agentsFileLine}\n`;
   const patchFile = path.join(os.tmpdir(), `dsh-patch-${Date.now()}-${Math.random().toString(36).slice(2)}.yml`);
   await writeFile(patchFile, patchContent, "utf-8");
+
+  // Isolate dsh session per task: archive any existing session for this WORKDIR
+  // to prevent context bleed between SIB-chain tasks (2026-10-30: task 120
+  // hallucinated 119's artifact because session accumulated 8.7 MB of history).
+  const sessionKey = "--" + WORKDIR.replace(/\//g, "-").replace(/ /g, "~0020") + "--";
+  const sessionDir = path.join(os.homedir(), ".dsh", "sessions", sessionKey);
+  if (existsSync(sessionDir)) {
+    const archivedDir = sessionDir + ".archived-" + Date.now();
+    try {
+      await rename(sessionDir, archivedDir);
+      console.log(`[${new Date().toISOString()}] SESSION_ISOLATION: archived ${sessionKey} -> ${path.basename(archivedDir)}`);
+    } catch (e) {
+      console.log(`[${new Date().toISOString()}] SESSION_ISOLATION: failed to archive ${sessionKey}: ${e.message}`);
+    }
+  }
+
   try {
     return await new Promise((resolve, reject) => {
       const child = spawn("dsh", ["--profile", "headless", "--patch", patchFile, text], {
