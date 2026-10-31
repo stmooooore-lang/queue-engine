@@ -1668,7 +1668,7 @@ function checkoutTaskBranch(text) {
 const PROVIDER_ORDER = ["nvidia", "openrouter", "groq", "google", "vertex"];
 const PROVIDER_CONFIG = {
   groq: { baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY", models: ["openai/gpt-oss-120b"] },
-  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", models: ["nvidia/nemotron-3-ultra-550b-a55b"] },
+  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", models: ["minimaxai/minimax-m3.1-flash", "stepfun-ai/step-5-preview", "nvidia/nemotron-3-ultra-550b-a55b"] },
   // 2026-10-04: model was gemini-1.5-pro - verified dead against the real
   // endpoint (HTTP 404 "no longer available to new users"; every pro-tier
   // model carries free-tier limit 0 on the current key, 429). gemini-3.8-flash
