@@ -1665,11 +1665,10 @@ function checkoutTaskBranch(text) {
 // НЕ удалён, settings.yaml google-блок не тронут (dsh валидирует все
 // объявленные провайдеры на старте). Порядок после исключения:
 // nvidia → mistral → vertex.
-const PROVIDER_ORDER = ["nvidia", "mistral", "openrouter"];
+const PROVIDER_ORDER = ["nvidia", "openrouter", "groq", "google", "vertex"];
 const PROVIDER_CONFIG = {
   groq: { baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY", models: ["openai/gpt-oss-120b"] },
-  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", models: ["deepseek-ai/deepseek-v4.1-flash", "nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"] },
-  mistral: { baseURL: "https://api.mistral.ai/v1", apiKeyEnv: "MISTRAL_API_KEY", models: ["mistral-medium-3-5"] },
+  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", models: ["nvidia/nemotron-3-ultra-550b-a55b"] },
   // 2026-10-04: model was gemini-1.5-pro - verified dead against the real
   // endpoint (HTTP 404 "no longer available to new users"; every pro-tier
   // model carries free-tier limit 0 on the current key, 429). gemini-3.8-flash
@@ -1688,7 +1687,7 @@ const PROVIDER_CONFIG = {
     api: 'openai-completions',
     baseURL: 'https://openrouter.ai/api/v1',
     apiKeyEnv: 'OPENROUTER_API_KEY',
-    models: ['nvidia/nemotron-3-ultra-550b-a55b:free', 'thinkingmachines/inkling:free', 'thinkingmachines/inkling-small:free'],
+    models: ['nvidia/nemotron-3-ultra-550b-a55b:free'],
   },
 };
 // Helper to resolve Vertex baseURL with env vars at runtime (shell-style ${VAR:-default} not interpolated in JS)
