@@ -41,6 +41,9 @@
 // not always first in the text: [NO-TRIAGE] may precede it. The regex stays
 // anchored (a marker quoted mid-text must not be read as the task's own);
 // the guard's lookup must be tolerant, or a real predecessor goes invisible.
+// parseSiblingMarker() therefore strips the LEADING bracket-tags ([NO-TRIAGE]
+// and friends) before applying this anchored regex - it never searches
+// mid-text.
 export const SIBLING_MARKER_RE = /^\[SIB (\d+)\/(\d+) parent:(\d+)\]/;
 
 /**
@@ -49,11 +52,35 @@ export const SIBLING_MARKER_RE = /^\[SIB (\d+)\/(\d+) parent:(\d+)\]/;
  * triage-split subtask at all (no marker) - siblingOrderOk() then always
  * allows it, unchanged behavior for every non-subtask task.
  *
+ * 2026-10-31 (вторая часть фикса): маркер не всегда первый в тексте -
+ * перед ним может стоять другой тег, например `[NO-TRIAGE]`:
+ * "[NO-TRIAGE] [SIB 2/2 parent:11] ...". Прежний разбор требовал маркер
+ * ровно в начале, поэтому такая задача читалась как задача БЕЗ маркера -
+ * siblingOrderOk() возвращал true (fail-open), и порядок по братьям не
+ * проверялся вовсе: задача могла стартовать раньше своего предшественника.
+ * В живой базе такой случай ровно один - задача 62, "[NO-TRIAGE] [SIB 2/2
+ * parent:11] ...".
+ *
+ * Что здесь НЕ меняется: маркер, процитированный ВНУТРИ текста, по-прежнему
+ * не считается маркером самой задачи. Поэтому снимаем только ведущие
+ * скобочные теги - ровно те, что стоят перед маркером, - а не ищем маркер
+ * где попало.
+ *
  * @param {string} [text]
  * @returns {{index: number, total: number, parentId: number}|null}
  */
 export function parseSiblingMarker(text) {
-  const m = String(text || "").match(SIBLING_MARKER_RE);
+  let t = String(text || "");
+  // Снимаем ведущие скобочные теги, пока не дойдём до маркера (или до конца
+  // текста). Ограничение на число итераций - страховка от pathology.
+  for (let i = 0; i < 10; i++) {
+    t = t.replace(/^\s+/, "");
+    const tag = t.match(/^\[[^\]]*\]/);
+    if (!tag) break;
+    if (SIBLING_MARKER_RE.test(t)) break; // этот тег и есть наш маркер
+    t = t.slice(tag[0].length);
+  }
+  const m = t.match(SIBLING_MARKER_RE);
   if (!m) return null;
   return { index: Number(m[1]), total: Number(m[2]), parentId: Number(m[3]) };
 }
