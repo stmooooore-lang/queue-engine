@@ -34,9 +34,13 @@
  */
 
 // Canonical marker format, e.g. `[SIB 2/3 parent:7510]`. Anchored to the
-// very start of the task text: triageSplit() embeds it as a prefix, the
-// order guards LIKE-query on that prefix, and parseSiblingMarker() must
-// NOT match the same shape appearing mid-text.
+// very start of the task text: triageSplit() embeds it as a prefix, and
+// parseSiblingMarker() must NOT match the same shape appearing mid-text.
+// 2026-10-31: the ORDER GUARD is looser than this regex - it looks its
+// predecessor up by substring (`LIKE '%[SIB ...]%'`), because the marker is
+// not always first in the text: [NO-TRIAGE] may precede it. The regex stays
+// anchored (a marker quoted mid-text must not be read as the task's own);
+// the guard's lookup must be tolerant, or a real predecessor goes invisible.
 export const SIBLING_MARKER_RE = /^\[SIB (\d+)\/(\d+) parent:(\d+)\]/;
 
 /**
@@ -131,7 +135,17 @@ export function makeSiblingOrderOk(client) {
     try {
       const res = await client.execute({
         sql: "SELECT status FROM tasks WHERE text LIKE ? LIMIT 1",
-        args: [`${buildSiblingMarker(sib.index - 1, sib.total, sib.parentId)}%`],
+        // 2026-10-31: ищем маркер ПРЕДШЕСТВЕННИКА как подстроку, а не как
+        // префикс. Триаж пишет в текст подзадачи и [SIB ...], и [NO-TRIAGE]
+        // - и когда [NO-TRIAGE] стоит ПЕРЕД маркером, префиксный LIKE
+        // '\[SIB i/n parent:P]%' вообще ничего не находил: предшественник
+        // есть в базе, но запрос его не видел. Тогда guard трактовал
+        // предшественника как отсутствующего и fail-closed блокировал
+        // задачу (исходник: задача 143 и другие [NO-TRIAGE] [SIB]).
+        // Ведущий % ищет маркер в любой позиции. Ложных срабатываний нет:
+        // в шаблоне стоит полный маркер вместе с номером и parent, поэтому
+        // '[SIB 12/16 parent:116]' не подходит под '[SIB 2/6 parent:116]'.
+        args: [`%${buildSiblingMarker(sib.index - 1, sib.total, sib.parentId)}%`],
       });
       const prev = res.rows[0];
       if (!prev) return false;
