@@ -275,12 +275,16 @@ jobs:
                 # dsh --patch overlay selects the model from executor.mjs, so
                 # code and yaml must agree, or rotation dies with
                 # NO_ADAPTER/model-not-registered on the undeclared ids.
+                # 2026-10-31 (hotfix, task 143): minimaxai/minimax-m3.1-flash
+                # (UNKNOWN_MODEL) and stepfun-ai/step-5-preview (absent from
+                # pi-ai entirely - only Step-3.7-Flash exists) were in the
+                # mjs rotation list and killed task 143 - Plexus confirmed
+                # against pi-ai. List is now exactly the two registered
+                # models, in the same order in both files.
                 models:
-                  - id: deepseek-ai/deepseek-v4.1-flash
-                    contextWindow: 131072
                   - id: nvidia/nemotron-3-ultra-550b-a55b
                     contextWindow: 131072
-                  - id: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning
+                  - id: minimaxai/minimax-m3
                     contextWindow: 131072
               mistral:
                 apiKeyEnv: MISTRAL_API_KEY

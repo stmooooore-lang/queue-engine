@@ -1112,16 +1112,35 @@ async function checkTreeCompletion(taskId, task = null, db = client) {
       });
       const children = childrenRes.rows || [];
       if (children.length > 0) {
+        // Check acceptance criteria: all children 'готова' AND no FAIL/NOT/провал in results
         const allDone = children.every(r => r.status === 'готова');
         const anyPartial = children.some(r => r.status === 'partial');
         const anyFailed = children.some(r => r.status === 'провал' || r.status === 'заблокирована');
-        if (allDone) {
+        
+        // Check results for failure indicators (case-insensitive)
+        const failPatterns = /FAIL|NOT|провал/i;
+        const anyResultHasFailure = children.some(r => r.result && failPatterns.test(r.result));
+        
+        // Check for 'отменена' status
+        const anyCancelled = children.some(r => r.status === 'отменена');
+        
+        // Check if any failed/cancelled child has a retry indicator
+        const failedOrCancelled = children.filter(r => r.status === 'провал' || r.status === 'заблокирована' || r.status === 'отменена');
+        const hasRetryIndicator = failedOrCancelled.some(r => {
+          const text = (r.text || '') + ' ' + (r.result || '');
+          return /\[(?:iteration|retry|attempt):\s*\d+\]/i.test(text) || /(?:iteration|retry|attempt)\s*#?\s*\d+/i.test(text);
+        });
+        
+        // Parent stays 'выполняется' if any child has failure in result or cancelled/failed without retry
+        const parentShouldWait = anyResultHasFailure || (anyFailed || anyCancelled) && !hasRetryIndicator;
+        
+        if (allDone && !parentShouldWait) {
           const completionNote = `ДЕРЕВО ЗАДАЧ ЗАВЕРШЕНО: все ${children.length} подзадач выполнены успешно (подзадачи: ${children.map(c => c.id).join(', ')})`;
           await db.execute({
             sql: "UPDATE tasks SET status = 'готова', result = ? WHERE id = ?",
             args: [completionNote, taskId]
           });
-          console.log(`[${new Date().toISOString()}] TREE_COMPLETION: parent task ${taskId} marked 'готова' (all ${children.length} subtasks done)`);
+          console.log(`[${new Date().toISOString()}] TREE_COMPLETION: parent task ${taskId} marked 'готова' (all ${children.length} subtasks done, acceptance passed)`);
           return {
             treeComplete: true,
             parentId: taskId,
@@ -1129,13 +1148,20 @@ async function checkTreeCompletion(taskId, task = null, db = client) {
             completedSiblings: children.length
           };
         }
+        // Parent stays 'выполняется' if acceptance criteria not met
+        if (allDone && parentShouldWait) {
+          console.log(`[${new Date().toISOString()}] TREE_COMPLETION: parent task ${taskId} stays 'выполняется' (acceptance failed: resultFailure=${anyResultHasFailure}, failedOrCancelled=${anyFailed || anyCancelled}, hasRetry=${hasRetryIndicator})`);
+        }
         return {
           treeComplete: false,
           parentId: taskId,
           totalSiblings: children.length,
           completedSiblings: children.filter(c => c.status === 'готова').length,
           anyPartial,
-          anyFailed
+          anyFailed,
+          anyResultHasFailure,
+          anyCancelled,
+          hasRetryIndicator
         };
       }
     } catch (err) {
@@ -1162,11 +1188,27 @@ async function checkTreeCompletion(taskId, task = null, db = client) {
     const completedSiblings = siblings.filter(s => s.status === 'готова');
     const partialSiblings = siblings.filter(s => s.status === 'partial');
     const failedSiblings = siblings.filter(s => s.status === 'провал' || s.status === 'заблокирована');
+    const cancelledSiblings = siblings.filter(s => s.status === 'отменена');
     const pendingSiblings = siblings.filter(s => s.status === 'ожидает' || s.status === 'выполняется');
 
     const isAllCompleted = siblings.length >= totalCount && completedSiblings.length === siblings.length;
 
-    if (isAllCompleted) {
+    // Check acceptance criteria: all siblings 'готова' AND no FAIL/NOT/провал in results
+    // Check results for failure indicators (case-insensitive)
+    const failPatterns = /FAIL|NOT|провал/i;
+    const anyResultHasFailure = siblings.some(r => r.result && failPatterns.test(r.result));
+
+    // Check if any failed/cancelled sibling has a retry indicator
+    const failedOrCancelled = siblings.filter(r => r.status === 'провал' || r.status === 'заблокирована' || r.status === 'отменена');
+    const hasRetryIndicator = failedOrCancelled.some(r => {
+      const text = (r.text || '') + ' ' + (r.result || '');
+      return /\[(?:iteration|retry|attempt):\s*\d+\]/i.test(text) || /(?:iteration|retry|attempt)\s*#?\s*\d+/i.test(text);
+    });
+
+    // Parent stays 'выполняется' if any sibling has failure in result or failed/cancelled without retry
+    const parentShouldWait = anyResultHasFailure || (failedSiblings.length > 0 || cancelledSiblings.length > 0) && !hasRetryIndicator;
+
+    if (isAllCompleted && !parentShouldWait) {
       console.log(`[${new Date().toISOString()}] TREE_COMPLETION: all ${siblings.length} siblings for parent ${parentId} are 'готова'. Marking parent complete.`);
       const parentNote = `ДЕРЕВО ЗАДАЧ ЗАВЕРШЕНО: все ${siblings.length} подзадач выполнены успешно (подзадачи: ${siblings.map(s => s.id).join(', ')})`;
 
@@ -1182,18 +1224,25 @@ async function checkTreeCompletion(taskId, task = null, db = client) {
         completedSiblings: completedSiblings.length,
         siblings: siblings.map(s => ({ id: s.id, status: s.status }))
       };
-    } else {
-      console.log(`[${new Date().toISOString()}] TREE_COMPLETION: tree for parent ${parentId} not yet complete (${completedSiblings.length}/${siblings.length} completed, ${partialSiblings.length} partial, ${pendingSiblings.length} pending)`);
-      return {
-        treeComplete: false,
-        parentId,
-        totalSiblings: siblings.length,
-        completedSiblings: completedSiblings.length,
-        partialCount: partialSiblings.length,
-        pendingCount: pendingSiblings.length,
-        failedCount: failedSiblings.length
-      };
     }
+    // Parent stays 'выполняется' if acceptance criteria not met
+    if (isAllCompleted && parentShouldWait) {
+      console.log(`[${new Date().toISOString()}] TREE_COMPLETION: parent task ${parentId} stays 'выполняется' (acceptance failed: resultFailure=${anyResultHasFailure}, failedOrCancelled=${failedSiblings.length > 0 || cancelledSiblings.length > 0}, hasRetry=${hasRetryIndicator})`);
+    } else {
+      console.log(`[${new Date().toISOString()}] TREE_COMPLETION: tree for parent ${parentId} not yet complete (${completedSiblings.length}/${siblings.length} completed, ${partialSiblings.length} partial, ${pendingSiblings.length} pending, ${failedSiblings.length} failed, ${cancelledSiblings.length} cancelled)`);
+    }
+    return {
+      treeComplete: false,
+      parentId,
+      totalSiblings: siblings.length,
+      completedSiblings: completedSiblings.length,
+      partialCount: partialSiblings.length,
+      pendingCount: pendingSiblings.length,
+      failedCount: failedSiblings.length,
+      cancelledCount: cancelledSiblings.length,
+      anyResultHasFailure,
+      hasRetryIndicator
+    };
   } catch (err) {
     console.log(`[${new Date().toISOString()}] TREE_COMPLETION: error: ${redactSecrets(err.message)}`);
     return { treeComplete: false, parentId, error: redactSecrets(err.message) };
@@ -1421,7 +1470,7 @@ async function run() {
         const note = `ТРИАЖ: разбита на ${subtaskIds.length} подзадач: ${subtaskIds.join(", ")}`;
         await client.execute({
           sql: 'UPDATE tasks SET status = ?, result = ? WHERE id = ?',
-          args: ['готова', note, taskId],
+          args: ['выполняется', note, taskId],
         });
         await notifyTelegram(task.creator_id, `Задача ${taskId} ${note}`);
         return;
@@ -1455,7 +1504,7 @@ async function run() {
     const note = result.decomposeReason === "capacity-exhausted"
       ? `ТРИАЖ (все провайдеры отвергли payload задачи): разбита на ${result.subtaskIds.length} подзадач: ${result.subtaskIds.join(", ")}`
       : `ТРИАЖ (после реального прогресса, обрезанного таймаутом): разбита на ${result.subtaskIds.length} подзадач: ${result.subtaskIds.join(", ")}`;
-    await client.execute({ sql: 'UPDATE tasks SET status = ?, result = ? WHERE id = ?', args: ['готова', note, taskId] });
+    await client.execute({ sql: 'UPDATE tasks SET status = ?, result = ? WHERE id = ?', args: ['выполняется', note, taskId] });
     await notifyTelegram(task.creator_id, `Задача ${taskId} ${note}`);
     return;
   }
@@ -1668,7 +1717,12 @@ function checkoutTaskBranch(text) {
 const PROVIDER_ORDER = ["nvidia", "openrouter", "groq", "google", "vertex"];
 const PROVIDER_CONFIG = {
   groq: { baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY", models: ["openai/gpt-oss-120b"] },
-  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", models: ["minimaxai/minimax-m3.1-flash", "stepfun-ai/step-5-preview", "nvidia/nemotron-3-ultra-550b-a55b"] },
+  // 2026-10-31 (hotfix, task 143): minimaxai/minimax-m3.1-flash (UNKNOWN_MODEL)
+  // and stepfun-ai/step-5-preview (absent from pi-ai entirely - only Step-3.7-Flash
+  // exists) are not in the dsh registry - Plexus confirmed against pi-ai. The
+  // list is exactly the two registered models, identical to the settings.yaml
+  // nvidia block in executor.yml - any divergence kills rotation at NO_ADAPTER.
+  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", models: ["nvidia/nemotron-3-ultra-550b-a55b", "minimaxai/minimax-m3"] },
   // 2026-10-04: model was gemini-1.5-pro - verified dead against the real
   // endpoint (HTTP 404 "no longer available to new users"; every pro-tier
   // model carries free-tier limit 0 on the current key, 429). gemini-3.8-flash
