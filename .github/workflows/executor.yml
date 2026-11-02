@@ -281,10 +281,12 @@ jobs:
                 # mjs rotation list and killed task 143 - Plexus confirmed
                 # against pi-ai. List is now exactly the two registered
                 # models, in the same order in both files.
+                # 2026-11-01: minimaxai/minimax-m3 is DEAD at NVIDIA NIM (HTTP 410,
+                # end of life 2026-09-09, absent from /models endpoint; preflight
+                # does not prune it). Only nemotron-ultra is alive and declared
+                # in both files.
                 models:
                   - id: nvidia/nemotron-3-ultra-550b-a55b
-                    contextWindow: 131072
-                  - id: minimaxai/minimax-m3
                     contextWindow: 131072
               mistral:
                 apiKeyEnv: MISTRAL_API_KEY

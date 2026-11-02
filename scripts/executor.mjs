@@ -1722,7 +1722,7 @@ const PROVIDER_CONFIG = {
   // exists) are not in the dsh registry - Plexus confirmed against pi-ai. The
   // list is exactly the two registered models, identical to the settings.yaml
   // nvidia block in executor.yml - any divergence kills rotation at NO_ADAPTER.
-  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", models: ["nvidia/nemotron-3-ultra-550b-a55b", "minimaxai/minimax-m3"] },
+  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", models: ["nvidia/nemotron-3-ultra-550b-a55b"] },
   // 2026-10-04: model was gemini-1.5-pro - verified dead against the real
   // endpoint (HTTP 404 "no longer available to new users"; every pro-tier
   // model carries free-tier limit 0 on the current key, 429). gemini-3.8-flash
