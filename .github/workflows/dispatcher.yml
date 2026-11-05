@@ -4,8 +4,35 @@ name: dispatcher
 # explicit workflow_dispatch with a taskId input - it never scans the tasks
 # table on its own, unlike the old scripts/poller.mjs. Inserting a Turso row
 # (e.g. from worker/index.js's Telegram entry point) is therefore not enough
-# by itself. This cron polls Turso and calls workflow_dispatch on executor.yml
-# for each real pending task, via scripts/dispatcher.mjs.
+# by itself. This workflow polls Turso and calls workflow_dispatch on
+# executor.yml for each real pending task, via scripts/dispatcher.mjs.
+#
+# 2026-11-05: trigger changed from `schedule: '*/10 * * * *'` to
+# `workflow_run` on Task Executor completion - hotfix, outside the queue,
+# at the founder's request (alongside four Plexus infra requirements).
+#
+# WHY: GitHub's scheduled workflows are best-effort and queue behind free
+# minutes for repos on the free/shared runner pool - in practice this
+# dispatcher sat 5 hours between executions, so a task queued in Turso
+# waited up to 5h before any executor ran, which is the "5-часовые
+# задержки" Plexus reported (same family as GHQ-EXEC-DISPATCHER's original
+# "задачи не висели по 4 часа", only the cron made it worse, not better).
+# workflow_run fires within seconds of Task Executor's run reaching a
+# terminal state, so the dispatcher runs the moment the executor frees up
+# instead of when the next cron slot happens to open.
+#
+# GitHub caveats that are load-bearing, do not "simplify" them away:
+# 1. `workflows` matches the `name:` field of executor.yml ("Task Executor"),
+#    not the filename - a rename in executor.yml silently breaks this.
+# 2. workflow_run ALWAYS runs from the default branch and reads its copy of
+#    the workflow file there; a dispatcher.yml edit on a feature branch does
+#    nothing until it lands on default. Same for "Task Executor" - it must
+#    exist in the default branch for the trigger to fire at all.
+# 3. `types: [completed]` deliberately includes failed/cancelled runs: the
+#    executor finishing badly is exactly when the next pending task needs
+#    dispatching, not a reason to stop dispatching.
+# 4. `workflow_dispatch` is kept so the dispatcher can still be run by hand
+#    for a manual flush.
 #
 # Uses secrets.DISPATCH_TOKEN, a separate PAT from REPO_TOKEN (which is
 # scoped to plexus-doc only, for the checkout in cloud-agent.yml, and can't
@@ -17,10 +44,15 @@ name: dispatcher
 # value. Not the default GITHUB_TOKEN: GitHub's anti-recursion behavior for
 # the built-in token is real and documented for several trigger types, and
 # this workflow's whole job is triggering another one.
+#
+# dispatcher.mjs does not read the triggering run (no GITHUB_API calls about
+# it - it only scans Turso and calls workflow_dispatch), so this job needs
+# no `actions: read` permission.
 
 on:
-  schedule:
-    - cron: '*/10 * * * *'
+  workflow_run:
+    workflows: ["Task Executor"]
+    types: [completed]
   workflow_dispatch: {}
 
 jobs:
