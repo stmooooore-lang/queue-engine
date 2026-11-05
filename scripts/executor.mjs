@@ -928,8 +928,7 @@ async function uploadTaskCheckpointsAndArtifacts(taskId, options = {}) {
 
     const branch = execSync("git branch --show-current", { cwd: targetDir, stdio: "pipe" }).toString().trim();
     if (branch) {
-      execSync(`git pull --rebase origin ${branch}`, { cwd: targetDir, stdio: "pipe" });
-      execSync(`git push origin ${branch}`, { cwd: targetDir, stdio: "pipe" });
+      await pushBranch(branch, targetDir);
       console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: committed and pushed ${status.split('\n').length} file(s) (${modeLabel}) to origin/${branch}`);
     } else {
       console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: detached HEAD or no branch, committed locally only`);
@@ -941,6 +940,62 @@ async function uploadTaskCheckpointsAndArtifacts(taskId, options = {}) {
     console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: FAILED - ${redactSecrets(err.message)}`);
     return false;
   }
+}
+
+/**
+ * CLOUD-PUSH-UPSTREAM, 2026-11-05: push a branch, creating it on the remote
+ * when the remote does not have it yet.
+ *
+ * The real defect (task 155, second reason it failed next to the 401): a
+ * brief named its branch "s14-fractal-research"; dsh created that branch
+ * locally on the runner, but the remote never had it. The old sequence was
+ * unconditionally `git pull --rebase origin <branch>` followed by
+ * `git push origin <branch>`, and `pull --rebase` dies with "couldn't find
+ * remote ref" on a branch the remote does not have. That exception left the
+ * push helper, was caught one level up as a plain failure, and took the
+ * whole task down - for pure bookkeeping that had nothing to do with the
+ * task's own work.
+ *
+ * Why not "or push to main" as the founder's brief offered as an
+ * alternative: "ONE TASK, ONE BRANCH" (GHQ4, plexus-doc's own AGENTS.md)
+ * says a branch named in the brief is a constraint, not a suggestion.
+ * Silently publishing a task's work to main when it asked for its own
+ * branch is the worse failure. Creating the branch on the remote keeps the
+ * named destination AND unblocks the push.
+ *
+ * `git ls-remote --heads` is the only reliable way to ask the remote
+ * directly whether it has the ref; it is one cheap call and does not
+ * create anything as a side effect.
+ *
+ * @param {string} branch - non-empty, validated branch name
+ * @param {string} dir - git working directory
+ */
+async function pushBranch(branch, dir) {
+  // Branch names reach a shell command here, so refuse anything that is not
+  // a safe ref. Defence in depth on top of checkoutTaskBranch's own regex.
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(String(branch))) {
+    throw new Error(`pushBranch: refusing unsafe branch name ${JSON.stringify(String(branch)).slice(0, 40)}`);
+  }
+  let remoteHasIt = true;
+  try {
+    const heads = execSync(`git ls-remote --heads origin ${branch}`, { cwd: dir, stdio: "pipe" }).toString();
+    remoteHasIt = heads.trim().length > 0;
+  } catch (err) {
+    // Could not reach the remote to ask. Fall through to the rebase path,
+    // whose own error is reported below - do not mask a real outage as
+    // "branch missing".
+    console.log(`[${new Date().toISOString()}] push: could not ask remote about ${branch} (${redactSecrets(err.message)}), assuming it exists`);
+  }
+
+  if (remoteHasIt) {
+    execSync(`git pull --rebase origin ${branch}`, { cwd: dir, stdio: "pipe" });
+    execSync(`git push origin ${branch}`, { cwd: dir, stdio: "pipe" });
+    return "pushed";
+  }
+
+  execSync(`git push -u origin ${branch}`, { cwd: dir, stdio: "pipe" });
+  console.log(`[${new Date().toISOString()}] push: branch ${branch} did not exist on origin - created upstream with 'git push -u origin ${branch}' (nothing to rebase onto)`);
+  return "created";
 }
 
 /**
@@ -1781,9 +1836,8 @@ async function pushTaskArtifacts() {
     const commitMsg = `task ${process.env.TASK_ID}: ${firstFile}`;
     execSync(`git commit -m "${commitMsg.replace(/"/g, '\"')}"`, { cwd: WORKDIR, stdio: "pipe" });
     const branch = execSync("git branch --show-current", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
-    execSync(`git pull --rebase origin ${branch}`, { cwd: WORKDIR, stdio: "pipe" });
-    execSync(`git push origin ${branch}`, { cwd: WORKDIR, stdio: "pipe" });
-    console.log(`[${new Date().toISOString()}] push: committed and pushed ${status.split('\n').length} file(s) to origin/${branch}`);
+    const pushResult = await pushBranch(branch, WORKDIR);
+    console.log(`[${new Date().toISOString()}] push: committed and pushed ${status.split('\n').length} file(s) to origin/${branch} (${pushResult})`);
     return true;
   } catch (err) {
     console.log(`[${new Date().toISOString()}] push: FAILED - ${redactSecrets(err.message)}`);
@@ -3992,6 +4046,7 @@ export {
   executeResume,
   extractParentAndSiblingInfo,
   blockDependentSiblings,
+  pushBranch,
   checkTreeCompletion,
   executeLongCompute,
   doWork,
