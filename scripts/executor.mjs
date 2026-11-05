@@ -1107,15 +1107,16 @@ async function checkTreeCompletion(taskId, task = null, db = client) {
   if (!info || !info.parentId) {
     try {
       const childrenRes = await db.execute({
-        sql: `SELECT id, status, text, result FROM tasks WHERE text LIKE ? OR text LIKE ? /* parent:${taskId} */`,
+        sql: `SELECT id, status, text, result, blocked_reason FROM tasks WHERE text LIKE ? OR text LIKE ? /* parent:${taskId} */`,
         args: [`%parent:${taskId}]%`, `%parent:${taskId}%`]
       });
       const children = childrenRes.rows || [];
       if (children.length > 0) {
         // Check acceptance criteria: all children 'готова' AND no FAIL/NOT/провал in results
+        // Blocked is a separate axis (blocked_reason), not a status value - check blocked_reason
         const allDone = children.every(r => r.status === 'готова');
         const anyPartial = children.some(r => r.status === 'partial');
-        const anyFailed = children.some(r => r.status === 'провал' || r.status === 'заблокирована');
+        const anyFailed = children.some(r => r.status === 'провал' || r.blocked_reason);
         
         // Check results for failure indicators (case-insensitive)
         const failPatterns = /FAIL|NOT|провал/i;
@@ -1125,7 +1126,7 @@ async function checkTreeCompletion(taskId, task = null, db = client) {
         const anyCancelled = children.some(r => r.status === 'отменена');
         
         // Check if any failed/cancelled child has a retry indicator
-        const failedOrCancelled = children.filter(r => r.status === 'провал' || r.status === 'заблокирована' || r.status === 'отменена');
+        const failedOrCancelled = children.filter(r => r.status === 'провал' || r.blocked_reason || r.status === 'отменена');
         const hasRetryIndicator = failedOrCancelled.some(r => {
           const text = (r.text || '') + ' ' + (r.result || '');
           return /\[(?:iteration|retry|attempt):\s*\d+\]/i.test(text) || /(?:iteration|retry|attempt)\s*#?\s*\d+/i.test(text);
@@ -1175,7 +1176,7 @@ async function checkTreeCompletion(taskId, task = null, db = client) {
 
   try {
     const sibRes = await db.execute({
-      sql: `SELECT id, status, text, result FROM tasks WHERE text LIKE ? OR text LIKE ? /* parent:${parentId} */`,
+      sql: `SELECT id, status, text, result, blocked_reason FROM tasks WHERE text LIKE ? OR text LIKE ? /* parent:${parentId} */`,
       args: [`%parent:${parentId}]%`, `%parent:${parentId}%`]
     });
 
@@ -1187,7 +1188,8 @@ async function checkTreeCompletion(taskId, task = null, db = client) {
     const totalCount = expectedTotal || siblings.length;
     const completedSiblings = siblings.filter(s => s.status === 'готова');
     const partialSiblings = siblings.filter(s => s.status === 'partial');
-    const failedSiblings = siblings.filter(s => s.status === 'провал' || s.status === 'заблокирована');
+    // Blocked is a separate axis (blocked_reason), not a status value
+    const failedSiblings = siblings.filter(s => s.status === 'провал' || s.blocked_reason);
     const cancelledSiblings = siblings.filter(s => s.status === 'отменена');
     const pendingSiblings = siblings.filter(s => s.status === 'ожидает' || s.status === 'выполняется');
 
@@ -1199,7 +1201,7 @@ async function checkTreeCompletion(taskId, task = null, db = client) {
     const anyResultHasFailure = siblings.some(r => r.result && failPatterns.test(r.result));
 
     // Check if any failed/cancelled sibling has a retry indicator
-    const failedOrCancelled = siblings.filter(r => r.status === 'провал' || r.status === 'заблокирована' || r.status === 'отменена');
+    const failedOrCancelled = siblings.filter(r => r.status === 'провал' || r.blocked_reason || r.status === 'отменена');
     const hasRetryIndicator = failedOrCancelled.some(r => {
       const text = (r.text || '') + ' ' + (r.result || '');
       return /\[(?:iteration|retry|attempt):\s*\d+\]/i.test(text) || /(?:iteration|retry|attempt)\s*#?\s*\d+/i.test(text);
@@ -1246,6 +1248,100 @@ async function checkTreeCompletion(taskId, task = null, db = client) {
   } catch (err) {
     console.log(`[${new Date().toISOString()}] TREE_COMPLETION: error: ${redactSecrets(err.message)}`);
     return { treeComplete: false, parentId, error: redactSecrets(err.message) };
+  }
+}
+
+/**
+ * CLOUD-SIB-FATAL, 2026-11-05: when a triage-split subtask dies a terminal
+ * death, its LATER SIBLINGS must die with it instead of waiting forever.
+ *
+ * The real defect (Plexus, S14): task 155 failed with AUTH 401 and was
+ * recorded 'провал'. Tasks 156 and 157 are its SIB descendants
+ * ([SIB 2/n parent:155], [SIB 3/n parent:155]). The order guard
+ * (siblingOrderOk) only ever let a subtask through once its predecessor was
+ * 'готова', so after 155 fell, 156 and 157 sat in 'ожидает' permanently:
+ * the dispatcher kept re-dispatching them, the guard kept refusing them,
+ * and nothing reconciled the chain. One failed auth error froze a whole
+ * task tree with no record of why.
+ *
+ * Why 'отменена' and not a new 'заблокирована' value: the schema keeps
+ * blocking on its own axis now (blocked_reason, see the status write
+ * below), and 'заблокирована' is not a status value. 'отменена' is
+ * terminal, so neither executor nor dispatcher will ever pick these tasks
+ * up again (both SELECT only status 'ожидает'/'partial'), which is exactly
+ * what "not hanging forever" needs. blocked_reason is set as well so the
+ * tree-completion accounting already treats them as resolved rather than
+ * pending.
+ *
+ * Only siblings of the same parent that are STILL 'ожидает' are touched.
+ * An already-'готова' sibling is never downgraded, and a 'partial' one is
+ * left alone: only the order-blocked tail of the chain is doomed, because
+ * the guard resolves order sequentially (i/n waits for i-1/n, so once i-1
+ * can never be 'готова', nothing after it can either).
+ *
+ * What this deliberately does NOT do: loosen siblingOrderOk so a terminal
+ * predecessor lets a later sibling RUN. That "run it anyway" behavior was
+ * tried and rejected - tests/cloud_queue_contract.mjs normatively requires
+ * "Sibling 2 must be rejected when prior sibling is 'провал'", and that
+ * fail-closed rule is deliberate (same philosophy as CHECKLIST-FAIL-CLOSED):
+ * a sequential chain must not continue past a step that died, because what
+ * follows is built on a broken foundation. The guard therefore still says
+ * no. This cascade is the answer to the hang instead: it TERMINATES the
+ * waiting tail with a recorded reason, so it neither hangs nor runs.
+ *
+ * @param {object} task - the failed task row (needs .text for its marker)
+ * @param {import("@libsql/client").Client} client
+ * @returns {Promise<{parentId: string|null, resolved: number[]}>}
+ */
+async function blockDependentSiblings(task, client) {
+  const parentId = null;
+  let resolved = [];
+  try {
+    // Defense in depth: only a TERMINAL death freezes a chain. The primary
+    // gate is the call site (status === 'провал'), but a paused task returns
+    // to 'ожидает' expecting a retry after the provider's quota reset, and a
+    // 'partial' one expects resumption - cancelling their siblings here would
+    // destroy work that is merely waiting. Verified by
+    // tests/sib-cascade-on-fatal.mjs case 3, which caught exactly that when
+    // this function itself trusted the caller.
+    if (task.status !== 'провал') {
+      console.log(`[${new Date().toISOString()}] SIB_CASCADE: task ${task.id} is '${task.status}', not terminal - leaving its sibling chain alone`);
+      return { parentId: null, resolved: [] };
+    }
+    const sib = parseSiblingMarker(task.text);
+    if (!sib) return { parentId: null, resolved: [] };
+
+    const dependents = await client.execute({
+      // Same parent, same total, still waiting. 'parent:' is anchored to the
+      // marker's closing bracket so a mention inside prose cannot match.
+      sql: `SELECT id, text FROM tasks WHERE status = 'ожидает' AND text LIKE ?`,
+      args: [`%[SIB %/${sib.total} parent:${sib.parentId}]%`],
+    });
+
+    const reason = `предшественник/родственник ${task.id} провалился окончательно (${String(task.result || '').split('\n')[0].slice(0, 120)}); цепочка заморожена - перезапустить родителя`;
+    for (const dep of dependents.rows || []) {
+      // Never touch the task that just failed itself (it is 'провал', not
+      // 'ожидает', so it cannot be selected by this query - asserted here
+      // rather than trusted).
+      if (String(dep.id) === String(task.id)) continue;
+      const note = `${reason} (задача ${dep.id} отменена, а не оставлена в 'ожидает')`;
+      const upd = await client.execute({
+        // Guarded on 'ожидает' so two concurrent cascades cannot fight.
+        sql: `UPDATE tasks SET status = 'отменена', blocked_reason = ?, result = ? WHERE id = ? AND status = 'ожидает'`,
+        args: [reason, note, dep.id],
+      });
+      if (upd.rowsAffected > 0) {
+        resolved.push(dep.id);
+        console.log(`[${new Date().toISOString()}] SIB_CASCADE: task ${dep.id} cancelled - its order chain is behind ${task.id}, which failed terminally`);
+      }
+    }
+    if (resolved.length > 0) {
+      console.log(`[${new Date().toISOString()}] SIB_CASCADE: ${resolved.length} dependent task(s) of parent ${sib.parentId} switched to 'отменена' after ${task.id} failed`);
+    }
+    return { parentId: sib.parentId, resolved };
+  } catch (err) {
+    console.log(`[${new Date().toISOString()}] SIB_CASCADE: error: ${redactSecrets(err.message)}`);
+    return { parentId, resolved };
   }
 }
 
@@ -1531,24 +1627,29 @@ async function run() {
   // Update task
   // GHQ2-b, 2026-09-14: a permanent, founder-fixable verdict (no_address,
   // no_access, impossible_as_written, brief_conflicts_rules) gets a
-  // persistent "заблокирована" status instead of "провал" - retrying the
-  // same brief on a different provider cannot fix any of these, mirroring
-  // queue.sh's own queue-blocked.txt semantics.
+  // separate blocking signal (blocked_reason) instead of a "заблокирована"
+  // status value. This matches queue.sh's orthogonal-axis pattern:
+  // queue-blocked.txt is a separate file checked via is_blocked_now(),
+  // not a value inside the status column. Blocking is a prioritization/
+  // dependency property (something else must happen first), not an outcome
+  // of this task's own attempt.
   // 2026-10-24 (founder brief): a daily-rate-limit pause (result.paused,
   // set in doWork's exhausted-rotation path when the last error carries the
   // daily-limit signature) returns the task to 'ожидает' - the queue then
   // retries it after the provider's quota reset instead of burying the
   // chain under a 'провал'.
+  const isPermanentBlock = Boolean(result.permanent);
   const status = result.success
     ? 'готова'
     : (result.paused ? 'ожидает'
-      : (result.partial || result.status === 'partial' ? 'partial' : (result.permanent ? 'заблокирована' : 'провал')));
+      : (result.partial || result.status === 'partial' ? 'partial' : 'провал'));
+  const blockedReason = isPermanentBlock ? (result.blockedReason || result.message || 'permanent founder-fixable blocker') : null;
   const minutesUsed = Math.ceil((workEnd - workStart) / 60000);
   const secondsToFirstWork = Math.floor((workStart - startTime) / 1000);
 
   await client.execute({
-    sql: 'UPDATE tasks SET status = ?, result = ?, actions_run_id = ?, seconds_to_first_work = ?, minutes_used = ?, paused_until = ? WHERE id = ?',
-    args: [status, result.message, process.env.GITHUB_RUN_ID, secondsToFirstWork, minutesUsed, result.pausedUntil || null, taskId]
+    sql: 'UPDATE tasks SET status = ?, result = ?, actions_run_id = ?, seconds_to_first_work = ?, minutes_used = ?, paused_until = ?, blocked_reason = ? WHERE id = ?',
+    args: [status, result.message, process.env.GITHUB_RUN_ID, secondsToFirstWork, minutesUsed, result.pausedUntil || null, blockedReason, taskId]
   });
 
   // Ensure correct tree completion when jobs are completed or resumed
@@ -1569,7 +1670,8 @@ async function run() {
   // Notify via Telegram to creator
   await notifyTelegram(task.creator_id, `Задача ${taskId} ${status}: ${result.message}`);
 
-  if (status === 'провал' || status === 'заблокирована') {
+  // Failure alert for either 'провал' status OR blocked via blocked_reason (separate axis)
+  if (status === 'провал' || blockedReason) {
     await writeChatAlert({
       type: "failure",
       task: taskId,
@@ -1578,6 +1680,36 @@ async function run() {
       error: String(result.message).split("\n")[0],
       details: result.message,
     });
+  }
+
+  // CLOUD-SIB-FATAL, 2026-11-05: a terminal failure freezes its sibling
+  // chain unless someone resolves it. Only 'провал' qualifies - a paused
+  // ('ожидает', provider sleeping until quota resets) or partial task is
+  // expected to come back, and terminating its siblings here would destroy
+  // work that is merely waiting. Every other branch above already kept the
+  // old behavior. Founder's brief: "чтобы они не висели вечно".
+  if (status === 'провал') {
+    try {
+      const cascade = await blockDependentSiblings(
+        { id: taskId, status, text: task.text, result: result.message },
+        client
+      );
+      if (cascade.resolved.length > 0) {
+        await writeChatAlert({
+          type: EXECUTION_EVENTS.SIB_CASCADE,
+          task: taskId,
+          from: null,
+          to: null,
+          error: `${cascade.resolved.length} sibling task(s) cancelled after task ${taskId} failed terminally`,
+          details: `Parent ${cascade.parentId}: cancelled ${cascade.resolved.join(", ")}. ` +
+            `Reason: predecessor ${taskId} is terminal and can never become 'готова', so the ` +
+            `order-guarded tail of the chain would wait forever (real case: task 155 AUTH 401 ` +
+            `left 156/157 parked in 'ожидает').`,
+        }).catch(() => {});
+      }
+    } catch (cascadeErr) {
+      console.log(`[${new Date().toISOString()}] SIB_CASCADE: unhandled: ${redactSecrets(cascadeErr.message)}`);
+    }
   }
 
   // 2026-10-24: a daily-rate-limit pause gets its own chat_alerts type so
@@ -2357,7 +2489,6 @@ const TASK_STATUSES = {
   RUNNING: "выполняется",
   COMPLETED: "готова",
   FAILED: "провал",
-  BLOCKED: "заблокирована",
   PARTIAL: "partial",
   LOOP: "loop",
   PROGRESS: "progress",
@@ -2366,6 +2497,10 @@ const TASK_STATUSES = {
 /**
  * Standard execution event types for telemetry, chat alerts, and stuck detection.
  */
+// AUTO-LOWER-ON-STALE (cloud): automatic priority lowering for stale escalations
+const ESCALATION_STALE_HOURS = Number(process.env.ESCALATION_STALE_HOURS) || 24;
+const ESCALATION_MAX_LOWER = Number(process.env.ESCALATION_MAX_LOWER) || 3;
+
 const EXECUTION_EVENTS = {
   PROGRESS: "progress",
   LOOP: "loop",
@@ -2373,6 +2508,12 @@ const EXECUTION_EVENTS = {
   TIMEOUT_LOOP: "timeout_loop",
   STUCK_TASK: "stuck_task",
   RATE_LIMIT_PAUSE: "rate_limit_pause",
+  AUTO_LOWER: "auto_lower",
+  // CLOUD-SIB-FATAL, 2026-11-05: the sibling chain was terminated because
+  // its predecessor died a terminal death. Distinct from "failure" (which
+  // is the failed task itself) and from "loop"/"stuck_task" (which describe
+  // ONE task going in circles) - this records a whole tree being resolved.
+  SIB_CASCADE: "sib_cascade",
 };
 
 /**
@@ -2724,6 +2865,8 @@ async function runDshOnce(provider, text, model) {
   const patchContent = `- id: agent-default-model\n  config:\n    provider: ${provider}\n    model: ${modelToUse}\n- id: agent-instructions\n  config:\n    maxBytes: ${agentsBytes}${agentsFileLine}\n`;
   const patchFile = path.join(os.tmpdir(), `dsh-patch-${Date.now()}-${Math.random().toString(36).slice(2)}.yml`);
   await writeFile(patchFile, patchContent, "utf-8");
+  // Calculate prompt length in bytes for fallback usage logging
+  const promptBytes = Buffer.byteLength(text, "utf8");
   try {
     return await new Promise((resolve, reject) => {
       const child = spawn("dsh", ["--profile", "headless", "--patch", patchFile, text], {
@@ -2838,7 +2981,32 @@ async function runDshOnce(provider, text, model) {
           );
           reject(structuredErr);
         } else if (code === 0) {
-          resolve(redactSecrets(trimmed));
+          // Calculate response length in bytes for fallback usage logging
+          const responseBytes = Buffer.byteLength(trimmed, "utf8");
+          let usage = null;
+          // Try to extract OpenAI-compatible usage from response (some providers/dsh configurations may include it)
+          try {
+            // Look for usage object in the output (may be in last line or embedded)
+            const usageMatch = trimmed.match(/"usage"\s*:\s*\{[^}]*"prompt_tokens"\s*:\s*(\d+)[^}]*"completion_tokens"\s*:\s*(\d+)[^}]*"total_tokens"\s*:\s*(\d+)[^}]*\}/);
+            if (usageMatch) {
+              usage = {
+                prompt_tokens: parseInt(usageMatch[1], 10),
+                completion_tokens: parseInt(usageMatch[2], 10),
+                total_tokens: parseInt(usageMatch[3], 10),
+              };
+            }
+          } catch {}
+          // Fallback: use prompt/response byte lengths
+          if (!usage) {
+            usage = {
+              prompt_tokens: null,
+              completion_tokens: null,
+              total_tokens: null,
+              prompt_bytes: promptBytes,
+              response_bytes: responseBytes,
+            };
+          }
+          resolve({ body: redactSecrets(trimmed), usage, provider, model: modelToUse });
         } else {
           // 2026-09-12: real bug found via plexus-doc-ce's captured output -
           // `out` can be a non-empty but USELESS string (a stray "\n", or
@@ -2977,7 +3145,18 @@ async function doWork(text, task) {
       return remaining.length > 0 ? remaining[0] : null;
     };
     try {
-      const rawBody = await runDshOnce(provider, text, model);
+      const result = await runDshOnce(provider, text, model);
+      const rawBody = result.body;
+      const usage = result.usage;
+      // Log usage information
+      const timestamp = new Date().toISOString();
+      if (usage) {
+        if (usage.prompt_tokens !== null && usage.completion_tokens !== null && usage.total_tokens !== null) {
+          console.log(`[${timestamp}] usage: prompt_tokens=${usage.prompt_tokens} completion_tokens=${usage.completion_tokens} total_tokens=${usage.total_tokens}`);
+        } else if (usage.prompt_bytes !== undefined && usage.response_bytes !== undefined) {
+          console.log(`[${timestamp}] usage: prompt_bytes=${usage.prompt_bytes} response_bytes=${usage.response_bytes} (fallback: provider did not return token usage)`);
+        }
+      }
       const sanitized = rawBody ? sanitizeModelText(rawBody) : "";
       const isGarbage = rawBody !== "" && sanitized !== rawBody;
       const body = rawBody ? sanitized : "(агент ничего не ответил)";
@@ -3250,11 +3429,41 @@ async function notifyTelegram(chatId, message) {
 /**
  * Эскалация фаундеру при исчерпании лимитов/зацикливании.
  * Вызывается когда все провайдеры исчерпаны или обнаружен loop.
+ * AUTO-LOWER-ON-STALE: сохраняет escalated_at и escalation_count в metadata задачи.
  */
 async function escalateToFounder(taskId, error, provider) {
   const founderChatId = "1568126"; // founder's personal Telegram chat_id
   const msg = `🚨 ЭСКАЛЯЦИЯ: задача ${taskId} провалилась на ${provider}\nОшибка: ${error}\nВсе провайдеры исчерпаны или зациклены.`;
   await notifyTelegram(founderChatId, msg);
+
+  // AUTO-LOWER-ON-STALE: record escalation timestamp and increment counter in task metadata
+  try {
+    const taskRes = await client.execute({ sql: "SELECT metadata FROM tasks WHERE id = ?", args: [taskId] });
+    const task = taskRes.rows[0];
+    let metadata = {};
+    if (task?.metadata) {
+      try { metadata = JSON.parse(task.metadata); } catch {}
+    }
+    const now = new Date().toISOString();
+    const escalationCount = (metadata.escalation_count || 0) + 1;
+    metadata.escalated_at = now;
+    metadata.escalation_count = escalationCount;
+    await client.execute({
+      sql: "UPDATE tasks SET metadata = ? WHERE id = ?",
+      args: [JSON.stringify(metadata), taskId]
+    });
+    // Log auto-lower event to chat_alerts
+    await writeChatAlert({
+      type: EXECUTION_EVENTS.AUTO_LOWER,
+      task: taskId,
+      from: provider,
+      to: null,
+      error: `Escalation #${escalationCount} recorded`,
+      details: `Task ${taskId} escalated to founder at ${now}. Escalation count: ${escalationCount}/${ESCALATION_MAX_LOWER}`
+    }).catch(() => {});
+  } catch (e) {
+    console.log(`[${new Date().toISOString()}] AUTO-LOWER: failed to record escalation metadata for task ${taskId}: ${e.message}`);
+  }
 }
 
 /**
@@ -3782,6 +3991,7 @@ export {
   findLatestCheckpoint,
   executeResume,
   extractParentAndSiblingInfo,
+  blockDependentSiblings,
   checkTreeCompletion,
   executeLongCompute,
   doWork,
