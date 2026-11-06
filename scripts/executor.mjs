@@ -1352,15 +1352,28 @@ async function blockDependentSiblings(task, client) {
   const parentId = null;
   let resolved = [];
   try {
-    // Defense in depth: only a TERMINAL death freezes a chain. The primary
-    // gate is the call site (status === 'провал'), but a paused task returns
-    // to 'ожидает' expecting a retry after the provider's quota reset, and a
-    // 'partial' one expects resumption - cancelling their siblings here would
-    // destroy work that is merely waiting. Verified by
-    // tests/sib-cascade-on-fatal.mjs case 3, which caught exactly that when
-    // this function itself trusted the caller.
-    if (task.status !== 'провал') {
-      console.log(`[${new Date().toISOString()}] SIB_CASCADE: task ${task.id} is '${task.status}', not terminal - leaving its sibling chain alone`);
+    // Defense in depth: only a TERMINAL death freezes a chain.
+    //
+    // RETRY-BUDGET, 2026-11-06 widened the meaning of 'провал': it is now
+    // ALSO a retryable verdict (provider hiccup, retry budget unspent), and
+    // the dispatcher will bring that task back. Cancelling its siblings then
+    // would be a disaster - the predecessor is coming back healthy, most
+    // likely with nothing more than a corrected key, and the chain should
+    // still be waiting for it.
+    //
+    // Terminal now means exactly two things:
+    //   'провал_фатальный'  - the task's own defect, or a spent retry budget
+    //   'провал' with retry_budget_exhausted - same verdict, belt and braces
+    //                        in case the status was written by an older build
+    // Everything else ('ожидает', 'partial', a retryable 'провал') is a
+    // task that is coming back, and its chain must keep waiting.
+    const meta = parseTaskMetadata(task);
+    const stillRetryable = task.status === 'провал' && isRetryableFailureTask({ status: task.status, metadata: task.metadata, blocked_reason: task.blocked_reason });
+    const terminal = task.status === 'провал_фатальный'
+      || Boolean(task.blocked_reason)
+      || (task.status === 'провал' && !stillRetryable);
+    if (!terminal) {
+      console.log(`[${new Date().toISOString()}] SIB_CASCADE: task ${task.id} is '${task.status}' (retry_count=${meta.retry_count || 0}) - not terminal, leaving its sibling chain to wait`);
       return { parentId: null, resolved: [] };
     }
     const sib = parseSiblingMarker(task.text);
@@ -1373,7 +1386,7 @@ async function blockDependentSiblings(task, client) {
       args: [`%[SIB %/${sib.total} parent:${sib.parentId}]%`],
     });
 
-    const reason = `предшественник/родственник ${task.id} провалился окончательно (${String(task.result || '').split('\n')[0].slice(0, 120)}); цепочка заморожена - перезапустить родителя`;
+    const reason = `предшественник/родственник ${task.id} остановлен окончательно (${task.status}, причина: ${meta.last_failure_reason || 'n/a'}, попыток: ${meta.retry_count || 0}): ${String(task.result || '').split('\n')[0].slice(0, 120)}. Цепочка заморожена - перезапустить родителя`;
     for (const dep of dependents.rows || []) {
       // Never touch the task that just failed itself (it is 'провал', not
       // 'ожидает', so it cannot be selected by this query - asserted here
@@ -1573,9 +1586,20 @@ async function run() {
   const startTime = Date.now();
 
   // Fetch task (supports pending and partial tasks for resume)
-  const taskRes = await client.execute({ sql: "SELECT * FROM tasks WHERE id = ? AND status IN ('ожидает', 'partial')", args: [taskId] });
+  const taskRes = await client.execute({ sql: "SELECT * FROM tasks WHERE id = ? AND (status IN ('ожидает', 'partial') OR status = 'провал')", args: [taskId] });
   const task = taskRes.rows[0];
   if (!task) { console.log('No pending or partial task found'); return; }
+
+  // RETRY-BUDGET, 2026-11-06: a 'провал' row is only runnable while its
+  // budget is unspent and it is not a founder-fixable block. The dispatcher
+  // applies the same rule before it queues a retry, so the two contours
+  // cannot disagree. Anything else is left exactly as it is - the row keeps
+  // its verdict instead of being silently re-run.
+  if (task.status === 'провал' && !isRetryableFailureTask(task)) {
+    const meta = parseTaskMetadata(task);
+    console.log(`[${new Date().toISOString()}] task ${taskId}: 'провал' is not retryable (reason=${meta.last_failure_reason || 'n/a'}, retry_count=${meta.retry_count || 0}${task.blocked_reason ? ', blocked_reason set' : ''}) - leaving its verdict in place`);
+    return;
+  }
 
   // Preflight model validation (once per run)
   await preflightCheckModels();
@@ -1694,18 +1718,57 @@ async function run() {
   // retries it after the provider's quota reset instead of burying the
   // chain under a 'провал'.
   const isPermanentBlock = Boolean(result.permanent);
+
+  // RETRY-BUDGET, 2026-11-06: transient vs fatal. A provider hiccup (401,
+  // 429, 503, timeout, ECONNRESET) now keeps the task retryable with a
+  // budget, and only a task-defect or an exhausted budget gets the fatal
+  // verdict that freezes the sibling chain. 'paused' (daily rate limit) and
+  // 'partial' keep their existing meanings and are not retries at all.
+  const verdict = classifyFailure(result);
+  // metadata arrives from Turso as a JSON string, not an object - parse it
+  // or the retry budget resets to 0 on every attempt and retries never exhaust.
+  const prevRetryCount = Number((parseTaskMetadata(task).retry_count) || 0);
+  const retryCount = verdict.retryable ? prevRetryCount + 1 : prevRetryCount;
+  const retryBudgetExhausted = verdict.retryable && retryCount >= MAX_TASK_RETRIES;
+
   const status = result.success
     ? 'готова'
     : (result.paused ? 'ожидает'
-      : (result.partial || result.status === 'partial' ? 'partial' : 'провал'));
+      : (result.partial || result.status === 'partial' ? 'partial'
+        : ((verdict.fatal && !isPermanentBlock) || retryBudgetExhausted ? 'провал_фатальный' : 'провал')));
+
   const blockedReason = isPermanentBlock ? (result.blockedReason || result.message || 'permanent founder-fixable blocker') : null;
   const minutesUsed = Math.ceil((workEnd - workStart) / 60000);
   const secondsToFirstWork = Math.floor((workStart - startTime) / 1000);
+
+  // The retry budget and the moment of the last failure live in metadata so
+  // the dispatcher can re-pick a transient failure after RETRY_AFTER_SECONDS
+  // without needing a new column on the live Turso table.
+  const retryMetadata = (status === 'провал' || status === 'провал_фатальный')
+    ? {
+        retry_count: retryCount,
+        retryable: verdict.retryable && !retryBudgetExhausted,
+        retry_budget_exhausted: retryBudgetExhausted,
+        failed_at: Math.floor(Date.now() / 1000),
+        last_failure_reason: verdict.reason,
+        last_failure_category: result.category || null,
+      }
+    : null;
 
   await client.execute({
     sql: 'UPDATE tasks SET status = ?, result = ?, actions_run_id = ?, seconds_to_first_work = ?, minutes_used = ?, paused_until = ?, blocked_reason = ? WHERE id = ?',
     args: [status, result.message, process.env.GITHUB_RUN_ID, secondsToFirstWork, minutesUsed, result.pausedUntil || null, blockedReason, taskId]
   });
+
+  if (retryMetadata) {
+    let prevMeta = {};
+    try { prevMeta = task.metadata ? JSON.parse(task.metadata) : {}; } catch {}
+    if (!prevMeta || typeof prevMeta !== "object") prevMeta = {};
+    await client.execute({
+      sql: 'UPDATE tasks SET metadata = ? WHERE id = ?',
+      args: [JSON.stringify({ ...prevMeta, ...retryMetadata }), taskId]
+    });
+  }
 
   // Ensure correct tree completion when jobs are completed or resumed
   if (status === 'готова') {
@@ -1722,11 +1785,23 @@ async function run() {
     }
   }
 
-  // Notify via Telegram to creator
-  await notifyTelegram(task.creator_id, `Задача ${taskId} ${status}: ${result.message}`);
+  // Notify via Telegram to creator.
+  // RETRY-BUDGET / blocked_reason, 2026-11-06: blocking left the status
+  // column, so `${status}` alone stopped telling the owner a task was
+  // BLOCKED (founder action required) rather than merely FAILED (retryable).
+  // Name the axis explicitly in the owner-facing text - the distinction is
+  // the whole point of "invalid_key needs a new key" vs "no_address needs the
+  // brief edited", and tests/cloud_queue_contract.mjs asserts on it.
+  // Blocked first, as the state the owner must act on - the status verdict is
+  // secondary detail for a blocked task, and this is the one string that has
+  // to let "invalid_key needs a new key" stand apart from a retryable провал.
+  const notifyText = blockedReason
+    ? `Задача ${taskId} заблокирована: ${result.message}`
+    : `Задача ${taskId} ${status}: ${result.message}`;
+  await notifyTelegram(task.creator_id, notifyText);
 
   // Failure alert for either 'провал' status OR blocked via blocked_reason (separate axis)
-  if (status === 'провал' || blockedReason) {
+  if (status === 'провал' || status === 'провал_фатальный' || blockedReason) {
     await writeChatAlert({
       type: "failure",
       task: taskId,
@@ -1743,10 +1818,12 @@ async function run() {
   // expected to come back, and terminating its siblings here would destroy
   // work that is merely waiting. Every other branch above already kept the
   // old behavior. Founder's brief: "чтобы они не висели вечно".
-  if (status === 'провал') {
+  // RETRY-BUDGET: a retryable 'провал' must NOT freeze the chain (the task
+  // is coming back); 'провал_фатальный' and 'провал' with a spent budget must.
+  if (status === 'провал_фатальный' || (status === 'провал' && retryBudgetExhausted)) {
     try {
       const cascade = await blockDependentSiblings(
-        { id: taskId, status, text: task.text, result: result.message },
+        { id: taskId, status, text: task.text, result: result.message, metadata: JSON.stringify({ ...(prevRetryCount ? { retry_count: retryCount } : {}), retry_budget_exhausted: retryBudgetExhausted, last_failure_reason: verdict.reason }) },
         client
       );
       if (cascade.resolved.length > 0) {
@@ -2543,10 +2620,161 @@ const TASK_STATUSES = {
   RUNNING: "выполняется",
   COMPLETED: "готова",
   FAILED: "провал",
+  // RETRY-BUDGET, 2026-11-06: a task whose own brief is broken, or whose
+  // retry budget is spent. Terminal for the SIB cascade, unretryable by
+  // the dispatcher - and visibly distinct from a retryable 'провал'.
+  FAILED_FATAL: "провал_фатальный",
   PARTIAL: "partial",
   LOOP: "loop",
   PROGRESS: "progress",
 };
+
+/**
+ * RETRY-BUDGET, 2026-11-06 (founder brief: transient vs fatal).
+ *
+ * The old queue had exactly one terminal failure verdict, 'провал'. That
+ * was wrong in both directions: a provider hiccup (429, timeouts, a stale
+ * key) buried the chain under a status nobody may retry, while a task whose
+ * own brief is broken kept its retryable shape. Real case, run 41958012870
+ * (task 156): nvidia timed out after 20 min -> openrouter looped -> groq
+ * answered 401 Invalid API Key. One bad credential ended a task that needed
+ * three attempts and a fixed key, not a verdict.
+ *
+ * Two verdicts now:
+ *
+ *   transient - provider-facing: 401, 429, 503, timeouts, ECONNRESET and
+ *               friends. status 'провал' + retry_count incremented, and the
+ *               dispatcher re-picks the task 5 minutes later while
+ *               retry_count < MAX_TASK_RETRIES. The sibling chain is NOT
+ *               cancelled here: the predecessor may still come back healthy,
+ *               which is exactly what a correct key produces.
+ *   fatal     - the task's own defect: invalid model, syntax, broken logic,
+ *               or a founder-fixable block (no_address and friends, the
+ *               pre-existing result.permanent path). status
+ *               'провал_фатальный' immediately, and the SIB cascade fires -
+ *               the chain is doomed for a reason the predecessor cannot
+ *               change by being retried.
+ *
+ * A transient failure whose retry budget is exhausted ALSO becomes
+ * 'провал_фатальный': three strikes is a terminal verdict, not a fourth
+ * attempt, and the chain must be resolved rather than held open.
+ *
+ * The retry budget lives in metadata (JSON column) rather than a new
+ * column, so no live ALTER TABLE on Turso is needed - the same pattern
+ * escalateToFounder already uses for escalation_count.
+ */
+const MAX_TASK_RETRIES = 3;
+const RETRY_AFTER_SECONDS = 300;
+const RETRYABLE_CATEGORIES = new Set(["auth", "capacity", "timeout", "service"]);
+
+// Network/provider transients that may not be named in a category, plus the
+// 401/429/503 families the founder's brief calls out explicitly.
+const TRANSIENT_ERROR_RE = /ECONNRESET|ECONNABORTED|ETIMEDOUT|EPIPE|socket hang up|connection reset|connection refused|bad gateway|too many requests|rate limit|quota|overloaded|service unavailable|timed? out|timeout|HTTP Error 5\d\d|HTTP Error 40[19]|\b40[19]\b|\b4[23]9\b|invalid api key|invalid_api_key|unauthorized/i;
+
+// The task's own defect - retrying cannot repair a brief.
+const FATAL_ERROR_RE = /invalid model|not a valid model|unknown model|model not found|NO_ADAPTER|syntax error|unexpected token|unexpected end of|parse error|malformed|cannot find module|MODULE_NOT_FOUND|is not defined|impossible_as_written/i;
+
+/**
+ * Decides what a failed attempt MEANS: retryable, fatal, or no verdict.
+ *
+ * Order matters. A founder-fixable block (result.permanent, the diagnose
+ * path's no_address/no_access/impossible_as_written) is fatal even though
+ * its message may read like an ordinary failure - and it must never be
+ * retried, because the fix is a human editing the brief. Likewise a
+ * PERMANENT_BLOCKER recovery hint (403 permission denied) is a real
+ * credential/permission wall, not a hiccup.
+ *
+ * @param {object} result - doWork()'s result object
+ * @returns {{retryable: boolean, fatal: boolean, reason: string}}
+ */
+/**
+ * Parses a task's metadata column into an object. Turso hands back JSON as
+ * a string, and several call sites in this file already do the same dance
+ * inline - this is the one place it is done safely (bad/absent JSON yields
+ * {} rather than throwing or silently losing the field).
+ *
+ * @param {{metadata?: unknown}} task
+ * @returns {Record<string, any>}
+ */
+function parseTaskMetadata(task) {
+  const raw = task && task.metadata;
+  if (!raw) return {};
+  if (typeof raw === "object") return raw;
+  try { const parsed = JSON.parse(raw); return (parsed && typeof parsed === "object") ? parsed : {}; }
+  catch { return {}; }
+}
+
+/**
+ * RETRY-BUDGET, 2026-11-06: is a task that reads 'провал' worth another
+ * attempt? One rule, shared by BOTH contours - executor.mjs (which reads the
+ * row again before claiming) and dispatcher.mjs (whose SELECT pulls the
+ * candidates back into the queue). Keeping it here, next to
+ * classifyFailure(), is what stops the two halves from disagreeing about
+ * what "retryable" means - the Local-Cloud Parity rule applied to a single
+ * file rather than two hand-synced copies (the CLOUD-MAINT-c-d mistake).
+ *
+ * Not retryable:
+ *   - a founder-fixable block (blocked_reason set) - the fix is a human
+ *     editing the brief, and no retry will make it appear;
+ *   - a spent budget (retry_count >= MAX_TASK_RETRIES) - three strikes;
+ *   - an explicit retryable: false.
+ * Retryable by default:
+ *   - a 'провал' row from BEFORE this change carried no marker at all, and
+ *     stranding those would turn a hotfix into a queue freeze.
+ *
+ * @param {object} task - a task row (metadata may be a JSON string)
+ * @returns {boolean}
+ */
+function isRetryableFailureTask(task) {
+  if (!task || task.status !== TASK_STATUSES.FAILED) return false;
+  if (task.blocked_reason) return false;
+  const meta = parseTaskMetadata(task);
+  // The BUDGET is the authority, not the flag - the founder's rule is
+  // literally "retry_count < 3". A row written while the count was 1 says
+  // retryable: true forever, and trusting that flag is how a task reaches
+  // attempt #5 and beyond (caught by tests/retry-budget.mjs).
+  if (Number(meta.retry_count || 0) >= MAX_TASK_RETRIES) return false;
+  if (meta.retryable !== undefined) return meta.retryable === true;
+
+  // A row with NO failure timestamp is not retryable, and this is not a
+  // detail - it is the founder's own gate read literally: "если с момента
+  // падения прошло > 5 минут". A legacy 'провал' written before RETRY-BUDGET
+  // carries no failed_at, so there is no "момент падения" to measure and the
+  // gate cannot be satisfied.
+  //
+  // This also resolves a real conflict rather than choosing a side:
+  // tests/cloud_queue_contract.mjs §3.3 seeds a legacy 'провал' and asserts
+  // "Must not execute failed task" (status must stay 'провал'). Re-running
+  // old unclassified failures wholesale would break that contract and burn
+  // quota on three-month-old verdicts. The retry mechanism therefore applies
+  // to failures it has itself classified - never retroactively to a queue
+  // full of unmarked history.
+  return Boolean(meta.failed_at);
+}
+
+function classifyFailure(result) {
+  if (!result || result.success) return { retryable: false, fatal: false, reason: "no_failure" };
+  // A founder-fixable block is NEITHER of my verdicts. It keeps its own
+  // orthogonal signal (blocked_reason, "what must happen first") on a plain
+  // 'провал', exactly as the blocked_reason refactor designed it - folding
+  // it into 'провал_фатальный' would invent a third meaning for the same
+  // thing and clash with a contract that already encodes the split.
+  if (result.permanent) return { retryable: false, fatal: false, reason: "permanent_founder_fixable" };
+  if (result.recoveryHint === RECOVERY_HINTS.PERMANENT_BLOCKER) {
+    return { retryable: false, fatal: false, reason: "permanent_blocker_hint" };
+  }
+  const msg = String(result.message || "");
+  // A task-defect signature outranks category: an unclassifiable-looking
+  // error whose text names a syntax or model problem is not a hiccup.
+  if (FATAL_ERROR_RE.test(msg)) return { retryable: false, fatal: true, reason: "task_defect" };
+  if (TRANSIENT_ERROR_RE.test(msg) || RETRYABLE_CATEGORIES.has(result.category)) {
+    return { retryable: true, fatal: false, reason: result.category || "transient_signature" };
+  }
+  // 'process'/'unknown' and anything unrecognized: not evidence of a
+  // provider hiccup, and retrying an unknown failure three times is how a
+  // quota gets burned for nothing.
+  return { retryable: false, fatal: true, reason: "unclassified_failure" };
+}
 
 /**
  * Standard execution event types for telemetry, chat alerts, and stuck detection.
@@ -4047,6 +4275,8 @@ export {
   extractParentAndSiblingInfo,
   blockDependentSiblings,
   pushBranch,
+  isRetryableFailureTask,
+  classifyFailure,
   checkTreeCompletion,
   executeLongCompute,
   doWork,
