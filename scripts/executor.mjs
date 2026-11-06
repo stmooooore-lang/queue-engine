@@ -1581,6 +1581,11 @@ async function executeLongCompute(command, task = null, text = '', options = {})
   };
 }
 
+// ZOMBIE-HOTFIX, 2026-11-08: the task the current pass has claimed and not
+// yet released. Cleared once its verdict is written (success, failure or
+// deferred), so the crash guard only ever releases a row genuinely still stuck.
+let activeTaskIdForCrashGuard = null;
+
 async function run() {
   const taskId = process.env.TASK_ID;
   const startTime = Date.now();
@@ -1622,6 +1627,13 @@ async function run() {
     console.log(`[${new Date().toISOString()}] Task ${taskId}: atomic claim failed (expected status "${expectedStatus}" no longer matches or task claimed by another executor), skipping`);
     return;
   }
+  // ZOMBIE-HOTFIX, 2026-11-08 (second layer): from this instant the row says
+  // 'выполняется' and we own it. The primary-write guard below covers a
+  // failure AT that write; this makes the same release available to a crash
+  // ANYWHERE else in the pass - a decompose, a checkpoint upload, an
+  // unguarded await - which the previous `run().catch(() => process.exit(1))`
+  // turned into a silent zombie too, just by a different route.
+  activeTaskIdForCrashGuard = taskId;
 
   // Triage: is this genuinely one unit of work, or several that should
   // run as independent, smaller dsh calls? (founder's own repeated
@@ -1755,19 +1767,66 @@ async function run() {
       }
     : null;
 
-  await client.execute({
-    sql: 'UPDATE tasks SET status = ?, result = ?, actions_run_id = ?, seconds_to_first_work = ?, minutes_used = ?, paused_until = ?, blocked_reason = ? WHERE id = ?',
-    args: [status, result.message, process.env.GITHUB_RUN_ID, secondsToFirstWork, minutesUsed, result.pausedUntil || null, blockedReason, taskId]
-  });
-
-  if (retryMetadata) {
-    let prevMeta = {};
-    try { prevMeta = task.metadata ? JSON.parse(task.metadata) : {}; } catch {}
-    if (!prevMeta || typeof prevMeta !== "object") prevMeta = {};
+  // ZOMBIE-HOTFIX, 2026-11-08: this write is the point of no return, and
+  // until now it had no guard. When it throws - as it did on tasks 155/156
+  // with "no such column: blocked_reason" - the executor died right here,
+  // after 40 minutes of real work, having written nothing: no result, no
+  // status, and the row still claiming 'выполняется'. The dispatcher will
+  // never re-pick 'выполняется' (it is not in the SELECT), so those tasks
+  // became permanent zombies that only a human could find by eye.
+  //
+  // The guard is not "swallow the error"; the task must still land in a state
+  // someone can act on. So: primary write fails -> fall back to a minimal
+  // write that names ONLY id, status and result. That is deliberate - a
+  // fallback that also set blocked_reason would fail the same way this write
+  // did and leave the zombie in place. Minimal means survivable.
+  // The verdict is being written now, so this pass no longer needs the
+  // crash guard - clearing it here stops a later throw (a Telegram or a tree
+  // check) from re-releasing a task whose real verdict is already recorded.
+  activeTaskIdForCrashGuard = null;
+  let outcomeWritten = false;
+  try {
     await client.execute({
-      sql: 'UPDATE tasks SET metadata = ? WHERE id = ?',
-      args: [JSON.stringify({ ...prevMeta, ...retryMetadata }), taskId]
+      sql: 'UPDATE tasks SET status = ?, result = ?, actions_run_id = ?, seconds_to_first_work = ?, minutes_used = ?, paused_until = ?, blocked_reason = ? WHERE id = ?',
+      args: [status, result.message, process.env.GITHUB_RUN_ID, secondsToFirstWork, minutesUsed, result.pausedUntil || null, blockedReason, taskId]
     });
+    outcomeWritten = true;
+  } catch (writeErr) {
+    // The zombie guard. 'провал' is the founder's prescribed verdict for a
+    // crashed write, and it is retryable, which is the honest call: an
+    // infrastructure failure is not proof the brief is bad.
+    console.log(`[${new Date().toISOString()}] OUTCOME_WRITE_FAILED: could not record the verdict for task ${taskId} (${redactSecrets(writeErr.message)}) - falling back to a minimal status write`);
+    try {
+      await client.execute({
+        sql: `UPDATE tasks SET status = 'провал', result = ? WHERE id = ?`,
+        args: [`WRITE-FAILED 2026-11-08: verdict could not be recorded (${redactSecrets(writeErr.message)}). Raw message: ${String(result.message || "").split("\n")[0]}`, taskId]
+      });
+      outcomeWritten = true;
+      console.log(`[${new Date().toISOString()}] ZOMBIE_PREVENTED: task ${taskId} released from 'выполняется' via minimal fallback write`);
+      process.exitCode = 1;
+    } catch (fallbackErr) {
+      // Both writes failed. The row is still 'выполняется' and there is no
+      // safe move left that touches the DB - say so loudly and let the run
+      // fail, rather than reporting success over a zombie.
+      console.log(`[${new Date().toISOString()}] ZOMBIE_UNPREVENTED: even the minimal write failed for task ${taskId} (${redactSecrets(fallbackErr.message)}) - task remains in 'выполняется', needs manual cleanup`);
+      process.exitCode = 1;
+    }
+  }
+
+  if (retryMetadata && outcomeWritten) {
+    // Retry bookkeeping is best-effort by design: a task whose verdict is
+    // recorded must not become a zombie because its metadata did not fit.
+    try {
+      let prevMeta = {};
+      try { prevMeta = task.metadata ? JSON.parse(task.metadata) : {}; } catch {}
+      if (!prevMeta || typeof prevMeta !== "object") prevMeta = {};
+      await client.execute({
+        sql: 'UPDATE tasks SET metadata = ? WHERE id = ?',
+        args: [JSON.stringify({ ...prevMeta, ...retryMetadata }), taskId]
+      });
+    } catch (metaErr) {
+      console.log(`[${new Date().toISOString()}] RETRY_METADATA_UNWRITTEN: metadata not saved for task ${taskId} (${redactSecrets(metaErr.message)}) - the verdict above stands, the retry budget will restart on the next attempt`);
+    }
   }
 
   // Ensure correct tree completion when jobs are completed or resumed
@@ -1931,8 +1990,27 @@ async function pushTaskArtifacts() {
 // this existed. Only safe branch-name characters are captured by the regex
 // (alnum, dot, dash, underscore, slash) - never interpolated unsanitized
 // into a shell command.
+// ZOMBIE-HOTFIX, 2026-11-08: branch names are an explicit token, not prose.
+// The old regex /\bbranch[:\s]+.../i accepted ANY whitespace after "branch",
+// so ordinary wording was parsed as a branch name: "branch is main" captured
+// "is", and the run then tried `git fetch origin is` and fell back to the
+// default checkout silently - the task's real intent was lost with no error
+// anyone could see. Colon is now MANDATORY (the marker syntax every brief
+// already used), and a bracketed form is accepted too.
+//
+// Two accepted forms only - deliberately not a looser one:
+//   [BRANCH: name]   (marker, wins when both are present)
+//   branch: name     (inline, colon required)
+// No Russian "ветка:" equivalent is invented here: an unrequested alias is a
+// guess, and a guess in a ref parser is a checkout of a ref nobody asked for.
+const BRANCH_MARKER_RE = /\[\s*branch\s*:\s*([A-Za-z0-9][A-Za-z0-9._\/-]*)\s*\]/i;
+const BRANCH_COLON_RE = /\bbranch\s*:\s*(?!directive\b)([A-Za-z0-9][A-Za-z0-9._\/-]*)/i;
+
 function checkoutTaskBranch(text) {
-  const m = String(text || "").match(/\bbranch[:\s]+(?!directive\b)([A-Za-z0-9][A-Za-z0-9._\/-]*)/i);
+  const raw = String(text || "");
+  // Bracket marker first, then the inline colon form - so "[BRANCH: rule] use
+  // branch: rule" cannot make the inline form win by accident of position.
+  const m = BRANCH_MARKER_RE.exec(raw) || BRANCH_COLON_RE.exec(raw);
   if (!m) {
     console.log(`[${new Date().toISOString()}] branch: none named in task text, staying on default checkout`);
     return null;
@@ -4314,6 +4392,7 @@ export {
   notifyTelegram,
   escalateToFounder,
   checkoutTaskBranch,
+  releaseStuckTaskAfterCrash,
   pushTaskArtifacts,
   triageSplit,
   triageCheck,
@@ -4359,9 +4438,49 @@ export {
   verifyBootstrap,
 };
 
+/**
+ * ZOMBIE-HOTFIX, 2026-11-08 (layer two of two): release a task that any
+ * unhandled throw leaves stuck in 'выполняется'.
+ *
+ * Layer one guards the specific final write. This covers every OTHER way the
+ * pass can die - and `run()` has ~100 lines of awaits before that write, each
+ * of which would otherwise produce the exact same zombie by a different route.
+ *
+ * Same verdict and same reasoning as layer one: 'провал', the founder's
+ * prescribed value, retryable because an infrastructure crash says nothing
+ * about the brief. The write itself is minimal (id, status, result) for the
+ * same reason as before: if the DB is the thing that is broken, a richer
+ * statement fails identically and leaves the row stuck.
+ */
+async function releaseStuckTaskAfterCrash(taskId, err) {
+  console.error(redactSecrets(err?.stack || err?.message || err));
+  try {
+    await client.execute({
+      sql: `UPDATE tasks SET status = 'провал', result = ? WHERE id = ? AND status = 'выполняется'`,
+      args: [`CRASH-GUARD 2026-11-08: pass died before the verdict was written (${String(err?.message || err).split("\n")[0]}). Released from 'выполняется' so the dispatcher can pick it up; no verdict was recorded.`, taskId],
+    });
+    console.error(`[${new Date().toISOString()}] CRASH_GUARD: task ${taskId} released from 'выполняется' to 'провал' after an unhandled throw`);
+  } catch (releaseErr) {
+    console.error(`[${new Date().toISOString()}] CRASH_GUARD_FAILED: could not release task ${taskId} (${redactSecrets(releaseErr?.message || releaseErr)}) - row remains in 'выполняется' and needs manual cleanup`);
+  }
+  process.exit(1);
+}
+
 if (process.argv[1] && process.argv[1].endsWith('executor.mjs')) {
-  run().catch((err) => {
-    console.error(redactSecrets(err?.stack || err?.message || err));
-    process.exit(1);
-  });
+  const crashGuardWrapped = async () => {
+    // Re-read at throw time, not at call time: the guard is cleared the moment
+    // a verdict is recorded, so a task whose outcome was already written is
+    // never released a second time.
+    try {
+      return await run();
+    } catch (err) {
+      if (activeTaskIdForCrashGuard !== null) {
+        await releaseStuckTaskAfterCrash(activeTaskIdForCrashGuard, err);
+        return;
+      }
+      console.error(redactSecrets(err?.stack || err?.message || err));
+      process.exit(1);
+    }
+  };
+  crashGuardWrapped();
 }
