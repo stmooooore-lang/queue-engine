@@ -1977,9 +1977,35 @@ function checkoutTaskBranch(text) {
 // НЕ удалён, settings.yaml google-блок не тронут (dsh валидирует все
 // объявленные провайдеры на старте). Порядок после исключения:
 // nvidia → mistral → vertex.
-const PROVIDER_ORDER = ["nvidia", "openrouter", "groq", "google", "vertex"];
+// 2026-11-08 (hotfix, founder brief): groq ИСКЛЮЧЁН из ротации повторно -
+// причина та же, что 2026-10-13, но по факту окончательная: Groq
+// заблокировал аккаунт, ключ отвечает 401 Invalid API Key на каждом
+// вызове (run 41958012870, задача 156: nvidia таймаут -> openrouter петля ->
+// groq 401). На 401 ротация не продолжается (правило шапки файла),
+// поэтому одна мертвая учетка останавливала задачу целиком.
+//
+// Реальный механизм отключения - ЭТА строка. Провайдер вне PROVIDER_ORDER
+// не запрашивается ротатором, адаптер для него не ищется, ключ для него не
+// расходуется. Блок в executor.yml закомментирован по brief'у и для
+// согласованности, но НЕ потому, что dsh падал бы на старте: smoke-test
+// boot'а (executor.yml:214) намеренно гонится с фейковым
+// NVIDIA_API_KEY, получает exit 1 - и это считается успехом, потому что
+// ошибка провайдера доказывает, что дерево плагинов смонтировалось;
+// фатально только "plugin tree failed to load" (executor.yml:218). Так что
+// заявленный провайдер с битым ключом не убивает исполнитель - версия
+// "иначе весь исполнитель ложился" была бы выдуманным фактом и снята.
+//
+// PROVIDER_CONFIG.groq НЕ удалён - вернётся одной строкой, когда ключ
+// починят. Порядок после исключения: nvidia -> openrouter -> google -> vertex.
+const PROVIDER_ORDER = ["nvidia", "openrouter", "google", "vertex"];
 const PROVIDER_CONFIG = {
-  groq: { baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY", models: ["openai/gpt-oss-120b"] },
+  // 2026-11-08 (hotfix): groq выключен - ключ отдаёт 401 (аккаунт
+  // заблокирован). Блок сохранён закомментированным: возврат = убрать
+  // комментарий и добавить "groq" обратно в PROVIDER_ORDER. Наличие записи
+  // в PROVIDER_CONFIG безопасно, пока провайдера нет в PROVIDER_ORDER -
+  // ротация его не запрашивает, адаптер не ищется. Удалять нельзя: это
+  // edit-history причины, по которой он выключен.
+  // groq: { baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY", models: ["openai/gpt-oss-120b"] },
   // 2026-10-31 (hotfix, task 143): minimaxai/minimax-m3.1-flash (UNKNOWN_MODEL)
   // and stepfun-ai/step-5-preview (absent from pi-ai entirely - only Step-3.7-Flash
   // exists) are not in the dsh registry - Plexus confirmed against pi-ai. The

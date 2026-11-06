@@ -260,12 +260,30 @@ jobs:
           cat > ~/.dsh/settings.yaml << SETTINGS
           llm-pi-ai:
             providers:
-              groq:
-                apiKeyEnv: GROQ_API_KEY
-                api: openai-completions
-                baseURL: https://api.groq.com/openai/v1
-                models:
-                  - id: openai/gpt-oss-120b
+              # 2026-11-08 (hotfix, founder brief): groq отключён - Groq
+              # заблокировал аккаунт, ключ отвечает 401 Invalid API Key
+              # (run 41958012870, задача 156). Блок закомментирован, а не
+              # удалён: возврат = снять комментарий здесь И вернуть "groq"
+              # в PROVIDER_ORDER в executor.mjs (оба файла должны совпадать,
+              # иначе ротация умирает на NO_ADAPTER - правило из
+              # комментария к nvidia ниже).
+              #
+              # Отключение реально делается в executor.mjs (PROVIDER_ORDER) -
+              # провайдер вне порядка не запрашивается ротатором. Этот блок
+              # снимается по brief'у и ради согласованности файлов (правило в
+              # комментарии к nvidia ниже: код и yaml должны совпадать).
+              # НЕ потому, что dsh падал бы на старте с битым ключом: smoke-test
+              # boot'а выше намеренно идет с фейковым NVIDIA_API_KEY, получает
+              # exit 1 и считается успехом - фатальна только ошибка дерева
+              # плагинов. GROQ_API_KEY в env шага run-the-task оставлен: без
+              # объявленного провайдера он ни на что не влияет, а удаление -
+              # лишнее касание строки с именем секрета.
+              # groq:
+              #   apiKeyEnv: GROQ_API_KEY
+              #   api: openai-completions
+              #   baseURL: https://api.groq.com/openai/v1
+              #   models:
+              #     - id: openai/gpt-oss-120b
               nvidia:
                 apiKeyEnv: NVIDIA_API_KEY
                 api: openai-completions
