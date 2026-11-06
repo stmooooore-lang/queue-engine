@@ -7,9 +7,17 @@
  * One auth error froze an entire triage-split tree with no record of why.
  *
  * The fix: blockDependentSiblings() - WRITES. When a triage-split subtask
- * dies a terminal death, the still-waiting tail of its sibling tree is
+ * dies a TERMINAL death, the still-waiting tail of its sibling tree is
  * switched to 'отменена' with a recorded reason, so it neither hangs
  * forever nor runs on a broken foundation.
+ *
+ * RETRY-BUDGET, 2026-11-06 changed what "terminal" means: a plain 'провал'
+ * is now a RETRYABLE verdict (the predecessor is expected back - most
+ * likely nothing is wrong beyond a stale key), so it must NOT freeze the
+ * chain. Only 'провал_фатальный', or a 'провал' whose retry budget is
+ * spent, terminates. Every terminal case below therefore passes the fatal
+ * verdict or the exhausted budget explicitly; tests/retry-budget.mjs
+ * covers the retryable side of that boundary.
  *
  * The guard is deliberately NOT loosened: cloud_queue_contract.mjs
  * normatively requires "Sibling 2 must be rejected when prior sibling is
@@ -31,6 +39,8 @@
 import { createClient } from "@libsql/client";
 import { makeSiblingOrderOk } from "../scripts/sibling-parser.mjs";
 import { blockDependentSiblings } from "../scripts/executor.mjs";
+
+const MAX = 3; // MAX_TASK_RETRIES
 
 let pass = 0;
 let fail = 0;
@@ -90,7 +100,7 @@ console.log("=== CLOUD-SIB-FATAL regression tests ===\n");
   // Production order: 155's terminal failure cascades to its waiting tail.
   // THIS is what breaks the hang - it terminates the tail instead of
   // releasing it to burn a doomed attempt on a broken foundation.
-  const res = await blockDependentSiblings({ id: 155, status: "провал", text: T155, result: "ERR_AUTH_FAILURE 401" }, db);
+  const res = await blockDependentSiblings({ id: 155, status: "провал_фатальный", text: T155, result: "ERR_AUTH_FAILURE 401", metadata: JSON.stringify({ retry_count: MAX, retryable: false, retry_budget_exhausted: true }) }, db);
   check("cascade resolves exactly the two waiting siblings 156 and 157",
     res.resolved.length === 2 && String(res.parentId) === "155", JSON.stringify(res));
 
@@ -121,7 +131,7 @@ console.log("=== CLOUD-SIB-FATAL regression tests ===\n");
     row(155, "провал", "[SIB 2/3 parent:150]", "ERR_AUTH_FAILURE: HTTP Error 401"),
     row(156, "ожидает", "[SIB 3/3 parent:150]"),
   ]);
-  const res = await blockDependentSiblings({ id: 155, status: "провал", text: "[SIB 2/3 parent:150] do part 155", result: "ERR_AUTH_FAILURE 401" }, db);
+  const res = await blockDependentSiblings({ id: 155, status: "провал_фатальный", text: "[SIB 2/3 parent:150] do part 155", result: "ERR_AUTH_FAILURE 401", metadata: JSON.stringify({ retry_count: MAX, retryable: false, retry_budget_exhausted: true }) }, db);
 
   check("cascade reports the parent it resolved", String(res.parentId) === "150", JSON.stringify(res.parentId));
   check("cascade resolved exactly the one waiting sibling", res.resolved.length === 1 && String(res.resolved[0]) === "156", JSON.stringify(res.resolved));
@@ -163,7 +173,7 @@ console.log("=== CLOUD-SIB-FATAL regression tests ===\n");
 // Negative: no marker at all - not part of any tree.
 {
   const db = await freshDb([ row(900, "провал", "plain task text with no marker", "boom") ]);
-  const res = await blockDependentSiblings({ id: 900, status: "провал", text: "plain task text with no marker", result: "boom" }, db);
+  const res = await blockDependentSiblings({ id: 900, status: "провал_фатальный", text: "plain task text with no marker", result: "boom", metadata: JSON.stringify({ retry_count: MAX }) }, db);
   check("non-marker task: cascade is a no-op", res.parentId === null && res.resolved.length === 0, JSON.stringify(res));
   db.close();
 }
