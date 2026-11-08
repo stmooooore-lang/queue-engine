@@ -50,6 +50,27 @@ name: dispatcher
 # no `actions: read` permission.
 
 on:
+  schedule:
+    # DEADLOCK FIX, 2026-11-07: cron is back as a FALLBACK, not as the main
+    # trigger. The 2026-11-05 change (commit 201e04a) replaced this with
+    # workflow_run only, and that created a deadlock nobody could see from
+    # the happy path: with an empty queue there is no Task Executor run to
+    # complete, so workflow_run never fires, so the dispatcher never runs,
+    # so a task inserted straight into Turso (worker/index.js /task, or any
+    # direct INSERT) waits forever. Plexus reported exactly this: tasks sit
+    # in Turso with status 'ожидает' and no executor ever starts.
+    #
+    # Cron is the floor - it fires when nothing else is running. workflow_run
+    # stays on top and still wins the common case: the executor finishes and
+    # the dispatcher runs within seconds, not at the next cron slot. The
+    # 5-hour worst case cron alone can suffer (GitHub scheduled workflows are
+    # best-effort on the free/shared runner pool) is now only a worst case
+    # for a task that arrives into an idle system, not a permanent stall.
+    #
+    # Do NOT "simplify" this back to workflow_run only. The trigger that
+    # covers "the queue was empty when the task arrived" is the one that
+    # must exist for the queue to be able to start at all.
+    - cron: '*/10 * * * *'
   workflow_run:
     workflows: ["Task Executor"]
     types: [completed]
