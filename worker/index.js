@@ -18,7 +18,7 @@
 
 export default {
   async fetch(request, env) {
-    const { TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID } = env;
+    const { TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, GITHUB_DISPATCH_TOKEN } = env;
 
     if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
 
@@ -46,6 +46,7 @@ export default {
       `TURSO_DATABASE_URL len=${(TURSO_DATABASE_URL || '').length} ` +
       `TURSO_AUTH_TOKEN len=${(TURSO_AUTH_TOKEN || '').length} ` +
       `ALLOWED_USER_ID len=${(TELEGRAM_ALLOWED_USER_ID || '').length} ` +
+      `GITHUB_DISPATCH_TOKEN len=${(GITHUB_DISPATCH_TOKEN || '').length} ` +
       `incoming userId=${userId} chatId=${chatId}`,
     );
 
@@ -62,6 +63,7 @@ export default {
       if (text.startsWith('/task ')) {
         const taskText = text.slice(6).trim();
         const taskId = await createTask(db, taskText, userId);
+        await triggerDispatcher(GITHUB_DISPATCH_TOKEN, taskId);
         await sendMessage(TELEGRAM_BOT_TOKEN, chatId, `Задача создана с ID ${taskId}`);
       } else if (text === '/status') {
         const tasks = await getLastFiveTasks(db);
@@ -78,6 +80,7 @@ export default {
         // reply on purpose - that's the explicit, track-it-via-/status path.
         await sendTyping(TELEGRAM_BOT_TOKEN, chatId);
         const taskId = await createTask(db, text, userId);
+        await triggerDispatcher(GITHUB_DISPATCH_TOKEN, taskId);
         console.log(`plain-text task created, id=${taskId}`);
       }
     } catch (err) {
@@ -90,6 +93,74 @@ export default {
     return new Response('ok', { status: 200 });
   },
 };
+
+// --- GitHub Actions dispatch ---
+
+/**
+ * Kick the dispatcher the moment a task exists, instead of waiting for
+ * something else to happen.
+ *
+ * REVERT OF 6d55666, decided 2026-11-09 by the founder. That commit dropped
+ * this exact call ("bot no longer dispatches GitHub Actions on new tasks, VM
+ * poller is the only executor") and dispatcher.yml was moved to a
+ * workflow_run trigger on Task Executor. Two things broke in sequence:
+ *
+ *   1. The VM poller that 6d55666 relied on has no workflow in the repo at
+ *      all (`gh workflow list` shows no poller/vm/gcp job) - so the "only
+ *      executor" of that decision was not running.
+ *   2. workflow_run alone cannot START a queue: with an empty queue there is
+ *      no Task Executor run to complete, so the dispatcher never fires, so a
+ *      task INSERTed straight into Turso waits forever. Plexus reported
+ *      exactly this stall.
+ *
+ * Cron was restored 2026-11-09 as a fallback (commit f687909) and measured
+ * badly: it fired 4 times and then left a 7-hour hole - GitHub throttles
+ * scheduled workflows on the free tier, which the "5-hour worst case" note
+ * in dispatcher.yml had understated. So the immediate dispatch is back as the
+ * primary path; cron and workflow_run stay as fallbacks only.
+ *
+ * Best-effort by design, and that is load-bearing:
+ *   - if the token is absent (not yet set in Cloudflare), this no-ops with a
+ *     log line rather than calling GitHub with `Bearer undefined` (401 noise);
+ *   - any failure - network, 401, 403, 422, 404 - is caught and logged, and
+ *     task creation is never blocked or reported as failed because of it. The
+ *     task is already safely in Turso by the time this runs; dispatch is an
+ *     accelerator, not part of the insert's correctness.
+ * The dispatcher itself dedupes: it refuses to dispatch another executor run
+ * while one is in flight, so several tasks arriving at once cause no pileup.
+ *
+ * @param {string} githubToken - PAT with queue-engine Actions read/write.
+ * @param {number|string} taskId - for the log line only; dispatcher.yml takes
+ *   no inputs - dispatcher.mjs scans Turso and picks the task itself.
+ */
+async function triggerDispatcher(githubToken, taskId) {
+  try {
+    if (!githubToken) {
+      console.log('dispatch: GITHUB_DISPATCH_TOKEN not set in env, skipping (task stays queued for cron/workflow_run)');
+      return;
+    }
+    const res = await fetch(
+      'https://api.github.com/repos/stmooooore-lang/queue-engine/actions/workflows/dispatcher.yml/dispatches',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${githubToken}`,
+          Accept: 'application/vnd.github+json',
+          'Content-Type': 'application/json',
+          'User-Agent': 'Cloudflare-Worker',
+        },
+        body: JSON.stringify({ ref: 'main' }),
+      },
+    );
+    if (res.ok) {
+      console.log(`dispatch: dispatcher.yml triggered after task ${taskId} (${res.status})`);
+      return;
+    }
+    console.log(`dispatch: FAILED for task ${taskId} - ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  } catch (err) {
+    console.log(`dispatch: FAILED for task ${taskId} - ${err.message}`);
+  }
+}
 
 // --- Telegram, plain Bot API ---
 
