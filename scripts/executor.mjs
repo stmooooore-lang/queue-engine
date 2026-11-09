@@ -1586,6 +1586,28 @@ async function executeLongCompute(command, task = null, text = '', options = {})
 // deferred), so the crash guard only ever releases a row genuinely still stuck.
 let activeTaskIdForCrashGuard = null;
 
+/**
+ * COMMIT-VERIFICATION (2026-11-09): the ONE place that decides 'готова'.
+ *
+ * Extracted out of run()'s body so a test can execute it. Until it was a
+ * ternary buried inside the run body, the founder's acceptance for this fix -
+ * "an empty artifact tree must give 'провал', never 'готова'" - was true by
+ * eyeball and impossible to prove by construction. Everything that maps a
+ * result object onto a status lives here, in one pure function, no Turso.
+ *
+ * The invariant it exists to protect: result.success === false can NEVER
+ * produce 'готова'. Every path that refuses to accept a task's artifacts
+ * (ARTIFACT-GUARD: empty tree, commit not on GitHub) sets success=false and
+ * therefore lands in one of the 'провал' verdicts through this function.
+ */
+function taskVerdictFromResult(result, ctx) {
+  if (result.success) return 'готова';
+  if (result.paused) return 'ожидает';
+  if (result.partial || result.status === 'partial') return 'partial';
+  if ((ctx.verdict.fatal && !ctx.isPermanentBlock) || ctx.retryBudgetExhausted) return 'провал_фатальный';
+  return 'провал';
+}
+
 async function run() {
   const taskId = process.env.TASK_ID;
   const startTime = Date.now();
@@ -1697,13 +1719,20 @@ async function run() {
   }
   const workEnd = Date.now();
 
-  // Push artifacts to origin BEFORE marking task as done
+  // Push artifacts to origin BEFORE marking task as done.
+  //
+  // The task's own text goes in: pushTaskArtifacts has to know whether the
+  // brief declared [NO-ARTIFACT], or an empty working tree is
+  // indistinguishable from an agent that worked in the wrong directory.
   if (result.success) {
-    const pushed = await pushTaskArtifacts();
+    const pushed = await pushTaskArtifacts(task.text);
     if (!pushed) {
-      // Push failed - mark as failed instead of done
+      // COMMIT-VERIFICATION: name the real reason. Until 2026-11-09 every push
+      // failure read "Artifact push to origin failed: <the agent's own last
+      // sentence>", which is how "Committed. Task complete." became the
+      // result of tasks that committed nothing (167, 171, 173).
       result.success = false;
-      result.message = "Artifact push to origin failed: " + result.message;
+      result.message = `ARTIFACT-GUARD: ${lastArtifactPushReason || "artifact push did not complete"}. Agent's own report was: ${result.message}`;
     }
   }
 
@@ -1743,11 +1772,7 @@ async function run() {
   const retryCount = verdict.retryable ? prevRetryCount + 1 : prevRetryCount;
   const retryBudgetExhausted = verdict.retryable && retryCount >= MAX_TASK_RETRIES;
 
-  const status = result.success
-    ? 'готова'
-    : (result.paused ? 'ожидает'
-      : (result.partial || result.status === 'partial' ? 'partial'
-        : ((verdict.fatal && !isPermanentBlock) || retryBudgetExhausted ? 'провал_фатальный' : 'провал')));
+  const status = taskVerdictFromResult(result, { verdict, isPermanentBlock, retryBudgetExhausted });
 
   const blockedReason = isPermanentBlock ? (result.blockedReason || result.message || 'permanent founder-fixable blocker') : null;
   const minutesUsed = Math.ceil((workEnd - workStart) / 60000);
@@ -1958,27 +1983,112 @@ async function run() {
  * Called after successful task completion, before marking task as 'готова'.
  * Uses REPO_TOKEN from executor.yml environment (scoped to plexus-doc push).
  */
-async function pushTaskArtifacts() {
+// EXECUTOR-COMMIT-VERIFICATION (2026-11-09). The one lawful way to be "done"
+// with an empty working tree is to say so in the brief. A silent empty tree is
+// indistinguishable from an agent that worked in the wrong directory.
+const NO_ARTIFACT_MARKER_RE = /\[\s*no-artifact\s*\]/i;
+
+// Set by pushTaskArtifacts when it refuses to call the push a success, so the
+// caller names the real reason in the verdict instead of a generic one.
+let lastArtifactPushReason = "";
+
+// Exported as a function rather than the binding itself: a live `let` cannot
+// be re-exported by value, and a test must read the reason AFTER the call.
+function getLastArtifactPushReason() { return lastArtifactPushReason; }
+
+// Literal newline as a named constant: this file once carried a source-escape
+// that a review could mistake for a real line break.
+const SPLIT_NL = "'\n'";
+
+async function pushTaskArtifacts(taskText) {
+  // The task text arrives as a parameter: deciding "was any artifact even
+  // expected?" needs the brief, and the caller is the place that has it.
+  const declaredNoArtifact = NO_ARTIFACT_MARKER_RE.test(String(taskText || ""));
   try {
     const status = execSync("git status --porcelain", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
     if (!status) {
-      console.log(`[${new Date().toISOString()}] push: no changes in ${WORKDIR}, skipping`);
-      return true;
+      if (declaredNoArtifact) {
+        console.log(`[${new Date().toISOString()}] push: no changes in ${WORKDIR}, but task declared [NO-ARTIFACT] - treating as complete`);
+        return true;
+      }
+      // COMMIT-VERIFICATION FIX 1: an empty tree is NOT success.
+      //
+      // Before 2026-11-09 this branch returned true, and 7 of 14 Task Executor
+      // runs that day (tasks 160, 162, 166, 167, 168, 171, 173) were marked
+      // 'готова' with zero commits on GitHub - the fake-done report Plexus
+      // measured. The log even printed "push: no changes in plexus-doc,
+      // skipping" one line above the 'готова': the line was honest, the
+      // verdict was not.
+      //
+      // Returning false reaches run() as `if (!pushed) result.success = false`,
+      // so the status is 'провал', never 'готова'. A task that genuinely needs
+      // no file change declares [NO-ARTIFACT] in its text (above), so silence
+      // means the agent produced nothing - a failure to report, not a result.
+      lastArtifactPushReason = `no artifacts: git status --porcelain is empty in ${WORKDIR} and the task did not declare [NO-ARTIFACT]`;
+      console.log(`[${new Date().toISOString()}] push: FAILED - ${lastArtifactPushReason}`);
+      return false;
     }
     execSync("git config user.name 'queue-engine[bot]'", { cwd: WORKDIR, stdio: "pipe" });
     execSync("git config user.email 'queue-engine@users.noreply.github.com'", { cwd: WORKDIR, stdio: "pipe" });
     execSync("git add -A", { cwd: WORKDIR, stdio: "pipe" });
-    const firstFile = status.split('\n')[0].slice(0, 50);
+    const firstFile = status.split(SPLIT_NL)[0].slice(0, 50);
     const commitMsg = `task ${process.env.TASK_ID}: ${firstFile}`;
     execSync(`git commit -m "${commitMsg.replace(/"/g, '\"')}"`, { cwd: WORKDIR, stdio: "pipe" });
     const branch = execSync("git branch --show-current", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
     const pushResult = await pushBranch(branch, WORKDIR);
-    console.log(`[${new Date().toISOString()}] push: committed and pushed ${status.split('\n').length} file(s) to origin/${branch} (${pushResult})`);
+    // COMMIT-VERIFICATION FIX 2: `git push` exiting 0 is not proof the commit
+    // is on GitHub. Ask the remote which SHA its ref actually holds and
+    // compare - an exit-0 push whose ref never landed is otherwise
+    // indistinguishable from a good one, which is the second half of the bug.
+    const landed = commitReachedOrigin(branch, WORKDIR);
+    if (!landed) {
+      lastArtifactPushReason = `commit not on GitHub: origin refs/heads/${branch} does not point at local HEAD after push`;
+      console.log(`[${new Date().toISOString()}] push: FAILED - ${lastArtifactPushReason}`);
+      return false;
+    }
+    console.log(`[${new Date().toISOString()}] push: committed and pushed ${status.split(SPLIT_NL).length} file(s) to origin/${branch} (${pushResult}), verified on origin ${landed.slice(0, 8)}`);
     return true;
   } catch (err) {
-    console.log(`[${new Date().toISOString()}] push: FAILED - ${redactSecrets(err.message)}`);
+    lastArtifactPushReason = `push failed: ${redactSecrets(err.message)}`;
+    console.log(`[${new Date().toISOString()}] push: FAILED - ${lastArtifactPushReason}`);
     return false;
   }
+}
+
+/**
+ * COMMIT-VERIFICATION FIX 2 companion: does origin's ref for this branch point
+ * at the commit we just made?
+ *
+ * `git push` can exit 0 while the ref does not move (a rejected non-fast-
+ * forward, an edge/proxy dropping the write, a branch that existed only
+ * locally). The only way to tell is to ask the remote.
+ *
+ * Fail-closed by design: if the remote cannot be asked at all, this returns
+ * false and the task is not 'готова' - an unverifiable push is not an
+ * accepted one. A flaky network therefore converts into a retryable 'провал'
+ * rather than into a fake 'готова', which is the correct direction to fail in.
+ *
+ * @param {string} branch - branch name, same regex as pushBranch
+ * @param {string} dir - git working directory
+ * @returns {string|false} matching commit SHA, or false
+ */
+function commitReachedOrigin(branch, dir) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(String(branch))) return false;
+  let local;
+  try {
+    local = execSync("git rev-parse HEAD", { cwd: dir, stdio: "pipe" }).toString().trim();
+  } catch {
+    return false;
+  }
+  if (!/^[0-9a-f]{7,64}$/.test(local)) return false;
+  let out;
+  try {
+    out = execSync(`git ls-remote origin refs/heads/${branch}`, { cwd: dir, stdio: "pipe" }).toString().trim();
+  } catch {
+    return false;
+  }
+  const remoteSha = out.split(/\s+/)[0] || "";
+  return remoteSha === local ? local : false;
 }
 
 // GHQ4, 2026-09-14 (built directly by Claude Code, founder's own real-time
@@ -2023,8 +2133,19 @@ function checkoutTaskBranch(text) {
     console.log(`[${new Date().toISOString()}] branch: task named "${branch}", checked out (git reports: ${actual})`);
     return actual;
   } catch (err) {
-    console.log(`[${new Date().toISOString()}] branch: task named "${branch}" but checkout failed (${redactSecrets(err.message)}) - staying on default checkout`);
-    return null;
+    // COMMIT-VERIFICATION FIX 3: a branch the brief NAMED and could not check
+    // out is no longer a silent fallback to the default checkout.
+    //
+    // Before 2026-11-09 this returned null, doWork went on, and the task's
+    // commit landed on main while the brief asked for its own branch - the
+    // agent's work was published to the wrong place with nothing in the log
+    // for a human to catch. Plexus read that as "no commits where I asked".
+    //
+    // Throwing makes the caller decide, and the caller (doWork) converts it
+    // into a real verdict: the task is NOT 'готова'. "ONE TASK, ONE BRANCH"
+    // (GHQ4, plexus-doc's own AGENTS.md) says a named branch is a constraint,
+    // not a suggestion - a task that cannot honour it has failed.
+    throw new Error(`BRANCH-NOT-ON-ORIGIN: brief named branch "${branch}" but checkout failed (${redactSecrets(err.message)}) - refusing to commit to the default checkout silently`);
   }
 }
 
@@ -4392,8 +4513,11 @@ export {
   notifyTelegram,
   escalateToFounder,
   checkoutTaskBranch,
+  taskVerdictFromResult,
+  getLastArtifactPushReason,
   releaseStuckTaskAfterCrash,
   pushTaskArtifacts,
+  commitReachedOrigin,
   triageSplit,
   triageCheck,
   hasNoTriageMarker,
