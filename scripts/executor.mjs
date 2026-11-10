@@ -1715,6 +1715,14 @@ async function run() {
   // Execute work. A named branch that cannot be checked out is a failed task,
   // not work to do: doWork is skipped so no agent runs against a tree it was
   // forbidden to use ("ONE TASK, ONE BRANCH" - a named branch is a constraint).
+  // HEAD as it was before this pass ran any work - the only way "the tree is
+  // clean" can be told from "the tree has nothing in it". Captured after the
+  // branch checkout so a branch switch itself is not mistaken for work.
+  let preWorkSha = "";
+  try {
+    preWorkSha = execSync("git rev-parse HEAD", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
+  } catch { preWorkSha = ""; }
+
   const workStart = Date.now();
   const result = branchFailure
     ? { success: false, paused: false, partial: false, message: branchFailure.message, category: "infrastructure" }
@@ -1742,7 +1750,7 @@ async function run() {
   // brief declared [NO-ARTIFACT], or an empty working tree is
   // indistinguishable from an agent that worked in the wrong directory.
   if (result.success) {
-    const pushed = await pushTaskArtifacts(task.text);
+    const pushed = await pushTaskArtifacts(task.text, preWorkSha);
     if (!pushed) {
       // COMMIT-VERIFICATION: name the real reason. Until 2026-11-09 every push
       // failure read "Artifact push to origin failed: <the agent's own last
@@ -2003,7 +2011,26 @@ async function run() {
 // EXECUTOR-COMMIT-VERIFICATION (2026-11-09). The one lawful way to be "done"
 // with an empty working tree is to say so in the brief. A silent empty tree is
 // indistinguishable from an agent that worked in the wrong directory.
-const NO_ARTIFACT_MARKER_RE = /\[\s*no-artifact\s*\]/i;
+// A MARKER IS A DECLARATION, NOT A MENTION (live finding, task 178, 2026-11-10).
+// The previous regex matched the marker ANYWHERE in the brief, so a brief that
+// merely QUOTES the rule - "do NOT declare [NO-ARTIFACT]" - silently unlocked
+// the fake-done path. That is precisely the hole this guard exists to close,
+// and quoting the rule is something the founder and Plexus do in briefs on
+// purpose. Task 178 got 'готова' that way: its own artifact existed, but the
+// verdict came from a false positive, not from verification.
+//
+// A declaration sits in the marker block at the top of the brief, like every
+// other marker this file parses ([NO-TRIAGE], [BRANCH: x], [SIB ...]), so the
+// regex is anchored to that block: optional whitespace, then any number of
+// complete bracketed tokens, then the marker itself. A bare mention further
+// down is NOT a declaration (fail-closed), and is logged loudly instead.
+const NO_ARTIFACT_MARKER_RE = /^\s*(?:\[[^\]]*\]\s*)*\[\s*no-artifact\s*\]/i;
+const NO_ARTIFACT_MENTION_RE = /\[\s*no-artifact\s*\]/i;
+function briefDeclaresNoArtifact(text) { return NO_ARTIFACT_MARKER_RE.test(String(text || "")); }
+function mentionsNoArtifactMarker(text) {
+  const s = String(text || "");
+  return NO_ARTIFACT_MENTION_RE.test(s) && !NO_ARTIFACT_MARKER_RE.test(s);
+}
 
 // Set by pushTaskArtifacts when it refuses to call the push a success, so the
 // caller names the real reason in the verdict instead of a generic one.
@@ -2017,16 +2044,54 @@ function getLastArtifactPushReason() { return lastArtifactPushReason; }
 // that a review could mistake for a real line break.
 const SPLIT_NL = "'\n'";
 
-async function pushTaskArtifacts(taskText) {
+async function pushTaskArtifacts(taskText, preWorkSha) {
+  // preWorkSha: HEAD as it was BEFORE this pass ran any work (captured by run()).
+  // It tells "clean tree" apart from "no work": an agent that committed its own
+  // work leaves a clean tree too, and that tree is proof of an artifact, not of
+  // its absence (live finding, task 178: its commit landed, the tree was clean,
+  // and FIX 1's empty-tree branch called it "no artifacts").
   // The task text arrives as a parameter: deciding "was any artifact even
   // expected?" needs the brief, and the caller is the place that has it.
-  const declaredNoArtifact = NO_ARTIFACT_MARKER_RE.test(String(taskText || ""));
+  const declaredNoArtifact = briefDeclaresNoArtifact(taskText);
+  // A brief that quotes the rule without declaring it must not get a silent
+  // pass: the run log names it, so a posting defect is visible instead of
+  // becoming an invisible 'готова' with nothing behind it.
+  if (!declaredNoArtifact && mentionsNoArtifactMarker(taskText)) {
+    console.log(`[${new Date().toISOString()}] push: WARNING - brief mentions [NO-ARTIFACT] but does not declare it in the marker block; the escape hatch is NOT armed for this task`);
+  }
   try {
     const status = execSync("git status --porcelain", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
     if (!status) {
       if (declaredNoArtifact) {
         console.log(`[${new Date().toISOString()}] push: no changes in ${WORKDIR}, but task declared [NO-ARTIFACT] - treating as complete`);
         return true;
+      }
+      // A clean tree is not proof that nothing was done: the agent may have
+      // committed its own work (the brief told it to, and "ONE TASK, ONE
+      // BRANCH" says to work in the branch). Ask whether HEAD moved since this
+      // pass started. If it did, the artifact is the commit - push it and
+      // verify it on origin, exactly like a commit made here. Task 178 (live,
+      // 2026-11-10) landed its own commit on origin/cursor-build while this
+      // branch was calling the tree "no artifacts".
+      // Both reads are guarded: a repo with no commit at all (a bare checkout
+      // that never had one) makes `rev-parse HEAD` throw, and that must land on
+      // "no artifacts" below, not on the generic "push failed" catch.
+      let branchNow = "";
+      let headNow = "";
+      try {
+        branchNow = execSync("git branch --show-current", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
+        headNow = execSync("git rev-parse HEAD", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
+      } catch { branchNow = ""; headNow = ""; }
+      if (preWorkSha && headNow && preWorkSha !== headNow) {
+        const agentPush = await pushBranch(branchNow, WORKDIR);
+        const agentLanded = commitReachedOrigin(branchNow, WORKDIR);
+        if (agentLanded) {
+          console.log(`[${new Date().toISOString()}] push: the agent's own commit ${headNow.slice(0, 8)} on origin/${branchNow} (${agentPush}), verified on origin ${agentLanded.slice(0, 8)}`);
+          return true;
+        }
+        lastArtifactPushReason = `the agent's own commit ${headNow.slice(0, 8)} is not on GitHub: origin refs/heads/${branchNow} does not point at local HEAD after push`;
+        console.log(`[${new Date().toISOString()}] push: FAILED - ${lastArtifactPushReason}`);
+        return false;
       }
       // COMMIT-VERIFICATION FIX 1: an empty tree is NOT success.
       //
@@ -2041,7 +2106,7 @@ async function pushTaskArtifacts(taskText) {
       // so the status is 'провал', never 'готова'. A task that genuinely needs
       // no file change declares [NO-ARTIFACT] in its text (above), so silence
       // means the agent produced nothing - a failure to report, not a result.
-      lastArtifactPushReason = `no artifacts: git status --porcelain is empty in ${WORKDIR} and the task did not declare [NO-ARTIFACT]`;
+      lastArtifactPushReason = `no artifacts: git status --porcelain is empty in ${WORKDIR} and HEAD did not move during this pass (${preWorkSha ? preWorkSha.slice(0, 8) : "no starting SHA"}), so no commit was made and the task did not declare [NO-ARTIFACT]`;
       console.log(`[${new Date().toISOString()}] push: FAILED - ${lastArtifactPushReason}`);
       return false;
     }

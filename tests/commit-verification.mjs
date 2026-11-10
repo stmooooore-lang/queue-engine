@@ -212,5 +212,100 @@ console.log("=== EXECUTOR-COMMIT-VERIFICATION: artifact guard ===\n");
     status === "готова", `status=${status} pushed=${pushed} reason=${ex.getLastArtifactPushReason()}`);
 }
 
+
+// --- G: a MARKER is a declaration, not a mention (live finding, task 178) ---
+// The first version of the regex matched the marker anywhere in the brief, so a
+// brief that QUOTED the rule - "do NOT declare [NO-ARTIFACT]" - armed the
+// escape hatch by accident. Task 178 received 'готова' that way on 2026-11-10.
+{
+  const dir = makeRepo("mention");
+  const ex = await loadExecutor(dir);
+  const quoted = "[E2E-TEST] create notes/x.md. Do NOT declare [NO-ARTIFACT] in any form.";
+  const pushed = await ex.pushTaskArtifacts(quoted);
+  check("G1 a brief that merely MENTIONS [NO-ARTIFACT] does not get the escape hatch",
+    pushed === false, `returned ${JSON.stringify(pushed)}; reason=${ex.getLastArtifactPushReason()}`);
+  check("G2 ...and its verdict is not 'готова'",
+    ex.taskVerdictFromResult({ success: false, message: "x" },
+      { verdict: { fatal: false, retryable: true }, isPermanentBlock: false, retryBudgetExhausted: false }) !== "готова", "");
+}
+{
+  // The marker block at the top of a brief may hold several markers; a
+  // declaration is still a declaration then. Regression guard for the anchoring.
+  const dir = makeRepo("markerblock");
+  const ex = await loadExecutor(dir);
+  const pushed = await ex.pushTaskArtifacts("[NO-TRIAGE] [BRANCH: main] [NO-ARTIFACT] audit only");
+  check("G3 a real declaration in the marker block still unlocks the empty tree",
+    pushed === true, `returned ${JSON.stringify(pushed)}; reason=${ex.getLastArtifactPushReason()}`);
+}
+{
+  // And the marker mid-brief (not in the block) is a mention, not a
+  // declaration: the escape hatch must not open for it.
+  const dir = makeRepo("midbrief");
+  const ex = await loadExecutor(dir);
+  const pushed = await ex.pushTaskArtifacts("Migrate the notes. If nothing changes, say [NO-ARTIFACT] here.");
+  check("G4 the marker buried in prose is NOT treated as a declaration",
+    pushed === false, `returned ${JSON.stringify(pushed)}; reason=${ex.getLastArtifactPushReason()}`);
+}
+
+// --- H: a clean tree can HIDE the agent's own commit (live, task 178) -----
+// Task 178 created notes/test-success.md, committed and pushed it to
+// origin/cursor-build itself. Its tree was therefore clean at guard time, and
+// FIX 1 called that "no artifacts". A clean tree means "no uncommitted
+// change", not "no work" - HEAD has to be compared against the pass start.
+{
+  const dir = makeRepo("agentcommit", { withRemote: true });
+  fs.writeFileSync(path.join(dir, "a.md"), "one\n");
+  sh("git add -A && git commit -q -m seed && git push -q -u origin main", dir);
+  const preWorkSha = sh("git rev-parse HEAD", dir);
+  const ex = await loadExecutor(dir);
+  // The agent's own work: a real commit, not pushed by the executor.
+  fs.writeFileSync(path.join(dir, "notes-test-success.md"), "test artifact\n");
+  sh("git add -A && git commit -q -m 'task 178: real agent work'", dir);
+  check("H0 the tree is clean after the agent's own commit (the hole's precondition)",
+    sh("git status --porcelain", dir) === "", "tree still dirty");
+  const pushed = await ex.pushTaskArtifacts("[S14-20] triage notes into canon", preWorkSha);
+  check("H1 a clean tree with HEAD moved since the pass started is treated as work",
+    pushed === true, `returned ${JSON.stringify(pushed)}; reason=${ex.getLastArtifactPushReason()}`);
+  check("H2 ...and the agent's commit is pushed to origin and verified",
+    sh("git rev-parse origin/main", dir) === sh("git rev-parse HEAD", dir),
+    `origin/main=${sh("git rev-parse origin/main", dir)} HEAD=${sh("git rev-parse HEAD", dir)}`);
+  check("H3 ...and commitReachedOrigin confirms it",
+    ex.commitReachedOrigin("main", dir) === sh("git rev-parse HEAD", dir), "");
+  check("H4 ...so the task is 'готова', not a false 'провал'",
+    ex.taskVerdictFromResult({ success: pushed === true, message: "" },
+      { verdict: { fatal: false, retryable: true }, isPermanentBlock: false, retryBudgetExhausted: false }) === "готова", "");
+}
+{
+  // The agent pushed its own commit too - the executor must not double-commit
+  // and must not fail a task whose work is already on GitHub.
+  const dir = makeRepo("agentpushed", { withRemote: true });
+  fs.writeFileSync(path.join(dir, "a.md"), "one\n");
+  sh("git add -A && git commit -q -m seed && git push -q -u origin main", dir);
+  const preWorkSha = sh("git rev-parse HEAD", dir);
+  const ex = await loadExecutor(dir);
+  fs.writeFileSync(path.join(dir, "notes-test-success.md"), "test artifact\n");
+  sh("git add -A && git commit -q -m 'task 178: agent work, already pushed' && git push -q origin main", dir);
+  const pushed = await ex.pushTaskArtifacts("[S14-20] triage notes into canon", preWorkSha);
+  check("H5 work the agent already pushed itself is accepted without a second commit",
+    pushed === true, `returned ${JSON.stringify(pushed)}; reason=${ex.getLastArtifactPushReason()}`);
+  check("H6 ...and no duplicate commit was created",
+    sh("git rev-list --count origin/main", dir) === sh("git rev-list --count HEAD", dir), "");
+}
+{
+  // Fail-closed stays: a genuinely empty pass with a starting SHA recorded and
+  // HEAD unmoved is still not an artifact. This is the fake-done path that
+  // tasks 160-173 walked.
+  const dir = makeRepo("nomove", { withRemote: true });
+  fs.writeFileSync(path.join(dir, "a.md"), "one\n");
+  sh("git add -A && git commit -q -m seed && git push -q -u origin main", dir);
+  const preWorkSha = sh("git rev-parse HEAD", dir);
+  const ex = await loadExecutor(dir);
+  const pushed = await ex.pushTaskArtifacts("[S14-13] decide whether to build useDen", preWorkSha);
+  check("H7 HEAD unmoved during the pass with a clean tree still fails closed",
+    pushed === false, `returned ${JSON.stringify(pushed)}; reason=${ex.getLastArtifactPushReason()}`);
+  check("H8 ...and the reason says HEAD did not move",
+    /HEAD did not move/.test(ex.getLastArtifactPushReason() || ""), ex.getLastArtifactPushReason());
+}
+
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);
 process.exit(fail === 0 ? 0 : 1);
