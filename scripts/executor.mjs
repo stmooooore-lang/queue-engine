@@ -1697,11 +1697,28 @@ async function run() {
   // actions/checkout's ref can't be templated from a value only known once
   // this script reads the real task row, so the branch switch happens
   // here instead, with real git commands, before any work starts.
-  checkoutTaskBranch(task.text);
+  // COMMIT-VERIFICATION FIX 3, at the call site (2026-11-10, after the live
+  // run 42783284855 proved this was missing): checkoutTaskBranch THROWS when the
+  // brief named a branch it could not check out. Left unwrapped - as it was
+  // until now - the throw escapes run() entirely, and the verdict for the task
+  // is written by the crash guard ("pass died before the verdict was written"),
+  // not by the normal writer. The task does not become 'готова' either way, but
+  // it burns a run and books a 'провал' with no category and no reason.
+  let branchFailure = null;
+  try {
+    checkoutTaskBranch(task.text);
+  } catch (branchErr) {
+    console.log(`[${new Date().toISOString()}] branch: task named a branch that could not be checked out - recording the verdict instead of dying: ${redactSecrets(branchErr.message)}`);
+    branchFailure = branchErr;
+  }
 
-  // Execute work
+  // Execute work. A named branch that cannot be checked out is a failed task,
+  // not work to do: doWork is skipped so no agent runs against a tree it was
+  // forbidden to use ("ONE TASK, ONE BRANCH" - a named branch is a constraint).
   const workStart = Date.now();
-  const result = await doWork(task.text, task);
+  const result = branchFailure
+    ? { success: false, paused: false, partial: false, message: branchFailure.message, category: "infrastructure" }
+    : await doWork(task.text, task);
   if (result.decomposed) {
     // TIMECEIL-CLOUD, 2026-09-14: real re-decomposition happened instead
     // of a normal pass/fail - the original oversized task is done in the
