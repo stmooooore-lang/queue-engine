@@ -891,6 +891,9 @@ async function uploadTaskCheckpointsAndArtifacts(taskId, options = {}) {
   const isPartial = Boolean(options.isPartial);
   const targetDir = options.workdir || WORKDIR;
   const dir = options.checkpointDir || CHECKPOINT_DIR;
+  // Files this function itself copied into targetDir/checkpoints - the only
+  // paths it is allowed to stage in addition to the task's own manifest.
+  const copiedFiles = [];
 
   try {
     // If checkpoint directory exists and is outside targetDir, copy checkpoint files to targetDir/checkpoints
@@ -908,6 +911,7 @@ async function uploadTaskCheckpointsAndArtifacts(taskId, options = {}) {
           try {
             const content = await readFile(srcFile);
             await writeFile(destFile, content);
+            copiedFiles.push(f);
           } catch {}
         }
       }
@@ -919,30 +923,32 @@ async function uploadTaskCheckpointsAndArtifacts(taskId, options = {}) {
       return true;
     }
 
-    execSync("git config user.name 'queue-engine[bot]'", { cwd: targetDir, stdio: "pipe" });
-    execSync("git config user.email 'queue-engine@users.noreply.github.com'", { cwd: targetDir, stdio: "pipe" });
-
-    const modeLabel = isPartial ? "partial checkpoint/artifact" : "completed artifacts";
+    // PUSH-AFTER-ACCEPTANCE (2026-11-10): this path used to `git add -A`, write a
+    // machine message ("task N (partial checkpoint/artifact): ?? notes/") and push
+    // right here - the SECOND unguarded push, and while the row still said
+    // 'выполняется'. It now stages exactly what this job produced (the checkpoint
+    // files it just copied, plus the task's own manifest) and commits LOCALLY
+    // only: the push belongs to the acceptance gate in run(). Once this commit
+    // exists, stageTaskArtifacts sees a clean tree with HEAD moved, parks the
+    // task in 'ждёт_приёмки', and pushes after the founder accepts.
     const manifest = [
       ...copiedFiles.map((f) => `checkpoints/${f}`),
       ...existingFilesIn(artifactFileList(options.taskText || "", options.resultText || ""), targetDir),
     ];
     const { staged } = stageFilesFromManifest(manifest, targetDir);
-    const branch = execSync("git branch --show-current", { cwd: targetDir, stdio: "pipe" }).toString().trim();
-    if (!branch) {
-      console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: detached HEAD or no branch, committed locally only`);
+    const stagedNow = execSync("git diff --cached --name-only", { cwd: targetDir, stdio: "pipe" }).toString().trim();
+    if (!stagedNow) {
+      // COMMIT-VERIFICATION FIX 1, the same rule as the main path: a dirty tree
+      // is not evidence, and a commit is not made from an unnamed file set.
+      // Returning false here is honest - this flag is informational, and
+      // run()'s own gate is what decides the verdict.
+      console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: the work tree has ${status.split(SPLIT_NL).length} change(s) but the manifest matched no existing file - nothing staged, nothing committed, nothing pushed`);
       return false;
     }
     const sha = commitTaskArtifacts(options.taskText || "", taskId, targetDir);
-    await pushBranch(branch, targetDir);
-    const landed = commitReachedOrigin(branch, targetDir);
-    if (!landed) {
-      console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: commit is not on GitHub: origin refs/heads/${branch} does not point at local HEAD (${lastArtifactPushReason || "no reason recorded"})`);
-      return false;
-    }
-    console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: committed and pushed ${sha.slice(0, 8)} ("task ${taskId}: ${briefTitle(options.taskText || "")}") to origin/${branch}, verified`);
+    const { branch: branchNow } = currentBranchAndHead(targetDir);
+    console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: committed ${stagedNow.split(SPLIT_NL).length} file(s) from the manifest as ${sha.slice(0, 8)} ("task ${taskId}: ${briefTitle(options.taskText || "")}")${branchNow ? ` on ${branchNow} - local only, the acceptance gate pushes it` : " - HEAD is detached, so the commit is local and unbranchable"}`);
     return true;
-
   } catch (err) {
     // CLOUD-MAINT-c-e: git push failures echo the remote URL, and in CI that
     // URL is routinely built from REPO_TOKEN - redact before printing.
@@ -1753,20 +1759,80 @@ async function run() {
   }
   const workEnd = Date.now();
 
-  // Push the artifacts to origin, then let the verdict be written.
+  // ACCEPTANCE GATE (PUSH-AFTER-ACCEPTANCE, Variant A): the artifact is
+  // committed locally and the PUSH happens only after the founder accepts.
   //
-  // The task's own text goes in: pushTaskArtifacts has to know whether the
-  // brief declared [NO-ARTIFACT], or an empty working tree is
-  // indistinguishable from an agent that worked in the wrong directory.
+  // Until 2026-11-10 this block called pushTaskArtifacts() directly, with the
+  // comment "Push artifacts to origin BEFORE marking task as done" - the push
+  // was INSIDE the success path and the verdict was written after it, so an
+  // unaccepted task (possibly a failing one - 178 and 180 both landed commits
+  // while their rows still said 'выполняется') left its artifacts on origin
+  // permanently. The Plexus canon of 2026-11-10 names it the other way round:
+  // "after the founder accepts, the executor pushes - the acceptance is the
+  // barrier, not the push".
+  //
+  // The order is now: guard -> local commit -> 'ждёт_приёмки' -> wait for
+  // 'принята' -> verified push -> 'готова'. The guard still runs FIRST, because
+  // asking a human to accept an empty tree is the same hole wearing a gate.
+  // 'ждёт_приёмки' is not in the dispatcher's SELECT ('ожидает'/'провал' only),
+  // so a task waiting for a decision is never re-picked while it waits.
+  let gateOutcome = null;
   if (result.success) {
-    const pushed = await pushTaskArtifacts(task.text, preWorkSha, result.message);
-    if (!pushed) {
+    const staged = stageTaskArtifacts(task.text, preWorkSha, result.message);
+    if (!staged.ok) {
       // COMMIT-VERIFICATION: name the real reason. Until 2026-11-09 every push
       // failure read "Artifact push to origin failed: <the agent's own last
       // sentence>", which is how "Committed. Task complete." became the
       // result of tasks that committed nothing (167, 171, 173).
       result.success = false;
-      result.message = `ARTIFACT-GUARD: ${lastArtifactPushReason || "artifact push did not complete"}. Agent's own report was: ${result.message}`;
+      result.message = `ARTIFACT-GUARD: ${staged.reason}. Agent's own report was: ${result.message}`;
+    } else if (staged.needsGate) {
+      // Put the row into the waiting state BEFORE the delay starts, so a crash
+      // or a manual read at any moment shows a task that is waiting for a
+      // decision rather than one that is working.
+      const waitingNote = `ACCEPTANCE-GATE: local commit ${String(staged.stagedSha || "").slice(0, 8)} (${staged.source}) on branch ${staged.branch} in ${WORKDIR}, NOT pushed. Waiting for '${ACCEPT_ACCEPTED_STATUS}' or '${ACCEPT_REJECTED_STATUS}' for up to ${ACCEPTANCE_WINDOW_MINUTES} minute(s).`;
+      try {
+        await client.execute({
+          sql: 'UPDATE tasks SET status = ?, result = ? WHERE id = ?',
+          args: [ACCEPT_WAITING_STATUS, waitingNote, taskId],
+        });
+      } catch (waitErr) {
+        // The row could not be parked: the honest move is a fail-closed
+        // 'провал' with the local work still uncommitted, not a push on the
+        // assumption that somebody will accept it later.
+        result.success = false;
+        result.message = `ARTIFACT-GUARD: could not park the task in '${ACCEPT_WAITING_STATUS}' before waiting for acceptance (${redactSecrets(waitErr.message)}), so the artifacts were NOT pushed. Agent's own report was: ${result.message}`;
+        gateOutcome = { outcome: "park-failed", waitedMs: 0, reason: `the task could not be moved into '${ACCEPT_WAITING_STATUS}' (${redactSecrets(waitErr.message)})` };
+        staged.needsGate = false;
+      }
+      if (staged.needsGate) {
+        console.log(`[${new Date().toISOString()}] acceptance-gate: task ${taskId} is now '${ACCEPT_WAITING_STATUS}' - commit ${String(staged.stagedSha || "").slice(0, 8)} on ${staged.branch} is local only; it goes to origin when the row says '${ACCEPT_ACCEPTED_STATUS}'`);
+        if (task.creator_id) {
+          await notifyTelegram(task.creator_id, `Задача ${taskId} ждёт приёмки: коммит ${String(staged.stagedSha || "").slice(0, 8)} готов локально (${staged.branch}) и не отправлен. Ответьте «принята» или «отклонена» (до ${ACCEPTANCE_WINDOW_MINUTES} минут).`);
+        }
+        const outcome = await waitForAcceptance(taskId, {});
+        gateOutcome = outcome;
+        if (outcome.outcome === ACCEPT_ACCEPTED_STATUS) {
+          // Accepted: this is the only push in the pass, and it is verified.
+          const landed = await pushAcceptedArtifacts(staged.branch, WORKDIR);
+          if (landed) {
+            result.message = `${result.message}\nACCEPTANCE-GATE: принята основателем через ${Math.round(outcome.waitedMs / 1000)} с; коммит ${String(staged.stagedSha || "").slice(0, 8)} отправлен в origin/${staged.branch} и проверен на origin (${String(landed).slice(0, 8)}).`;
+          } else {
+            // Accepted but not delivered. Retryable: the founder already said
+            // yes and the work exists locally, so this is a transport failure,
+            // not a task defect - but it is NOT 'готова'.
+            result.success = false;
+            result.message = `ARTIFACT-GUARD: задача принята, но пуш не подтвердился - ${lastArtifactPushReason || "artifact push did not complete"}. Коммит ${String(staged.stagedSha || "").slice(0, 8)} остался локальным. Agent's own report was: ${result.message}`;
+          }
+        } else {
+          // 'отклонена', a timeout, or the row moved on its own: nothing was
+          // pushed, so roll the work tree back and let nothing of it survive.
+          rollbackLocalWork(preWorkSha, WORKDIR);
+          result.success = false;
+          result.message = `ARTIFACT-GUARD: ${outcome.reason || "acceptance window closed without a decision"}; локальный коммит ${String(staged.stagedSha || "").slice(0, 8)} откатан, в origin ничего не отправлено. Agent's own report was: ${result.message}`;
+        }
+        gateOutcome.waitedMs = outcome.waitedMs;
+      }
     }
   }
 
@@ -1806,10 +1872,23 @@ async function run() {
   const retryCount = verdict.retryable ? prevRetryCount + 1 : prevRetryCount;
   const retryBudgetExhausted = verdict.retryable && retryCount >= MAX_TASK_RETRIES;
 
-  const status = taskVerdictFromResult(result, { verdict, isPermanentBlock, retryBudgetExhausted });
+  // The gate decides its own verdict, because a decision made by a human is
+  // not an input to classifyFailure(): 'принята' plus a verified push is
+  // 'готова', and anything else (rejected, window expired, the row moved,
+  // accepted-but-the-push-did-not-verify) is 'провал_фатальный' - the local
+  // artifact is gone by then and re-running the same brief would only ask the
+  // same question again. A gate failure therefore does NOT write retry
+  // metadata: the decision, not the pass, is what has to change.
+  const status = gateOutcome
+    ? (gateOutcome.outcome === ACCEPT_ACCEPTED_STATUS && result.success ? 'готова' : 'провал_фатальный')
+    : taskVerdictFromResult(result, { verdict, isPermanentBlock, retryBudgetExhausted });
 
   const blockedReason = isPermanentBlock ? (result.blockedReason || result.message || 'permanent founder-fixable blocker') : null;
-  const minutesUsed = Math.ceil((workEnd - workStart) / 60000);
+  // The acceptance wait is consumed time in this run, not free time: a task
+  // that sat in 'ждёт_приёмки' for twenty minutes used twenty minutes of the
+  // job, and minutes_used is where the run's cost is read.
+  const gateWaitedMs = gateOutcome && gateOutcome.waitedMs ? gateOutcome.waitedMs : 0;
+  const minutesUsed = Math.ceil((workEnd - workStart + gateWaitedMs) / 60000);
   const secondsToFirstWork = Math.floor((workStart - startTime) / 1000);
 
   // The retry budget and the moment of the last failure live in metadata so
@@ -2054,25 +2133,59 @@ function getLastArtifactPushReason() { return lastArtifactPushReason; }
 const SPLIT_NL = "'\n'";
 
 // ---------------------------------------------------------------------------
-// STAGING CONTRACT (PUSH-AFTER-ACCEPTANCE, BACKLOG item 3, Step 1, 2026-11-10)
+// ACCEPTANCE GATE (PUSH-AFTER-ACCEPTANCE, BACKLOG item 3, Variant A, 2026-11-10)
 //
-// Until 2026-11-10 this file staged artifacts with `git add -A` and built the
-// commit message from the first line of `git status --porcelain`, which is why
-// plexus-doc carries commits like "task 172: ?? notes/" and "task 164: M
-// canon/content/bundle-language.md" - what read as a careless author was a
-// machine signature. Both are replaced here: the files come from a manifest
-// (the brief's own MANIFEST/FILES line, or the paths named in the agent's
-// report), and the message is `task <N>: <brief title>`.
+// What this is and why. Until 2026-11-10 the cloud executor pushed artifacts
+// to origin INSIDE the success path, BEFORE the verdict was written. The
+// comment at the call site literally said "Push artifacts to origin BEFORE
+// marking task as done", and the final status write came after the push. For
+// the Plexus canon (canon/START-HERE.md, rule of 2026-11-10: "after the
+// founder accepts, the executor pushes - the acceptance is the barrier, not
+// the push") that order was the wrong way round: a commit landed in the shared
+// repository while the task had been accepted by neither the founder nor the
+// artifact guard, and an unaccepted (possibly failing) task left its artifacts
+// on origin permanently.
 //
-// The push that follows a staged commit, and the verification that it reached
-// origin, are unchanged - COMMIT-VERIFICATION FIX 2 still reads the remote's
-// own ref back and refuses an exit-0 push whose ref never landed.
+// Variant A - acceptance inside the run - was chosen because a GitHub Actions
+// runner is ephemeral: a local commit left to wait for acceptance between runs
+// dies with the runner, so "wait for Turso to say 'принята'" can only be done
+// by a live process. That makes the wait loop belong inside this same run, and
+// it reuses the already-planned [JOINT]/awaiting_human mechanism (BACKLOG item
+// 35) instead of inventing a second acceptance channel.
 //
-// The acceptance gate that decides WHEN the push may happen waits for the
-// founder's decision and lives in run(); the wait has to be inside the run
-// because a GitHub Actions runner is ephemeral, and a commit left waiting for a
-// decision between runs dies with the runner.
+// Order is now:
+//   1. doWork finished, artifacts exist (the guard decides BEFORE the human is
+//      asked - asking someone to accept an empty tree is exactly the hole this
+//      gate would otherwise reopen);
+//   2. stageTaskArtifacts(): a LOCAL commit, no push;
+//   3. status 'ждёт_приёмки' + the founder is asked (Turso status column, and a
+//      Telegram note to the task's creator);
+//   4. waitForAcceptance(): polls the row for up to ACCEPTANCE_WINDOW_MINUTES;
+//        'принята'    -> pushAcceptedArtifacts (push + commitReachedOrigin) -> 'готова'
+//        'отклонена' or timeout -> rollbackLocalWork -> 'провал_фатальный'
+//   5. Fail-closed is unchanged: an empty tree, or a push that did not verify
+//      on origin, is 'провал' and never 'готова'.
+//
+// Two limits, stated on purpose rather than left to be discovered:
+//   - the window is measured from the moment staging finished, and a run cannot
+//     outlive the job's own 90-minute cap; if the work consumed most of it the
+//     wait gets cut short by the runner, which the crash guard then books as
+//     'провал' (retryable - the brief is fine, the pass just died);
+//   - rollbackLocalWork() does `git reset --hard` and deliberately NOT `git
+//     clean`: untracked files the agent never staged stay behind. They die with
+//     the runner and were never pushed, so deleting a stranger's files to tidy
+//     up would cost more than the tidiness is worth.
 // ---------------------------------------------------------------------------
+const ACCEPT_WAITING_STATUS = 'ждёт_приёмки';
+const ACCEPT_ACCEPTED_STATUS = 'принята';
+const ACCEPT_REJECTED_STATUS = 'отклонена';
+// The founder's brief named a 90-minute window; the run's own job cap is also
+// 90 minutes, so the default only fits when the work itself was short. Both are
+// env-overridable because the honest fix is per-run, not per-code.
+const ACCEPTANCE_WINDOW_MINUTES = Number(process.env.ACCEPTANCE_WINDOW_MINUTES) || 90;
+const ACCEPTANCE_WAIT_MS = ACCEPTANCE_WINDOW_MINUTES * 60 * 1000;
+const ACCEPTANCE_POLL_MS = Number(process.env.ACCEPTANCE_POLL_MS) || 30000;
+
 // Commit title: the first meaningful line of the brief, markers stripped.
 //
 // Until 2026-11-10 the message was the first line of `git status --porcelain`
@@ -2300,10 +2413,52 @@ async function pushTaskArtifacts(taskText, preWorkSha, resultText) {
 // rather than the executor's own optimism. A thrown read is NOT a decision - it
 // is left to the caller, which keeps waiting rather than treating an outage as
 // a rejection.
+async function readTaskStatus(taskId) {
+  const res = await client.execute({ sql: "SELECT status FROM tasks WHERE id = ?", args: [String(taskId)] });
+  const row = res && res.rows ? res.rows[0] : null;
+  return row ? String(row.status || "") : "";
+}
 
+async function waitForAcceptance(taskId, opts = {}) {
+  const deadlineMs = opts.deadlineMs == null ? ACCEPTANCE_WAIT_MS : opts.deadlineMs;
+  const pollMs = opts.pollMs == null ? ACCEPTANCE_POLL_MS : opts.pollMs;
+  const sleep = opts.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const readStatus = opts.readStatus || readTaskStatus;
+  const started = Date.now();
+  for (;;) {
+    // Read first, sleep second: a decision that arrived while the commit was
+    // being made must not cost a poll interval.
+    let current = "";
+    try { current = String((await readStatus(taskId)) || "").trim(); } catch (err) { current = ""; }
+    if (current === ACCEPT_ACCEPTED_STATUS) return { outcome: ACCEPT_ACCEPTED_STATUS, waitedMs: Date.now() - started };
+    if (current === ACCEPT_REJECTED_STATUS) return { outcome: ACCEPT_REJECTED_STATUS, waitedMs: Date.now() - started, reason: `rejected by the founder (row status '${ACCEPT_REJECTED_STATUS}')` };
+    const waitedMs = Date.now() - started;
+    if (waitedMs >= deadlineMs) {
+      return { outcome: "timeout", waitedMs, reason: `acceptance window expired after ${Math.round(waitedMs / 60000)} minute(s) without a '${ACCEPT_ACCEPTED_STATUS}' decision` };
+    }
+    if (current && current !== ACCEPT_WAITING_STATUS) {
+      // Somebody moved the row elsewhere while we were waiting (a manual edit,
+      // a triage split, the dispatcher). Waiting on a row we no longer own is
+      // how a task ends up with its artifacts pushed under a different state.
+      return { outcome: "unexpected-status", waitedMs, reason: `row left '${ACCEPT_WAITING_STATUS}' on its own and now reads '${current}' - not waiting on a task we no longer own` };
+    }
+    await sleep(pollMs);
+  }
+}
 
 // Roll the work tree back to where this pass started. Tracks nothing: the
 // artifacts never left the runner, so there is nothing to unpick on origin.
+function rollbackLocalWork(preWorkSha, dir) {
+  if (!preWorkSha) return false;
+  try {
+    execSync(`git reset --hard ${preWorkSha}`, { cwd: dir, stdio: "pipe" });
+    console.log(`[${new Date().toISOString()}] rollback: work tree reset to ${preWorkSha.slice(0, 8)} (the start of this pass); nothing was pushed`);
+    return true;
+  } catch (err) {
+    console.log(`[${new Date().toISOString()}] rollback: FAILED - could not reset to ${preWorkSha.slice(0, 8)}: ${redactSecrets(err.message)} (nothing was pushed either)`);
+    return false;
+  }
+}
 
 /**
  * COMMIT-VERIFICATION FIX 2 companion: does origin's ref for this branch point
@@ -4769,6 +4924,9 @@ export {
   pushTaskArtifacts,
   stageTaskArtifacts,
   pushAcceptedArtifacts,
+  waitForAcceptance,
+  rollbackLocalWork,
+  readTaskStatus,
   briefTitle,
   artifactFileList,
   existingFilesIn,
@@ -4836,12 +4994,12 @@ async function releaseStuckTaskAfterCrash(taskId, err) {
   console.error(redactSecrets(err?.stack || err?.message || err));
   try {
     await client.execute({
-      sql: `UPDATE tasks SET status = 'провал', result = ? WHERE id = ? AND status = 'выполняется'`,
-      args: [`CRASH-GUARD 2026-11-08: pass died before the verdict was written (${String(err?.message || err).split("\n")[0]}). Released from 'выполняется' so the dispatcher can pick it up; no verdict was recorded.`, taskId],
+      sql: `UPDATE tasks SET status = 'провал', result = ? WHERE id = ? AND status IN ('выполняется', 'ждёт_приёмки')`,
+      args: [`CRASH-GUARD 2026-11-08: pass died before the verdict was written (${String(err?.message || err).split("\n")[0]}). Released from 'выполняется' or 'ждёт_приёмки' so the dispatcher can pick it up; no verdict was recorded, and nothing was pushed while the pass was waiting for acceptance.`, taskId],
     });
-    console.error(`[${new Date().toISOString()}] CRASH_GUARD: task ${taskId} released from 'выполняется' to 'провал' after an unhandled throw`);
+    console.error(`[${new Date().toISOString()}] CRASH_GUARD: task ${taskId} released from 'выполняется'/'ждёт_приёмки' to 'провал' after an unhandled throw`);
   } catch (releaseErr) {
-    console.error(`[${new Date().toISOString()}] CRASH_GUARD_FAILED: could not release task ${taskId} (${redactSecrets(releaseErr?.message || releaseErr)}) - row remains in 'выполняется' and needs manual cleanup`);
+    console.error(`[${new Date().toISOString()}] CRASH_GUARD_FAILED: could not release task ${taskId} (${redactSecrets(releaseErr?.message || releaseErr)}) - row remains in 'выполняется'/'ждёт_приёмки' and needs manual cleanup`);
   }
   process.exit(1);
 }
