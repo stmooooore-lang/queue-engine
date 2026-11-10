@@ -1,0 +1,83 @@
+name: Merge Pending Acceptance
+
+# ACCEPTANCE-GATE (PUSH-AFTER-ACCEPTANCE, founder's brief 2026-11-10): the robot
+# half of acceptance. The founder's only action is setting a task row to
+# 'принята' in Turso - this workflow notices it every 5 minutes, merges
+# `pending/task-<id>` into the target branch, pushes, retires the pending ref and
+# closes the row as 'готова'.
+#
+# Nothing here can publish unaccepted work: the script reads the row again and
+# refuses anything that is not 'принята' (exit 2), and the merge is only ever
+# from the task's own preserved ref.
+#
+# The contract this file runs against: docs/ACCEPTANCE-GATE-SPEC.md, and the
+# scripts it calls: scripts/list-accepted-pending.mjs (which rows),
+# scripts/accept-pending.mjs (the merge). A repo that adopts the gate copies
+# BOTH scripts and this workflow verbatim.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+# One merge at a time: two overlapping merges of the same branch are the easiest
+# way to lose one of them silently.
+concurrency:
+  group: merge-pending
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: install the database client
+        run: npm install --no-save @libsql/client
+
+      # The queue works on the product repo (WORKDIR in executor.yml). Its own
+      # path is a variable so another repo can point at a different one: set
+      # TARGET_REPO (owner/name) to the repo the tasks are actually in.
+      - name: checkout the target repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.TARGET_REPO || 'stmooooore-lang/plexus-doc' }}
+          token: ${{ secrets.REPO_TOKEN }}
+          path: target
+
+      - name: select the accepted tasks
+        id: select
+        env:
+          TURSO_URL: ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+        run: |
+          node scripts/list-accepted-pending.mjs > accepted.tsv || exit 1
+          cat accepted.tsv
+          count=$(wc -l < accepted.tsv | tr -d ' ')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: merge each accepted task
+        if: steps.select.outputs.count != '0'
+        env:
+          TURSO_URL: ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+        run: |
+          failed=0
+          while IFS=$'\t' read -r id branch; do
+            [ -n "$id" ] || continue
+            echo "--- accept-pending: task $id into $branch ---"
+            node scripts/accept-pending.mjs "$id" ./target "$branch"
+            code=$?
+            case $code in
+              0) echo "task $id: merged" ;;
+              2) echo "task $id: not 'принята' (it changed since selection) - skipping, not failing the run" ;;
+              4) echo "task $id: MERGE-CONFLICT - nothing pushed, the founder resolves it"; failed=1 ;;
+              *) echo "task $id: FAILED with exit $code - see the log above"; failed=1 ;;
+            esac
+          done < accepted.tsv
+          exit $failed

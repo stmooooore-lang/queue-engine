@@ -1850,6 +1850,26 @@ async function run() {
           result.success = false;
           result.message = `ACCEPTANCE-GATE OVERDUE: ${outcome.reason}. Локальный коммит ${String(staged.stagedSha || "").slice(0, 8)} на ${staged.branch} НЕ откатывался. ${preserved ? `Сохранён в origin/${pendingRef} (${String(preserved).slice(0, 8)}, проверено на origin) - рабочая ветка ${staged.branch} не тронута. Слияние: см. docs/DECISIONS.md, PENDING-BRANCH-MERGE.` : `СОХРАНИТЬ НЕ УДАЛОСЬ: ${lastArtifactPushReason || "pending push did not complete"} - раннер эфемерный, коммит умирает вместе с прогоном.`} Файлы коммита: ${(staged.manifest || []).slice(0, 10).join(", ") || "(см. лог)"}${(staged.manifest || []).length > 10 ? ", ..." : ""}. Требуется решение основателя. Agent's own report was: ${result.message}`;
           console.log(`[${new Date().toISOString()}] acceptance-gate: task ${taskId} is now '${ACCEPT_OVERDUE_STATUS}' - commit ${String(staged.stagedSha || "").slice(0, 8)} on ${staged.branch} kept, ${preserved ? `preserved in origin/${pendingRef}, the working branch untouched` : "NOT preserved (the pending push failed)"}, not rolled back`);
+          // The preservation is only useful if it can be FOUND later. The row
+          // therefore records where the work went and what it merges into, in
+          // metadata rather than only in the result text: the workflow
+          // (.github/workflows/merge-pending.yml) selects on exactly these two
+          // keys, and parsing prose from 'result' would be the kind of check
+          // that survives only until someone rewrites the sentence.
+          if (preserved) {
+            try {
+              let prevMeta = {};
+              try { prevMeta = task.metadata ? JSON.parse(task.metadata) : {}; } catch {}
+              if (!prevMeta || typeof prevMeta !== "object") prevMeta = {};
+              await client.execute({
+                sql: 'UPDATE tasks SET metadata = ? WHERE id = ?',
+                args: [JSON.stringify({ ...prevMeta, pending_branch: pendingRef, target_branch: staged.branch }), taskId],
+              });
+              log(`task ${taskId} metadata: pending_branch=${pendingRef}, target_branch=${staged.branch} (merge-pending.yml selects on these)`);
+            } catch (metaErr) {
+              log(`PENDING-BRANCH-UNRECORDED: metadata not saved for task ${taskId} (${redactSecrets(metaErr.message)}) - the work IS on origin/${pendingRef}, but the workflow cannot find it by row; merge it by hand`);
+            }
+          }
         } else {
           // 'отклонена', or the row moved on its own: a decision was made, or
           // the row is no longer ours to wait on. Nothing was pushed, so roll
