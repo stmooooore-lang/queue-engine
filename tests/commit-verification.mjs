@@ -253,6 +253,10 @@ console.log("=== EXECUTOR-COMMIT-VERIFICATION: artifact guard ===\n");
 }
 
 // --- H: a clean tree can HIDE the agent's own commit (live, task 178) -----
+// 2026-11-10, PUSH-AFTER-ACCEPTANCE blocker 2: the agent's commit must ALSO be
+// declared in the brief's MANIFEST:/FILES: list, otherwise it is an
+// AGENT-PUSHED-OUTSIDE-MANIFEST violation and not a gated artifact (see group M
+// in tests/acceptance-gate.mjs). Both cases below declare the file they create.
 // Task 178 created notes/test-success.md, committed and pushed it to
 // origin/cursor-build itself. Its tree was therefore clean at guard time, and
 // FIX 1 called that "no artifacts". A clean tree means "no uncommitted
@@ -268,7 +272,7 @@ console.log("=== EXECUTOR-COMMIT-VERIFICATION: artifact guard ===\n");
   sh("git add -A && git commit -q -m 'task 178: real agent work'", dir);
   check("H0 the tree is clean after the agent's own commit (the hole's precondition)",
     sh("git status --porcelain", dir) === "", "tree still dirty");
-  const pushed = await ex.pushTaskArtifacts("[S14-20] triage notes into canon", preWorkSha);
+  const pushed = await ex.pushTaskArtifacts("[S14-20] triage notes into canon\nMANIFEST: notes-test-success.md", preWorkSha, "Created `notes-test-success.md`");
   check("H1 a clean tree with HEAD moved since the pass started is treated as work",
     pushed === true, `returned ${JSON.stringify(pushed)}; reason=${ex.getLastArtifactPushReason()}`);
   check("H2 ...and the agent's commit is pushed to origin and verified",
@@ -290,7 +294,7 @@ console.log("=== EXECUTOR-COMMIT-VERIFICATION: artifact guard ===\n");
   const ex = await loadExecutor(dir);
   fs.writeFileSync(path.join(dir, "notes-test-success.md"), "test artifact\n");
   sh("git add -A && git commit -q -m 'task 178: agent work, already pushed' && git push -q origin main", dir);
-  const pushed = await ex.pushTaskArtifacts("[S14-20] triage notes into canon", preWorkSha);
+  const pushed = await ex.pushTaskArtifacts("[S14-20] triage notes into canon\nMANIFEST: notes-test-success.md", preWorkSha, "Created `notes-test-success.md`");
   check("H5 work the agent already pushed itself is accepted without a second commit",
     pushed === true, `returned ${JSON.stringify(pushed)}; reason=${ex.getLastArtifactPushReason()}`);
   check("H6 ...and no duplicate commit was created",

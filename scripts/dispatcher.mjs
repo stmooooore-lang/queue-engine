@@ -96,8 +96,16 @@ function executorAlreadyRunning() {
   // RETRY-BUDGET, 2026-11-06: the one SELECT that decides what the
 // dispatcher may run this tick. Exported so tests/retry-budget.mjs verifies
 // THIS query rather than a hand-synced copy of it - a copy tests itself.
+// PUSH-AFTER-ACCEPTANCE 2026-11-10: the SELECT is an allowlist by design (only
+// 'ожидает' and 'провал' are ever picked), so a task parked for a decision
+// cannot be re-picked while it waits. The explicit NOT IN below is defence in
+// depth and documentation: if a future change widens the allowlist, it has to
+// widen it past this line and read what it is excluding - 'ждёт_приёмки'
+// (waiting for the founder) and 'ждёт_приёмки_просрочено' (window expired, a
+// human owes a decision) are both states where auto-dispatch would either
+// double-run the work or erase a decision-less artifact.
 const DISPATCH_SELECT_SQL =
-  "SELECT id, text, metadata, status, blocked_reason FROM tasks WHERE ((status = 'ожидает' OR status = 'провал') AND (paused_until IS NULL OR paused_until <= CURRENT_TIMESTAMP) AND (status = 'ожидает' OR ((blocked_reason IS NULL OR blocked_reason = '') AND CASE WHEN json_valid(metadata) THEN COALESCE(json_extract(metadata,'$.retry_count'),0) ELSE 0 END < 3 AND CASE WHEN json_valid(metadata) THEN COALESCE(json_extract(metadata,'$.failed_at'),0) ELSE 0 END > 0 AND CASE WHEN json_valid(metadata) THEN COALESCE(json_extract(metadata,'$.failed_at'),0) ELSE 0 END <= CAST(strftime('%s','now') AS INTEGER) - 300))) ORDER BY id ASC";
+  "SELECT id, text, metadata, status, blocked_reason FROM tasks WHERE status NOT IN ('ждёт_приёмки', 'ждёт_приёмки_просрочено') AND ((status = 'ожидает' OR status = 'провал') AND (paused_until IS NULL OR paused_until <= CURRENT_TIMESTAMP) AND (status = 'ожидает' OR ((blocked_reason IS NULL OR blocked_reason = '') AND CASE WHEN json_valid(metadata) THEN COALESCE(json_extract(metadata,'$.retry_count'),0) ELSE 0 END < 3 AND CASE WHEN json_valid(metadata) THEN COALESCE(json_extract(metadata,'$.failed_at'),0) ELSE 0 END > 0 AND CASE WHEN json_valid(metadata) THEN COALESCE(json_extract(metadata,'$.failed_at'),0) ELSE 0 END <= CAST(strftime('%s','now') AS INTEGER) - 300))) ORDER BY id ASC";
 
 async function main() {
 

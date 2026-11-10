@@ -29,7 +29,11 @@ concurrency:
 jobs:
   execute:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # JOB_CAP_MINUTES (scripts/executor.mjs) is 180, and this number has to agree with it:
+    # 180 total = ~120 for the slowest unit of work + 60 for the acceptance window.
+    # GitHub kills the job here regardless of what the code says, so a cap that
+    # exists only in JS is not a cap.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 

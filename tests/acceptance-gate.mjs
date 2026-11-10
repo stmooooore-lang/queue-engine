@@ -226,13 +226,160 @@ function makeRepo(name, withRemote = true) {
   const ex = await loadExecutor(dir);
   const preWorkSha = sh("git rev-parse HEAD", dir);
   sh("git add -A && git commit -q -m 'task 180: agent work'", dir);
-  const agentSha = sh("git rev-parse HEAD", dir);
-  const staged = ex.stageTaskArtifacts("[S14-20] triage notes into canon", preWorkSha, "");
-  check("J13 the agent's own commit is gated exactly like an executor commit",
-    staged.ok === true && staged.needsGate === true && staged.stagedSha === agentSha && /agent's own/.test(staged.source),
-    JSON.stringify(staged));
+  // New contract (blocker 2, 2026-11-10): an agent commit the brief never
+  // declared is a violation, not a gated artifact. The lawful shape - an agent
+  // commit inside the brief's manifest - is asserted in M1, and it is still not
+  // pushed until the decision (M4/M11).
+  const staged = ex.stageTaskArtifacts("[S14-20] triage notes into canon\nMANIFEST: seed2.md", preWorkSha, "");
+  check("J13 an agent commit inside the brief's manifest is gated, not pushed",
+    staged.ok === true && staged.needsGate === true && /agent's own/.test(staged.source), JSON.stringify(staged));
   check("J14 ...and it is not pushed until the decision",
     sh("git rev-parse origin/main", dir) === preWorkSha, "");
+}
+
+// --- L: job cap vs acceptance window (blocker 1) -----------------------------
+// The founder's arithmetic: the slowest single unit of work is ~120 minutes and
+// 180 - 120 = 60, so a 60-minute window survives even that. A window that can
+// be eaten by the work itself is not a window.
+{
+  const ex = await loadExecutor(makeRepo("caps"));
+  check("L1 the window is 60 minutes", ex.ACCEPTANCE_WINDOW_MINUTES === 60, ex.ACCEPTANCE_WINDOW_MINUTES);
+  check("L2 the job cap is 180 minutes", ex.JOB_CAP_MINUTES === 180, ex.JOB_CAP_MINUTES);
+  check("L3 ...and 180 - 120 minutes of work still leaves the whole window",
+    ex.JOB_CAP_MINUTES - 120 >= ex.ACCEPTANCE_WINDOW_MINUTES, `${ex.JOB_CAP_MINUTES - 120} < ${ex.ACCEPTANCE_WINDOW_MINUTES}`);
+  // GitHub kills the job at timeout-minutes regardless of what JS says, so a
+  // constant that disagrees with the workflow is a lie with a number.
+  const yml = fs.readFileSync(path.join(repoRoot, ".github/workflows/executor.yml"), "utf8");
+  const wf = /timeout-minutes:\s*(\d+)/.exec(yml);
+  check("L4 executor.yml's timeout-minutes equals JOB_CAP_MINUTES",
+    wf !== null && Number(wf[1]) === ex.JOB_CAP_MINUTES, wf ? wf[1] : "not found");
+}
+
+// --- M: the agent's own commit must be inside the brief's manifest (blocker 2)
+// dsh runs under danger-full-access, so an agent can commit AND push on its
+// own. Committing is fine (it is the artifact); committing files the brief
+// never named is how the gate gets bypassed, so that check has to read the
+// BRIEF, not the agent's own report.
+{
+  const brief = "[S14-20] triage notes into canon\nMANIFEST: artifact.md";
+  const dir = makeRepo("agentmanifestsok");
+  fs.writeFileSync(path.join(dir, "artifact.md"), "declared work\n");
+  const ex = await loadExecutor(dir);
+  const preWorkSha = sh("git rev-parse HEAD", dir);
+  sh("git add -A && git commit -q -m 'task 180: agent work'", dir);
+  const agentSha = sh("git rev-parse HEAD", dir);
+  const staged = ex.stageTaskArtifacts(brief, preWorkSha, "Created `artifact.md`");
+  check("M1 an agent commit holding exactly the manifest files is gated, not refused",
+    staged.ok === true && staged.needsGate === true && staged.stagedSha === agentSha, JSON.stringify(staged));
+}
+{
+  const brief = "[S14-20] triage notes into canon\nMANIFEST: artifact.md";
+  const dir = makeRepo("agentmanifestextra");
+  fs.writeFileSync(path.join(dir, "artifact.md"), "declared work\n");
+  fs.writeFileSync(path.join(dir, "stray.md"), "not declared\n");
+  const ex = await loadExecutor(dir);
+  const preWorkSha = sh("git rev-parse HEAD", dir);
+  sh("git add -A && git commit -q -m 'task 180: agent work'", dir);
+  const staged = ex.stageTaskArtifacts(brief, preWorkSha, "");
+  check("M2 an agent commit with an undeclared file fails the task",
+    staged.ok === false && staged.violation === "AGENT-PUSHED-OUTSIDE-MANIFEST", JSON.stringify(staged));
+  check("M3 ...the reason names the outside file",
+    /AGENT-PUSHED-OUTSIDE-MANIFEST/.test(staged.reason || "") && /stray\.md/.test(staged.reason || ""), staged.reason);
+  check("M4 ...and the work is rolled back to the start of the pass",
+    sh("git rev-parse HEAD", dir) === preWorkSha, `HEAD=${sh("git rev-parse HEAD", dir)} expected=${preWorkSha}`);
+  check("M5 ...and nothing was pushed",
+    sh("git rev-parse origin/main", dir) === preWorkSha, `origin/main=${sh("git rev-parse origin/main", dir)}`);
+}
+{
+  // A brief with no manifest authorises nothing: "no manifest" must not mean
+  // "everything allowed".
+  const dir = makeRepo("agentnomanifest");
+  fs.writeFileSync(path.join(dir, "anything.md"), "work nobody declared\n");
+  const ex = await loadExecutor(dir);
+  const preWorkSha = sh("git rev-parse HEAD", dir);
+  sh("git add -A && git commit -q -m 'task 180: agent work'", dir);
+  const staged = ex.stageTaskArtifacts("[S14-20] triage notes into canon", preWorkSha, "Created `anything.md`");
+  check("M6 a brief with no MANIFEST line authorises no agent-made commit",
+    staged.ok === false && /AGENT-PUSHED-OUTSIDE-MANIFEST/.test(staged.reason || "") && /no MANIFEST/.test(staged.reason || ""), staged.reason);
+  check("M7 ...and the agent's report naming the file does NOT rescue it",
+    /AGENT-PUSHED-OUTSIDE-MANIFEST/.test(staged.reason || ""), staged.reason);
+  const declared = ex.briefManifest("[S14-20] triage notes into canon");
+  const fromReport = ex.reportFileList("Created `anything.md`");
+  check("M8 the split is real: briefManifest() ignores the report, reportFileList() reads it",
+    declared.length === 0 && JSON.stringify(fromReport) === JSON.stringify(["anything.md"]), `brief=${JSON.stringify(declared)} report=${JSON.stringify(fromReport)}`);
+}
+{
+  // The agent already pushed: rollback resets the local tree, but the commit is
+  // on GitHub and cannot be recalled by git reset. The reason must say so out
+  // loud, or the founder will believe rollback fixed origin too.
+  const brief = "[S14-20] triage notes into canon\nMANIFEST: artifact.md";
+  const dir = makeRepo("agentalreadypushed");
+  fs.writeFileSync(path.join(dir, "artifact.md"), "declared\n");
+  fs.writeFileSync(path.join(dir, "stray.md"), "undeclared\n");
+  const ex = await loadExecutor(dir);
+  const preWorkSha = sh("git rev-parse HEAD", dir);
+  sh("git add -A && git commit -q -m 'task 180: agent work' && git push -q origin main", dir);
+  const staged = ex.stageTaskArtifacts(brief, preWorkSha, "");
+  check("M9 an agent push that skipped the gate is named as such",
+    staged.ok === false && /AGENT-PUSHED-OUTSIDE-MANIFEST/.test(staged.reason || ""), staged.reason);
+  check("M10 ...and the reason admits the commit is already on origin",
+    /ALREADY reached origin/.test(staged.reason || ""), staged.reason);
+  check("M11 ...and origin really still holds it (rollback cannot recall it)",
+    sh("git rev-parse origin/main", dir) !== preWorkSha, "origin was rewound");
+}
+{
+  // filesAddedSince is the set the commit introduced, not the whole tree.
+  const dir = makeRepo("addedsince");
+  const ex = await loadExecutor(dir);
+  const preWorkSha = sh("git rev-parse HEAD", dir);
+  check("M12 with no second commit, nothing was 'added'",
+    JSON.stringify(ex.filesAddedSince(preWorkSha, dir)) === "[]", JSON.stringify(ex.filesAddedSince(preWorkSha, dir)));
+  fs.writeFileSync(path.join(dir, "one.md"), "1\n");
+  fs.writeFileSync(path.join(dir, "two.md"), "2\n");
+  sh("git add -A && git commit -q -m two", dir);
+  const added = ex.filesAddedSince(preWorkSha, dir);
+  check("M13 it lists exactly the files the commit added",
+    JSON.stringify(added) === JSON.stringify(["one.md", "two.md"]), JSON.stringify(added));
+}
+
+// --- N: an overdue window is not a rejection (blocker 3) --------------------
+{
+  const ex = await loadExecutor(makeRepo("gateverdict"));
+  check("N1 an accepted, verified push is 'готова'",
+    ex.gateVerdict({ outcome: "принята" }, { success: true }) === "готова", "");
+  check("N2 accepted but the push failed is NOT 'готова'",
+    ex.gateVerdict({ outcome: "принята" }, { success: false }) === "провал_фатальный", "");
+  check("N3 a window that expired becomes its own status, never a rejection",
+    ex.gateVerdict({ outcome: "timeout" }, { success: false }) === "ждёт_приёмки_просрочено",
+    ex.gateVerdict({ outcome: "timeout" }, { success: false }));
+  check("N4 ...and that status is not a retryable провал",
+    ex.ACCEPT_OVERDUE_STATUS !== "провал" && ex.ACCEPT_OVERDUE_STATUS !== "провал_фатальный", ex.ACCEPT_OVERDUE_STATUS);
+  check("N5 a rejection is 'провал_фатальный' (a decision, the work is destroyed)",
+    ex.gateVerdict({ outcome: "отклонена" }, { success: false }) === "провал_фатальный", "");
+  check("N6 a row that moved on its own is 'провал_фатальный'",
+    ex.gateVerdict({ outcome: "unexpected-status" }, { success: false }) === "провал_фатальный", "");
+  check("N7 no gate means no gate verdict at all (the ordinary path decides)",
+    ex.gateVerdict(null, { success: true }) === null, "");
+}
+{
+  // The overdue row must not roll back: stageTaskArtifacts has already made the
+  // local commit, and the timeout branch in run() is the one that must leave it
+  // alone. Asserted through the two primitives the branch actually uses, since
+  // run() itself needs a live Turso row.
+  const dir = makeRepo("gateoverdue");
+  fs.writeFileSync(path.join(dir, "artifact.md"), "the work\n");
+  const ex = await loadExecutor(dir);
+  const preWorkSha = sh("git rev-parse HEAD", dir);
+  const staged = ex.stageTaskArtifacts("[S14-20] triage notes into canon\nMANIFEST: artifact.md", preWorkSha, "");
+  const decision = await ex.waitForAcceptance(999, { deadlineMs: 0, pollMs: 1000, sleep: async () => {}, readStatus: async () => "ждёт_приёмки" });
+  check("N8 the window expires on a silently-waiting row",
+    decision.outcome === "timeout", JSON.stringify(decision));
+  check("N9 the local commit still exists after the window expired (no rollback)",
+    sh("git rev-parse HEAD", dir) === staged.stagedSha && sh("git rev-parse HEAD", dir) !== preWorkSha,
+    `HEAD=${sh("git rev-parse HEAD", dir)} committed=${staged.stagedSha}`);
+  check("N10 ...and the dispatcher's SELECT has to exclude the overdue status too",
+    fs.readFileSync(path.join(repoRoot, "scripts/dispatcher.mjs"), "utf8").includes(`status NOT IN ('ждёт_приёмки', 'ждёт_приёмки_просрочено')`),
+    "the explicit exclusion is missing");
 }
 
 // --- K: the waiting row cannot be re-picked while it waits ------------------
@@ -250,8 +397,11 @@ function makeRepo(name, withRemote = true) {
   check("K2 the dispatcher's SELECT was found", selectIdx > 0, "");
   const selectSql = src.slice(selectIdx, selectIdx + 700);
   check("K3 ...and it picks only 'ожидает' and 'провал', so a parked task is never re-picked",
-    /status = 'ожидает'/.test(selectSql) && /status = 'провал'/.test(selectSql) && !selectSql.includes(waitingStatus),
-    selectSql.slice(0, 300));
+    /status = 'ожидает'/.test(selectSql) && /status = 'провал'/.test(selectSql), selectSql.slice(0, 300));
+  // 2026-11-10 (blocker 3): the exclusion is explicit rather than implied by
+  // absence, so a future widening of the allowlist has to pass THROUGH it.
+  check("K4 the exclusion names both waiting statuses explicitly",
+    /status NOT IN \('ждёт_приёмки', 'ждёт_приёмки_просрочено'\)/.test(selectSql), selectSql.slice(0, 300));
 }
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);

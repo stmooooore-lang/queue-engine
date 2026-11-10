@@ -1824,9 +1824,30 @@ async function run() {
             result.success = false;
             result.message = `ARTIFACT-GUARD: задача принята, но пуш не подтвердился - ${lastArtifactPushReason || "artifact push did not complete"}. Коммит ${String(staged.stagedSha || "").slice(0, 8)} остался локальным. Agent's own report was: ${result.message}`;
           }
+        } else if (outcome.outcome === "timeout") {
+          // Founder's brief 2026-11-10 (acceptance-gate blocker 3): a window
+          // that expires is NOT a rejection, so it must not be treated as one.
+          // No rollback, no 'провал_фатальный' - the work may be perfectly
+          // good and the decision merely never arrived. The row moves to its
+          // own status, which the dispatcher never picks, so nothing re-runs
+          // it and nothing destroys it until a human says what to do.
+          //
+          // What is NOT done here, said plainly: the runner is ephemeral, so
+          // when this process ends the local commit dies with it. The two
+          // options both require a decision the gate does not own - pushing
+          // the commit to a `task/<N>` staging branch would put it on origin
+          // WITHOUT acceptance (the very thing this gate exists to prevent),
+          // and saving the patch in Turso needs a column or a metadata key
+          // that does not exist yet. What IS preserved here is the trace: the
+          // commit sha, the branch, the file list, and the pass-start sha, so
+          // the work can be re-found and re-made rather than only remembered.
+          result.success = false;
+          result.message = `ACCEPTANCE-GATE OVERDUE: ${outcome.reason}. Локальный коммит ${String(staged.stagedSha || "").slice(0, 8)} на ${staged.branch} НЕ откатывался и НЕ отправлялся в origin (раннер эфемерный: коммит живёт, только пока идёт прогон). Файлы коммита: ${(staged.manifest || []).slice(0, 10).join(", ") || "(см. лог)"}${(staged.manifest || []).length > 10 ? ", ..." : ""}. Требуется решение основателя. Agent's own report was: ${result.message}`;
+          console.log(`[${new Date().toISOString()}] acceptance-gate: task ${taskId} is now '${ACCEPT_OVERDUE_STATUS}' - commit ${String(staged.stagedSha || "").slice(0, 8)} on ${staged.branch} kept, not pushed, not rolled back`);
         } else {
-          // 'отклонена', a timeout, or the row moved on its own: nothing was
-          // pushed, so roll the work tree back and let nothing of it survive.
+          // 'отклонена', or the row moved on its own: a decision was made, or
+          // the row is no longer ours to wait on. Nothing was pushed, so roll
+          // the work tree back and let nothing of it survive.
           rollbackLocalWork(preWorkSha, WORKDIR);
           result.success = false;
           result.message = `ARTIFACT-GUARD: ${outcome.reason || "acceptance window closed without a decision"}; локальный коммит ${String(staged.stagedSha || "").slice(0, 8)} откатан, в origin ничего не отправлено. Agent's own report was: ${result.message}`;
@@ -1873,15 +1894,10 @@ async function run() {
   const retryBudgetExhausted = verdict.retryable && retryCount >= MAX_TASK_RETRIES;
 
   // The gate decides its own verdict, because a decision made by a human is
-  // not an input to classifyFailure(): 'принята' plus a verified push is
-  // 'готова', and anything else (rejected, window expired, the row moved,
-  // accepted-but-the-push-did-not-verify) is 'провал_фатальный' - the local
-  // artifact is gone by then and re-running the same brief would only ask the
-  // same question again. A gate failure therefore does NOT write retry
-  // metadata: the decision, not the pass, is what has to change.
-  const status = gateOutcome
-    ? (gateOutcome.outcome === ACCEPT_ACCEPTED_STATUS && result.success ? 'готова' : 'провал_фатальный')
-    : taskVerdictFromResult(result, { verdict, isPermanentBlock, retryBudgetExhausted });
+  // not an input to classifyFailure(). The mapping lives in gateVerdict() so it
+  // can be executed rather than eyeballed (tests/acceptance-gate.mjs, group L).
+  const status = gateVerdict(gateOutcome, result)
+    || taskVerdictFromResult(result, { verdict, isPermanentBlock, retryBudgetExhausted });
 
   const blockedReason = isPermanentBlock ? (result.blockedReason || result.message || 'permanent founder-fixable blocker') : null;
   // The acceptance wait is consumed time in this run, not free time: a task
@@ -2162,15 +2178,20 @@ const SPLIT_NL = "'\n'";
 //      Telegram note to the task's creator);
 //   4. waitForAcceptance(): polls the row for up to ACCEPTANCE_WINDOW_MINUTES;
 //        'принята'    -> pushAcceptedArtifacts (push + commitReachedOrigin) -> 'готова'
-//        'отклонена' or timeout -> rollbackLocalWork -> 'провал_фатальный'
+//        'отклонена'          -> rollbackLocalWork -> 'провал_фатальный'
+//        timeout (no decision) -> ACCEPT_OVERDUE_STATUS, NO rollback: the work
+//                                 stays where it is and a human has to decide
+//                                 what happens to it
 //   5. Fail-closed is unchanged: an empty tree, or a push that did not verify
 //      on origin, is 'провал' and never 'готова'.
 //
 // Two limits, stated on purpose rather than left to be discovered:
 //   - the window is measured from the moment staging finished, and a run cannot
-//     outlive the job's own 90-minute cap; if the work consumed most of it the
-//     wait gets cut short by the runner, which the crash guard then books as
-//     'провал' (retryable - the brief is fine, the pass just died);
+//     outlive JOB_CAP_MINUTES (180). 180 - 120 (the slowest single unit) = 60,
+//     which is exactly what ACCEPTANCE_WINDOW_MINUTES defaults to, so a window
+//     is never shortened by the work that preceded it; if a pass somehow runs
+//     past the cap the runner kills it and the crash guard books 'провал'
+//     (retryable - the brief is fine, the pass just died);
 //   - rollbackLocalWork() does `git reset --hard` and deliberately NOT `git
 //     clean`: untracked files the agent never staged stay behind. They die with
 //     the runner and were never pushed, so deleting a stranger's files to tidy
@@ -2179,10 +2200,30 @@ const SPLIT_NL = "'\n'";
 const ACCEPT_WAITING_STATUS = 'ждёт_приёмки';
 const ACCEPT_ACCEPTED_STATUS = 'принята';
 const ACCEPT_REJECTED_STATUS = 'отклонена';
-// The founder's brief named a 90-minute window; the run's own job cap is also
-// 90 minutes, so the default only fits when the work itself was short. Both are
-// env-overridable because the honest fix is per-run, not per-code.
-const ACCEPTANCE_WINDOW_MINUTES = Number(process.env.ACCEPTANCE_WINDOW_MINUTES) || 90;
+// Overdue: the window closed with no decision. NOT 'провал_фатальный' and NOT
+// rolled back - the two are different problems. A rejection is a decision (the
+// work is wrong: destroy it); a silence is not (the work may be right and the
+// owner simply has not looked yet: destroying it would throw away the whole
+// attempt on the strength of nobody answering). The row therefore sits in its
+// own status, outside both the dispatcher's SELECT and the retry budget, until
+// a human makes a decision.
+const ACCEPT_OVERDUE_STATUS = 'ждёт_приёмки_просрочено';
+// JOB CAP, 2026-11-10 (founder's brief, Plexus's acceptance-gate blockers):
+// the run's total budget and the acceptance window are now named constants
+// instead of a number that lived only in a workflow comment.
+//   JOB_CAP_MINUTES (180) is the whole run - work AND waiting.
+//   ACCEPTANCE_WINDOW_MINUTES (60) is what is left for a decision once the work
+//   itself has finished staging.
+// The arithmetic the founder stated: the slowest single unit of work is ~120
+// minutes, and 180 - 120 = 60, so the window survives even that. Before this
+// change the window defaulted to the same 90 minutes the whole run was capped
+// at, which made the two numbers compete: a long task could consume the entire
+// budget before anyone was asked anything.
+// The constant is only honest if the runner agrees - executor.yml's
+// `timeout-minutes` is raised to the same 180 in this change, because GitHub
+// kills the job there regardless of what this file says.
+const JOB_CAP_MINUTES = 180;
+const ACCEPTANCE_WINDOW_MINUTES = 60;
 const ACCEPTANCE_WAIT_MS = ACCEPTANCE_WINDOW_MINUTES * 60 * 1000;
 const ACCEPTANCE_POLL_MS = Number(process.env.ACCEPTANCE_POLL_MS) || 30000;
 
@@ -2223,7 +2264,15 @@ function briefTitle(text) {
 // Neither source grants the whole tree. Every candidate is filtered to paths
 // that exist as regular files inside the work directory, so a typo, a branch
 // name in backticks or a directory cannot silently widen the commit.
-function artifactFileList(taskText, resultText) {
+// The BRIEF's own declaration, and only that.
+//
+// Split out of artifactFileList on 2026-11-10 for one reason: the
+// AGENT-PUSHED-OUTSIDE-MANIFEST check has to ask "did the brief authorise
+// these files?" - a question the agent must not be able to answer about itself.
+// Anything the agent's own report says is therefore excluded here; the agent's
+// paths stay usable for STAGING files it wrote, but they cannot authorise an
+// agent-made commit.
+function briefManifest(taskText) {
   const out = [];
   const seen = new Set();
   const add = (token) => {
@@ -2245,14 +2294,55 @@ function artifactFileList(taskText, resultText) {
   while ((m = manifestRe.exec(brief)) !== null) {
     for (const tok of m[1].split(/[\s,;]+/)) add(tok);
   }
+  return out;
+}
+
+// The paths the agent's own report names. These are enough to STAGE files the
+// agent wrote (that is what the fallback is for) and never enough to authorise
+// a commit the agent made itself.
+function reportFileList(resultText) {
+  const out = [];
+  const seen = new Set();
+  const add = (token) => {
+    let v = String(token == null ? "" : token).trim();
+    v = v.replace(/^[`"'(\[{]+/, "").replace(/[`"')\]},;:.\/]+$/, "");
+    if (!v) return;
+    if (v.startsWith("-")) return;
+    if (v.includes("..")) return;
+    if (/\/$/.test(v)) return;
+    if (/[*?]/.test(v)) return;
+    if (v.length > 400) return;
+    if (seen.has(v)) return;
+    seen.add(v);
+    out.push(v);
+  };
   const report = String(resultText || "");
   const tickRe = /`([^`\n]+)`/g;
+  let m;
   while ((m = tickRe.exec(report)) !== null) add(m[1]);
   const labeledRe = /^[ \t>*-]*(?:files?|paths?|created|modified|added|edited|artifacts?)[ \t]*:[ \t]*(.+)$/gim;
   while ((m = labeledRe.exec(report)) !== null) {
     for (const tok of m[1].split(/[\s,;]+/)) add(tok);
   }
   return out;
+}
+
+// What staging is allowed to add: the brief's manifest first, the agent's
+// report second. (The two are deliberately separate functions above - the split
+// is not cosmetic.)
+function artifactFileList(taskText, resultText) {
+  return [...briefManifest(taskText), ...reportFileList(resultText)];
+}
+
+// The files the agent's own commit introduced, as plain paths. Used by the
+// AGENT-PUSHED-OUTSIDE-MANIFEST check: `git diff --name-only <pass start> HEAD`
+// is the exact set the commit added on top of the tree the executor found.
+function filesAddedSince(preWorkSha, dir) {
+  if (!preWorkSha) return [];
+  try {
+    return execSync(`git diff --name-only ${preWorkSha} HEAD`, { cwd: dir, stdio: "pipe" })
+      .toString().trim().split("\n").map((s) => s.trim()).filter(Boolean);
+  } catch { return []; }
 }
 
 // Keep only the manifest entries that are real files in `dir`. A manifest entry
@@ -2335,13 +2425,40 @@ function stageTaskArtifacts(taskText, preWorkSha, resultText) {
       // during this pass, that commit IS the artifact: gate it, and push it
       // only if the founder accepts.
       if (preWorkSha && headNow && preWorkSha !== headNow) {
+        // The agent committed its own work. A commit is the artifact, and it is
+        // gated like any other - but an agent running under
+        // DSH_PERMISSION_MODE=danger-full-access can also PUSH on its own, which
+        // would make the whole gate advisory. So the commit's file list is
+        // checked against what the BRIEF declared.
+        //
+        // Only the brief's MANIFEST:/FILES: lines count here, not the agent's
+        // own report: a check the agent can satisfy by naming its own work is
+        // not a check. A brief that declares no manifest therefore has no
+        // lawful agent commit at all - the agent stages files and lets the
+        // executor commit them, which is the shape the manifest rule already
+        // expects (queue-engine/AGENTS.md section 5).
         if (!branchNow) {
-          lastArtifactPushReason = `the agent's own commit ${headNow.slice(0, 8)} cannot be pushed: HEAD is detached, so there is no branch to accept against`;
+          lastArtifactPushReason = `AGENT-PUSHED-OUTSIDE-MANIFEST: the agent's own commit ${headNow.slice(0, 8)} moved HEAD, but HEAD is detached - there is no branch to accept against, and an unmanifesged commit cannot be gated`;
+          rollbackLocalWork(preWorkSha, WORKDIR);
           console.log(`[${new Date().toISOString()}] stage: FAILED - ${lastArtifactPushReason}`);
-          return { ok: false, reason: lastArtifactPushReason };
+          return { ok: false, reason: lastArtifactPushReason, violation: "AGENT-PUSHED-OUTSIDE-MANIFEST" };
         }
-        console.log(`[${new Date().toISOString()}] stage: the agent's own commit ${headNow.slice(0, 8)} on ${branchNow} - staged for acceptance, not pushed`);
-        return { ok: true, needsGate: true, branch: branchNow, stagedSha: headNow, source: "the agent's own commit" };
+        const declared = briefManifest(taskText);
+        const added = filesAddedSince(preWorkSha, WORKDIR);
+        const declaredSet = new Set(declared);
+        const outside = added.filter((f) => !declaredSet.has(f));
+        if (declared.length === 0 || outside.length > 0) {
+          const landedAlready = commitReachedOrigin(branchNow, WORKDIR);
+          rollbackLocalWork(preWorkSha, WORKDIR);
+          const detail = declared.length === 0
+            ? `the brief declares no MANIFEST:/FILES: list, so no agent-made commit is lawful (the agent stages its files and the executor commits them)`
+            : `${outside.length} committed file(s) are outside the brief's manifest: ${outside.slice(0, 5).join(", ")}${outside.length > 5 ? ", ..." : ""}`;
+          lastArtifactPushReason = `AGENT-PUSHED-OUTSIDE-MANIFEST: the agent's own commit ${headNow.slice(0, 8)} moved HEAD on ${branchNow}, but ${detail}${landedAlready ? ` - and that commit ALREADY reached origin/${branchNow} (${String(landedAlready).slice(0, 8)}): rollbackLocalWork() resets the local tree only, it cannot recall a commit from GitHub` : ""}`;
+          console.log(`[${new Date().toISOString()}] stage: FAILED - ${lastArtifactPushReason}`);
+          return { ok: false, reason: lastArtifactPushReason, violation: "AGENT-PUSHED-OUTSIDE-MANIFEST" };
+        }
+        console.log(`[${new Date().toISOString()}] stage: the agent's own commit ${headNow.slice(0, 8)} on ${branchNow} is inside the brief's manifest (${added.length} file(s)) - staged for acceptance, not pushed`);
+        return { ok: true, needsGate: true, branch: branchNow, stagedSha: headNow, source: "the agent's own commit", manifest: added };
       }
       // COMMIT-VERIFICATION FIX 1 (unchanged): an empty tree is NOT success.
       lastArtifactPushReason = `no artifacts: git status --porcelain is empty in ${WORKDIR} and HEAD did not move during this pass (${preWorkSha ? preWorkSha.slice(0, 8) : "no starting SHA"}), so nothing was staged and the task did not declare [NO-ARTIFACT]`;
@@ -2401,6 +2518,27 @@ async function pushTaskArtifacts(taskText, preWorkSha, resultText) {
   if (!staged.needsGate) return true;
   const landed = await pushAcceptedArtifacts(staged.branch, WORKDIR);
   return landed ? true : false;
+}
+
+// The gate's verdict, on its own so the mapping can be executed rather than
+// eyeballed. A human decision is not an input to classifyFailure (that function
+// reads a provider's error text), and this mapping is exactly where an overdue
+// window differs from a rejection:
+//   'принята' + verified push -> 'готова'
+//   accepted but the push did not verify -> 'провал_фатальный' (NOT 'готова';
+//       retry metadata is not written either - the work is local and the
+//       founder already said yes, so a fresh run would lose that answer)
+//   timeout, no decision at all -> ACCEPT_OVERDUE_STATUS, its own state, so a
+//       silence can never be mistaken for a rejection
+//   rejected / park failed / row moved -> 'провал_фатальный' (the caller rolls
+//       the work back)
+// A null return means "no gate ran", and run() falls through to the ordinary
+// verdict path.
+function gateVerdict(gateOutcome, result) {
+  if (!gateOutcome) return null;
+  if (gateOutcome.outcome === ACCEPT_ACCEPTED_STATUS && result && result.success) return 'готова';
+  if (gateOutcome.outcome === "timeout") return ACCEPT_OVERDUE_STATUS;
+  return 'провал_фатальный';
 }
 
 // Wait for the founder's decision by polling the task's own row. `readStatus`
@@ -2811,7 +2949,7 @@ const MAX_OUTPUT = 60000;
 // 2026-10-25 (founder brief, intra-provider rotation): lowered 40 -> 20.
 // With models rotating inside a provider and providers rotating after
 // that, 40 min for the FIRST attempt left no room for a second one inside
-// the job cap. Now the job cap is 90 min (executor.yml) and one attempt
+// the job cap. Now the job cap is JOB_CAP_MINUTES (180 min, executor.yml) and one attempt
 // is 20 min, so a task can genuinely burn through several
 // model/provider pairs before the runner itself is killed - the same
 // reason the job cap was raised in the same change.
@@ -3798,7 +3936,7 @@ async function runDshOnce(provider, text, model) {
       // segments, so it needs the recent tail, not the first bytes of a
       // 20-minute run.
       let reasoning = "";
-      // Job-level cap in executor.yml is 90 min total (2026-10-25, was 50).
+      // Job-level cap in executor.yml is JOB_CAP_MINUTES (180 min total, 2026-11-10, was 90).
       // 2026-10-21 (task-110 chain, founder's call): single-attempt window
       // raised 8 -> 20 min so a real task can finish on one provider
       // instead of dying at the 8-min mark. 2026-10-24 (founder brief,
@@ -4924,6 +5062,13 @@ export {
   pushTaskArtifacts,
   stageTaskArtifacts,
   pushAcceptedArtifacts,
+  briefManifest,
+  reportFileList,
+  filesAddedSince,
+  gateVerdict,
+  ACCEPT_OVERDUE_STATUS,
+  JOB_CAP_MINUTES,
+  ACCEPTANCE_WINDOW_MINUTES,
   waitForAcceptance,
   rollbackLocalWork,
   readTaskStatus,
