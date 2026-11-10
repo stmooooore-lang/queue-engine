@@ -1841,9 +1841,15 @@ async function run() {
           // that does not exist yet. What IS preserved here is the trace: the
           // commit sha, the branch, the file list, and the pass-start sha, so
           // the work can be re-found and re-made rather than only remembered.
+          // The work must survive this process, so it goes to a ref of its own.
+          // NOT to the working branch: that is the whole point of the gate. The
+          // target branch is written only after 'принята' (see the merge plan in
+          // docs/DECISIONS.md, PENDING-BRANCH-MERGE).
+          const pendingRef = pendingBranchName(taskId);
+          const preserved = await pushPendingBranch(taskId, WORKDIR);
           result.success = false;
-          result.message = `ACCEPTANCE-GATE OVERDUE: ${outcome.reason}. Локальный коммит ${String(staged.stagedSha || "").slice(0, 8)} на ${staged.branch} НЕ откатывался и НЕ отправлялся в origin (раннер эфемерный: коммит живёт, только пока идёт прогон). Файлы коммита: ${(staged.manifest || []).slice(0, 10).join(", ") || "(см. лог)"}${(staged.manifest || []).length > 10 ? ", ..." : ""}. Требуется решение основателя. Agent's own report was: ${result.message}`;
-          console.log(`[${new Date().toISOString()}] acceptance-gate: task ${taskId} is now '${ACCEPT_OVERDUE_STATUS}' - commit ${String(staged.stagedSha || "").slice(0, 8)} on ${staged.branch} kept, not pushed, not rolled back`);
+          result.message = `ACCEPTANCE-GATE OVERDUE: ${outcome.reason}. Локальный коммит ${String(staged.stagedSha || "").slice(0, 8)} на ${staged.branch} НЕ откатывался. ${preserved ? `Сохранён в origin/${pendingRef} (${String(preserved).slice(0, 8)}, проверено на origin) - рабочая ветка ${staged.branch} не тронута. Слияние: см. docs/DECISIONS.md, PENDING-BRANCH-MERGE.` : `СОХРАНИТЬ НЕ УДАЛОСЬ: ${lastArtifactPushReason || "pending push did not complete"} - раннер эфемерный, коммит умирает вместе с прогоном.`} Файлы коммита: ${(staged.manifest || []).slice(0, 10).join(", ") || "(см. лог)"}${(staged.manifest || []).length > 10 ? ", ..." : ""}. Требуется решение основателя. Agent's own report was: ${result.message}`;
+          console.log(`[${new Date().toISOString()}] acceptance-gate: task ${taskId} is now '${ACCEPT_OVERDUE_STATUS}' - commit ${String(staged.stagedSha || "").slice(0, 8)} on ${staged.branch} kept, ${preserved ? `preserved in origin/${pendingRef}, the working branch untouched` : "NOT preserved (the pending push failed)"}, not rolled back`);
         } else {
           // 'отклонена', or the row moved on its own: a decision was made, or
           // the row is no longer ours to wait on. Nothing was pushed, so roll
@@ -2179,9 +2185,12 @@ const SPLIT_NL = "'\n'";
 //   4. waitForAcceptance(): polls the row for up to ACCEPTANCE_WINDOW_MINUTES;
 //        'принята'    -> pushAcceptedArtifacts (push + commitReachedOrigin) -> 'готова'
 //        'отклонена'          -> rollbackLocalWork -> 'провал_фатальный'
-//        timeout (no decision) -> ACCEPT_OVERDUE_STATUS, NO rollback: the work
-//                                 stays where it is and a human has to decide
-//                                 what happens to it
+//        timeout (no decision) -> the commit is pushed to its OWN ref
+//                                 `pending/task-<id>` (never to the working
+//                                 branch) and the row becomes
+//                                 ACCEPT_OVERDUE_STATUS - see
+//                                 pushPendingBranch() and the merge plan
+//                                 (docs/DECISIONS.md, PENDING-BRANCH-MERGE)
 //   5. Fail-closed is unchanged: an empty tree, or a push that did not verify
 //      on origin, is 'провал' and never 'готова'.
 //
@@ -2192,6 +2201,10 @@ const SPLIT_NL = "'\n'";
 //     is never shortened by the work that preceded it; if a pass somehow runs
 //     past the cap the runner kills it and the crash guard books 'провал'
 //     (retryable - the brief is fine, the pass just died);
+//   - a timeout is preserved, not destroyed: the commit goes to
+//     `pending/task-<id>`, a ref of its own, so the runner's death costs nothing.
+//     The working branch is never written this way - that is still the
+//     acceptance's job, and that is the whole point of the separation;
 //   - rollbackLocalWork() does `git reset --hard` and deliberately NOT `git
 //     clean`: untracked files the agent never staged stay behind. They die with
 //     the runner and were never pushed, so deleting a stranger's files to tidy
@@ -2508,6 +2521,54 @@ async function pushAcceptedArtifacts(branch, dir) {
   }
   console.log(`[${new Date().toISOString()}] push: accepted - ${String(landed).slice(0, 8)} on origin/${branch}, verified against the remote ref`);
   return landed;
+}
+
+// PUSH-AFTER-ACCEPTANCE, blocker 3 (founder's brief 2026-11-10): a window that
+// expires with no decision used to leave the work only in the runner - and the
+// runner is ephemeral, so the work died with it. It is now pushed to a
+// SEPARATE ref namespace, `pending/task-<id>`, and never to the working branch.
+//
+// This is the one place in this file where a push happens without an
+// acceptance, and it is deliberately narrow:
+//   - the target branch is never written - `pending/` is a different namespace,
+//     so the branch the canon and the repo read stays exactly as it was;
+//   - only the timeout path does this. A REJECTION still rolls the work back
+//     and pushes nothing, because a rejection is a decision and a silence is not;
+//   - the ref is named after the task, so it is findable by a human without a
+//     query, and deletable with `git push origin :refs/heads/pending/task-<id>`.
+// The merge back is a founder decision, documented in docs/DECISIONS.md
+// (PENDING-BRANCH-MERGE) - this function only preserves, it never decides.
+function pendingBranchName(taskId) {
+  return `pending/task-${String(taskId).replace(/[^A-Za-z0-9_-]/g, "")}`;
+}
+
+// Push one commit into the task's pending ref and verify it landed. Returns the
+// remote SHA on success, or null (with lastArtifactPushReason set) on failure -
+// a failed preservation is NOT a reason to fail the task: the row still becomes
+// overdue, and the recorded result says the work is gone.
+async function pushPendingBranch(taskId, dir) {
+  const ref = pendingBranchName(taskId);
+  // Defence in depth, the same shape as pushBranch: a name built from an id
+  // that reached a shell command must be checked before it gets there.
+  if (!/^pending\/task-[A-Za-z0-9_-]+$/.test(ref)) {
+    lastArtifactPushReason = `refusing unsafe pending ref name ${JSON.stringify(ref)}`;
+    return null;
+  }
+  try {
+    execSync(`git push origin HEAD:${JSON.stringify(ref)}`, { cwd: dir, stdio: "pipe" });
+    const landed = commitReachedOrigin(ref, dir);
+    if (!landed) {
+      lastArtifactPushReason = `commit not on GitHub: origin refs/heads/${ref} does not point at local HEAD after the push - an exit-0 push whose ref never landed is indistinguishable from preservation`;
+      console.log(`[${new Date().toISOString()}] pending: FAILED - ${lastArtifactPushReason}`);
+      return null;
+    }
+    console.log(`[${new Date().toISOString()}] pending: ${String(landed).slice(0, 8)} pushed to origin/${ref} and verified against the remote ref (the working branch was not touched)`);
+    return landed;
+  } catch (err) {
+    lastArtifactPushReason = `pending push failed: ${redactSecrets(err.message)}`;
+    console.log(`[${new Date().toISOString()}] pending: FAILED - ${lastArtifactPushReason}`);
+    return null;
+  }
 }
 
 // Kept as the composition of the two halves, for callers that must not wait
@@ -5066,6 +5127,8 @@ export {
   reportFileList,
   filesAddedSince,
   gateVerdict,
+  pendingBranchName,
+  pushPendingBranch,
   ACCEPT_OVERDUE_STATUS,
   JOB_CAP_MINUTES,
   ACCEPTANCE_WINDOW_MINUTES,

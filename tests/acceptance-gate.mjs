@@ -382,6 +382,77 @@ function makeRepo(name, withRemote = true) {
     "the explicit exclusion is missing");
 }
 
+// --- O: a timeout preserves the work in its OWN ref (blocker 3, part 2) -----
+// The runner is ephemeral, so a work tree left behind dies with it. The work now
+// goes to `pending/task-<id>` - a different ref namespace from the working
+// branch, because a push that preserves must not become a push that publishes.
+{
+  const ex = await loadExecutor(makeRepo("pendingname"));
+  check("O1 the pending ref is named after the task",
+    ex.pendingBranchName(181) === "pending/task-181", ex.pendingBranchName(181));
+  check("O2 ...and an id that is not ref-safe is stripped, not passed to git",
+    ex.pendingBranchName("7; rm -rf /") === "pending/task-7rm-rf", ex.pendingBranchName("7; rm -rf /"));
+  check("O3 the empty id produces no ref at all",
+    ex.pendingBranchName("") === "pending/task-", ex.pendingBranchName(""));
+}
+{
+  // The preservation itself, against a real bare origin: origin/main (the
+  // working branch) must NOT move, and origin/pending/task-<id> must hold the
+  // commit exactly.
+  const dir = makeRepo("pendingpush");
+  fs.writeFileSync(path.join(dir, "artifact.md"), "the work\n");
+  const ex = await loadExecutor(dir);
+  const preWorkSha = sh("git rev-parse HEAD", dir);
+  const staged = ex.stageTaskArtifacts("[S14-20] triage notes into canon\nMANIFEST: artifact.md", preWorkSha, "");
+  const decision = await ex.waitForAcceptance(999, { deadlineMs: 0, pollMs: 1000, sleep: async () => {}, readStatus: async () => "ждёт_приёмки" });
+  const ref = ex.pendingBranchName(999);
+  const preserved = await ex.pushPendingBranch(999, dir);
+  check("O4 the window expired, so the work has to be preserved",
+    decision.outcome === "timeout" && /^[0-9a-f]{40}$/.test(String(preserved)), JSON.stringify(decision) + " preserved=" + preserved);
+  check("O5 ...and the preserved ref holds the committed SHA",
+    sh(`git rev-parse origin/${ref}`, dir) === staged.stagedSha,
+    `origin/${ref}=${sh(`git rev-parse origin/${ref}`, dir)} committed=${staged.stagedSha}`);
+  check("O6 ...and the WORKING branch did not move (no publish before acceptance)",
+    sh("git rev-parse origin/main", dir) === preWorkSha,
+    `origin/main=${sh("git rev-parse origin/main", dir)} pass start=${preWorkSha}`);
+  check("O7 ...and the local HEAD still sits on the working branch, not on pending",
+    sh("git branch --show-current", dir) === "main" && sh("git rev-parse HEAD", dir) === staged.stagedSha,
+    `branch=${sh("git branch --show-current", dir)}`);
+  check("O8 the preserved ref is findable without a query",
+    sh(`git ls-remote --heads origin | grep ${ref}`, dir).includes(ref), "");
+}
+{
+  // A failed preservation is reported, not hidden: the row still becomes
+  // overdue, and the recorded result says the work is gone rather than implying
+  // it was saved.
+  const dir = makeRepo("pendingfail");
+  fs.writeFileSync(path.join(dir, "artifact.md"), "the work\n");
+  const ex = await loadExecutor(dir);
+  const staged = ex.stageTaskArtifacts("[S14-20] triage notes into canon\nMANIFEST: artifact.md", sh("git rev-parse HEAD", dir), "");
+  sh("git remote remove origin", dir);
+  const preserved = await ex.pushPendingBranch(999, dir);
+  check("O9 with no remote, the preservation fails honestly",
+    preserved === null && /pending push failed/.test(ex.getLastArtifactPushReason() || ""),
+    `preserved=${preserved} reason=${ex.getLastArtifactPushReason()}`);
+  check("O10 ...and nothing was silently written anywhere",
+    sh("git branch --all", dir).split("\n").filter((l) => l.includes("pending")).length === 0, sh("git branch --all", dir));
+  check("O11 ...the failed attempt is not 'commit not on GitHub' (it never claimed to land)",
+    ex.getLastArtifactPushReason() !== null && !/commit not on GitHub/.test(ex.getLastArtifactPushReason()), ex.getLastArtifactPushReason());
+}
+{
+  // A rejection must NOT be preserved: a rejection is a decision, and the work
+  // it rejected has to disappear, which is exactly why the preservation is
+  // scoped to the timeout branch alone.
+  const ex = await loadExecutor(makeRepo("pendingreject"));
+  const rejected = await ex.waitForAcceptance(999, {
+    deadlineMs: 1000, pollMs: 1000, sleep: async () => {}, readStatus: async () => "отклонена",
+  });
+  check("O12 a rejection never reaches the preservation path",
+    rejected.outcome === "отклонена" && rejected.outcome !== "timeout", JSON.stringify(rejected));
+  check("O13 ...and the verdict a rejection gets is still 'провал_фатальный'",
+    ex.gateVerdict(rejected, { success: false }) === "провал_фатальный", ex.gateVerdict(rejected, { success: false }));
+}
+
 // --- K: the waiting row cannot be re-picked while it waits ------------------
 {
   const src = fs.readFileSync(dispatcherPath, "utf8");
