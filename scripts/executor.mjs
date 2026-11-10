@@ -25,7 +25,7 @@
 import { createClient } from "@libsql/client";
 import { spawn, execSync } from "node:child_process";
 import { writeFile, readFile, unlink, mkdir, readdir, stat, appendFile } from "node:fs/promises";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -901,6 +901,7 @@ async function uploadTaskCheckpointsAndArtifacts(taskId, options = {}) {
         const destDir = path.join(targetDir, "checkpoints");
         await mkdir(destDir, { recursive: true });
         const cpFiles = await readdir(dir);
+        const copiedFiles = [];
         for (const f of cpFiles) {
           const srcFile = path.join(dir, f);
           const destFile = path.join(destDir, f);
@@ -920,20 +921,28 @@ async function uploadTaskCheckpointsAndArtifacts(taskId, options = {}) {
 
     execSync("git config user.name 'queue-engine[bot]'", { cwd: targetDir, stdio: "pipe" });
     execSync("git config user.email 'queue-engine@users.noreply.github.com'", { cwd: targetDir, stdio: "pipe" });
-    execSync("git add -A", { cwd: targetDir, stdio: "pipe" });
 
     const modeLabel = isPartial ? "partial checkpoint/artifact" : "completed artifacts";
-    const commitMsg = `task ${taskId} (${modeLabel}): ${status.split('\n')[0].slice(0, 50)}`;
-    execSync(`git commit -m "${commitMsg.replace(/"/g, '\"')}"`, { cwd: targetDir, stdio: "pipe" });
-
+    const manifest = [
+      ...copiedFiles.map((f) => `checkpoints/${f}`),
+      ...existingFilesIn(artifactFileList(options.taskText || "", options.resultText || ""), targetDir),
+    ];
+    const { staged } = stageFilesFromManifest(manifest, targetDir);
     const branch = execSync("git branch --show-current", { cwd: targetDir, stdio: "pipe" }).toString().trim();
-    if (branch) {
-      await pushBranch(branch, targetDir);
-      console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: committed and pushed ${status.split('\n').length} file(s) (${modeLabel}) to origin/${branch}`);
-    } else {
+    if (!branch) {
       console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: detached HEAD or no branch, committed locally only`);
+      return false;
     }
+    const sha = commitTaskArtifacts(options.taskText || "", taskId, targetDir);
+    await pushBranch(branch, targetDir);
+    const landed = commitReachedOrigin(branch, targetDir);
+    if (!landed) {
+      console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: commit is not on GitHub: origin refs/heads/${branch} does not point at local HEAD (${lastArtifactPushReason || "no reason recorded"})`);
+      return false;
+    }
+    console.log(`[${new Date().toISOString()}] ARTIFACT_UPLOAD: committed and pushed ${sha.slice(0, 8)} ("task ${taskId}: ${briefTitle(options.taskText || "")}") to origin/${branch}, verified`);
     return true;
+
   } catch (err) {
     // CLOUD-MAINT-c-e: git push failures echo the remote URL, and in CI that
     // URL is routinely built from REPO_TOKEN - redact before printing.
@@ -1744,13 +1753,13 @@ async function run() {
   }
   const workEnd = Date.now();
 
-  // Push artifacts to origin BEFORE marking task as done.
+  // Push the artifacts to origin, then let the verdict be written.
   //
   // The task's own text goes in: pushTaskArtifacts has to know whether the
   // brief declared [NO-ARTIFACT], or an empty working tree is
   // indistinguishable from an agent that worked in the wrong directory.
   if (result.success) {
-    const pushed = await pushTaskArtifacts(task.text, preWorkSha);
+    const pushed = await pushTaskArtifacts(task.text, preWorkSha, result.message);
     if (!pushed) {
       // COMMIT-VERIFICATION: name the real reason. Until 2026-11-09 every push
       // failure read "Artifact push to origin failed: <the agent's own last
@@ -2044,98 +2053,257 @@ function getLastArtifactPushReason() { return lastArtifactPushReason; }
 // that a review could mistake for a real line break.
 const SPLIT_NL = "'\n'";
 
-async function pushTaskArtifacts(taskText, preWorkSha) {
-  // preWorkSha: HEAD as it was BEFORE this pass ran any work (captured by run()).
-  // It tells "clean tree" apart from "no work": an agent that committed its own
-  // work leaves a clean tree too, and that tree is proof of an artifact, not of
-  // its absence (live finding, task 178: its commit landed, the tree was clean,
-  // and FIX 1's empty-tree branch called it "no artifacts").
-  // The task text arrives as a parameter: deciding "was any artifact even
-  // expected?" needs the brief, and the caller is the place that has it.
+// ---------------------------------------------------------------------------
+// STAGING CONTRACT (PUSH-AFTER-ACCEPTANCE, BACKLOG item 3, Step 1, 2026-11-10)
+//
+// Until 2026-11-10 this file staged artifacts with `git add -A` and built the
+// commit message from the first line of `git status --porcelain`, which is why
+// plexus-doc carries commits like "task 172: ?? notes/" and "task 164: M
+// canon/content/bundle-language.md" - what read as a careless author was a
+// machine signature. Both are replaced here: the files come from a manifest
+// (the brief's own MANIFEST/FILES line, or the paths named in the agent's
+// report), and the message is `task <N>: <brief title>`.
+//
+// The push that follows a staged commit, and the verification that it reached
+// origin, are unchanged - COMMIT-VERIFICATION FIX 2 still reads the remote's
+// own ref back and refuses an exit-0 push whose ref never landed.
+//
+// The acceptance gate that decides WHEN the push may happen waits for the
+// founder's decision and lives in run(); the wait has to be inside the run
+// because a GitHub Actions runner is ephemeral, and a commit left waiting for a
+// decision between runs dies with the runner.
+// ---------------------------------------------------------------------------
+// Commit title: the first meaningful line of the brief, markers stripped.
+//
+// Until 2026-11-10 the message was the first line of `git status --porcelain`
+// truncated to 50 characters, which is why plexus-doc carries commits like
+// "task 172: ?? notes/" and "task 164: M canon/content/bundle-language.md" -
+// what read as a careless author was in fact a machine signature. The title
+// now comes from the brief the author actually wrote; the file list lives in
+// the diff, which is where it was always inspectable.
+function briefTitle(text) {
+  for (const raw of String(text || "").split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    // Marker blocks ([NO-TRIAGE], [BRANCH: x], [NO-ARTIFACT], ...) are the
+    // brief's syntax, not its title.
+    const title = line.replace(/\[[^\]]*\]/g, " ").replace(/[`#>*_~]/g, " ").replace(/\s+/g, " ").trim();
+    if (title) return title.replace(/:$/, "").slice(0, 72).trim();
+  }
+  return "artifact push";
+}
+
+// The artifact manifest: which files this task is allowed to put in a commit.
+//
+// Before 2026-11-10 staging was `git add -A`, so every commit also carried
+// whatever else was lying in the work tree - the stray .bin files, the
+// CHECKPOINT_DIR copies, half-written scratch. That is how a single task's push
+// came to contain files no brief ever named (DECISIONS.md, the push audit).
+//
+// Sources, in order of seniority:
+//   1. an explicit manifest in the brief - a "MANIFEST:"/"FILES:"/"ARTIFACTS:"
+//      line, written by the brief's author, which is what the posting rules
+//      already demand;
+//   2. otherwise the file paths named in the agent's own report (result text):
+//      backticked paths, or paths behind "File(s)/Path/Created/Modified/Added".
+//
+// Neither source grants the whole tree. Every candidate is filtered to paths
+// that exist as regular files inside the work directory, so a typo, a branch
+// name in backticks or a directory cannot silently widen the commit.
+function artifactFileList(taskText, resultText) {
+  const out = [];
+  const seen = new Set();
+  const add = (token) => {
+    let v = String(token == null ? "" : token).trim();
+    v = v.replace(/^[`"'(\[{]+/, "").replace(/[`"')\]},;:.]+$/, "");
+    if (!v) return;
+    if (v.startsWith("-")) return;      // never a command-line-looking token
+    if (v.includes("..")) return;       // never a path leaving the tree
+    if (/\/$/.test(v)) return;          // a trailing slash names a directory, and `git add -- dir` sweeps the tree
+    if (/[*?]/.test(v)) return;         // no globs: we stage names, not patterns
+    if (v.length > 400) return;
+    if (seen.has(v)) return;
+    seen.add(v);
+    out.push(v);
+  };
+  const brief = String(taskText || "");
+  const manifestRe = /^[ \t>*-]*(?:manifest|files?|artifacts?)[ \t]*:[ \t]*(.+)$/gim;
+  let m;
+  while ((m = manifestRe.exec(brief)) !== null) {
+    for (const tok of m[1].split(/[\s,;]+/)) add(tok);
+  }
+  const report = String(resultText || "");
+  const tickRe = /`([^`\n]+)`/g;
+  while ((m = tickRe.exec(report)) !== null) add(m[1]);
+  const labeledRe = /^[ \t>*-]*(?:files?|paths?|created|modified|added|edited|artifacts?)[ \t]*:[ \t]*(.+)$/gim;
+  while ((m = labeledRe.exec(report)) !== null) {
+    for (const tok of m[1].split(/[\s,;]+/)) add(tok);
+  }
+  return out;
+}
+
+// Keep only the manifest entries that are real files in `dir`. A manifest entry
+// that names something absent, or a directory, is not staged: `git add --` on a
+// directory would sweep the tree, which is the thing being removed.
+function existingFilesIn(files, dir) {
+  const kept = [];
+  for (const f of files) {
+    try {
+      if (statSync(path.join(dir, f)).isFile()) kept.push(f);
+    } catch { /* absent, or unreadable: not staged */ }
+  }
+  return kept;
+}
+
+// Stage exactly these paths and report what did not stage.
+function stageFilesFromManifest(files, dir) {
+  const staged = [];
+  const skipped = [];
+  for (const f of files) {
+    try {
+      // `--` plus a JSON-quoted value: no token can be read as a flag, and no
+      // quote in a path can break out of the command.
+      execSync(`git add -- ${JSON.stringify(f)}`, { cwd: dir, stdio: "pipe" });
+      staged.push(f);
+    } catch { skipped.push(f); }
+  }
+  return { staged, skipped };
+}
+
+// The local commit. NO push happens here - that is the whole point of the gate:
+// this is the artifact, and pushing it is the founder's decision.
+function commitTaskArtifacts(taskText, taskId, dir) {
+  execSync("git config user.name 'queue-engine[bot]'", { cwd: dir, stdio: "pipe" });
+  execSync("git config user.email 'queue-engine@users.noreply.github.com'", { cwd: dir, stdio: "pipe" });
+  const commitMsg = `task ${taskId}: ${briefTitle(taskText)}`;
+  execSync(`git commit -m ${JSON.stringify(commitMsg)}`, { cwd: dir, stdio: "pipe" });
+  return execSync("git rev-parse HEAD", { cwd: dir, stdio: "pipe" }).toString().trim();
+}
+
+// Everything that can be learned about the branch/HEAD without dying: a repo
+// with no commit at all makes `rev-parse HEAD` throw, and that must land on "no
+// artifacts", not on the generic "push failed" catch.
+function currentBranchAndHead(dir) {
+  let branch = "";
+  let head = "";
+  try {
+    branch = execSync("git branch --show-current", { cwd: dir, stdio: "pipe" }).toString().trim();
+    head = execSync("git rev-parse HEAD", { cwd: dir, stdio: "pipe" }).toString().trim();
+  } catch { branch = ""; head = ""; }
+  return { branch, head };
+}
+
+// Stage the artifacts WITHOUT pushing. Returns:
+//   { ok:false, reason }         - nothing stageable: fail closed, no gate
+//   { ok:true, needsGate:false } - the brief declared [NO-ARTIFACT]: a text
+//                                  report is the artifact and there is nothing
+//                                  to put on origin, so no push - and no gate -
+//                                  applies. The marker stays an escape hatch
+//                                  from a FILE artifact, not from the push.
+//   { ok:true, needsGate:true, branch, stagedSha, source } - a local commit
+//                                  exists and must be accepted before pushing.
+function stageTaskArtifacts(taskText, preWorkSha, resultText) {
   const declaredNoArtifact = briefDeclaresNoArtifact(taskText);
-  // A brief that quotes the rule without declaring it must not get a silent
-  // pass: the run log names it, so a posting defect is visible instead of
-  // becoming an invisible 'готова' with nothing behind it.
   if (!declaredNoArtifact && mentionsNoArtifactMarker(taskText)) {
-    console.log(`[${new Date().toISOString()}] push: WARNING - brief mentions [NO-ARTIFACT] but does not declare it in the marker block; the escape hatch is NOT armed for this task`);
+    console.log(`[${new Date().toISOString()}] push: WARNING - brief mentions [NO-ARTIFACT] but does not declare it in the marker block - the escape hatch is NOT armed`);
   }
   try {
-    const status = execSync("git status --porcelain", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
-    if (!status) {
+    const treeStatus = execSync("git status --porcelain", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
+    const { branch: branchNow, head: headNow } = currentBranchAndHead(WORKDIR);
+
+    if (!treeStatus) {
       if (declaredNoArtifact) {
-        console.log(`[${new Date().toISOString()}] push: no changes in ${WORKDIR}, but task declared [NO-ARTIFACT] - treating as complete`);
-        return true;
+        console.log(`[${new Date().toISOString()}] stage: [NO-ARTIFACT] declared and the tree is clean - the report is the artifact, nothing to push and no gate`);
+        return { ok: true, needsGate: false, branch: branchNow, stagedSha: headNow, reason: "brief declared [NO-ARTIFACT]; no file artifact, so no push and no gate" };
       }
-      // A clean tree is not proof that nothing was done: the agent may have
-      // committed its own work (the brief told it to, and "ONE TASK, ONE
-      // BRANCH" says to work in the branch). Ask whether HEAD moved since this
-      // pass started. If it did, the artifact is the commit - push it and
-      // verify it on origin, exactly like a commit made here. Task 178 (live,
-      // 2026-11-10) landed its own commit on origin/cursor-build while this
-      // branch was calling the tree "no artifacts".
-      // Both reads are guarded: a repo with no commit at all (a bare checkout
-      // that never had one) makes `rev-parse HEAD` throw, and that must land on
-      // "no artifacts" below, not on the generic "push failed" catch.
-      let branchNow = "";
-      let headNow = "";
-      try {
-        branchNow = execSync("git branch --show-current", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
-        headNow = execSync("git rev-parse HEAD", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
-      } catch { branchNow = ""; headNow = ""; }
+      // A clean tree is not proof that nothing happened: the agent may have
+      // committed its own work (live finding, task 178 - its commit landed
+      // while this branch was calling the tree "no artifacts"). If HEAD moved
+      // during this pass, that commit IS the artifact: gate it, and push it
+      // only if the founder accepts.
       if (preWorkSha && headNow && preWorkSha !== headNow) {
-        const agentPush = await pushBranch(branchNow, WORKDIR);
-        const agentLanded = commitReachedOrigin(branchNow, WORKDIR);
-        if (agentLanded) {
-          console.log(`[${new Date().toISOString()}] push: the agent's own commit ${headNow.slice(0, 8)} on origin/${branchNow} (${agentPush}), verified on origin ${agentLanded.slice(0, 8)}`);
-          return true;
+        if (!branchNow) {
+          lastArtifactPushReason = `the agent's own commit ${headNow.slice(0, 8)} cannot be pushed: HEAD is detached, so there is no branch to accept against`;
+          console.log(`[${new Date().toISOString()}] stage: FAILED - ${lastArtifactPushReason}`);
+          return { ok: false, reason: lastArtifactPushReason };
         }
-        lastArtifactPushReason = `the agent's own commit ${headNow.slice(0, 8)} is not on GitHub: origin refs/heads/${branchNow} does not point at local HEAD after push`;
-        console.log(`[${new Date().toISOString()}] push: FAILED - ${lastArtifactPushReason}`);
-        return false;
+        console.log(`[${new Date().toISOString()}] stage: the agent's own commit ${headNow.slice(0, 8)} on ${branchNow} - staged for acceptance, not pushed`);
+        return { ok: true, needsGate: true, branch: branchNow, stagedSha: headNow, source: "the agent's own commit" };
       }
-      // COMMIT-VERIFICATION FIX 1: an empty tree is NOT success.
-      //
-      // Before 2026-11-09 this branch returned true, and 7 of 14 Task Executor
-      // runs that day (tasks 160, 162, 166, 167, 168, 171, 173) were marked
-      // 'готова' with zero commits on GitHub - the fake-done report Plexus
-      // measured. The log even printed "push: no changes in plexus-doc,
-      // skipping" one line above the 'готова': the line was honest, the
-      // verdict was not.
-      //
-      // Returning false reaches run() as `if (!pushed) result.success = false`,
-      // so the status is 'провал', never 'готова'. A task that genuinely needs
-      // no file change declares [NO-ARTIFACT] in its text (above), so silence
-      // means the agent produced nothing - a failure to report, not a result.
-      lastArtifactPushReason = `no artifacts: git status --porcelain is empty in ${WORKDIR} and HEAD did not move during this pass (${preWorkSha ? preWorkSha.slice(0, 8) : "no starting SHA"}), so no commit was made and the task did not declare [NO-ARTIFACT]`;
-      console.log(`[${new Date().toISOString()}] push: FAILED - ${lastArtifactPushReason}`);
-      return false;
+      // COMMIT-VERIFICATION FIX 1 (unchanged): an empty tree is NOT success.
+      lastArtifactPushReason = `no artifacts: git status --porcelain is empty in ${WORKDIR} and HEAD did not move during this pass (${preWorkSha ? preWorkSha.slice(0, 8) : "no starting SHA"}), so nothing was staged and the task did not declare [NO-ARTIFACT]`;
+      console.log(`[${new Date().toISOString()}] stage: FAILED - ${lastArtifactPushReason}`);
+      return { ok: false, reason: lastArtifactPushReason };
     }
-    execSync("git config user.name 'queue-engine[bot]'", { cwd: WORKDIR, stdio: "pipe" });
-    execSync("git config user.email 'queue-engine@users.noreply.github.com'", { cwd: WORKDIR, stdio: "pipe" });
-    execSync("git add -A", { cwd: WORKDIR, stdio: "pipe" });
-    const firstFile = status.split(SPLIT_NL)[0].slice(0, 50);
-    const commitMsg = `task ${process.env.TASK_ID}: ${firstFile}`;
-    execSync(`git commit -m "${commitMsg.replace(/"/g, '\"')}"`, { cwd: WORKDIR, stdio: "pipe" });
-    const branch = execSync("git branch --show-current", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
-    const pushResult = await pushBranch(branch, WORKDIR);
-    // COMMIT-VERIFICATION FIX 2: `git push` exiting 0 is not proof the commit
-    // is on GitHub. Ask the remote which SHA its ref actually holds and
-    // compare - an exit-0 push whose ref never landed is otherwise
-    // indistinguishable from a good one, which is the second half of the bug.
-    const landed = commitReachedOrigin(branch, WORKDIR);
-    if (!landed) {
-      lastArtifactPushReason = `commit not on GitHub: origin refs/heads/${branch} does not point at local HEAD after push`;
-      console.log(`[${new Date().toISOString()}] push: FAILED - ${lastArtifactPushReason}`);
-      return false;
+
+    // Dirty tree: stage the manifest, not the tree.
+    const manifest = existingFilesIn(artifactFileList(taskText, resultText), WORKDIR);
+    const { staged, skipped } = stageFilesFromManifest(manifest, WORKDIR);
+    const stagedNow = execSync("git diff --cached --name-only", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
+    if (!stagedNow) {
+      lastArtifactPushReason = `no artifacts: the work tree is dirty (${treeStatus.split(SPLIT_NL).length} change(s)) but the manifest matched no existing file (brief manifest + report paths: ${manifest.length === 0 && skipped.length === 0 ? "none named" : `staged ${staged.length}, skipped ${skipped.length}`}), so nothing was staged - 'git add -A' was removed from this path on 2026-11-10 and a commit is not made from an unnamed file set`;
+      console.log(`[${new Date().toISOString()}] stage: FAILED - ${lastArtifactPushReason}`);
+      return { ok: false, reason: lastArtifactPushReason };
     }
-    console.log(`[${new Date().toISOString()}] push: committed and pushed ${status.split(SPLIT_NL).length} file(s) to origin/${branch} (${pushResult}), verified on origin ${landed.slice(0, 8)}`);
-    return true;
+    if (!branchNow) {
+      lastArtifactPushReason = `staged ${stagedNow.split(SPLIT_NL).length} file(s) but HEAD is detached - there is no branch to accept against, so nothing was committed`;
+      console.log(`[${new Date().toISOString()}] stage: FAILED - ${lastArtifactPushReason}`);
+      return { ok: false, reason: lastArtifactPushReason };
+    }
+    const sha = commitTaskArtifacts(taskText, process.env.TASK_ID, WORKDIR);
+    const leftover = execSync("git status --porcelain", { cwd: WORKDIR, stdio: "pipe" }).toString().trim();
+    console.log(`[${new Date().toISOString()}] stage: committed ${stagedNow.split(SPLIT_NL).length} file(s) from the manifest as ${sha.slice(0, 8)} ("task ${process.env.TASK_ID}: ${briefTitle(taskText)}")${leftover ? `; ${leftover.split(SPLIT_NL).length} tree change(s) intentionally left out of the manifest` : ""}`);
+    return { ok: true, needsGate: true, branch: branchNow, stagedSha: sha, source: "manifest commit", manifest: staged };
   } catch (err) {
-    lastArtifactPushReason = `push failed: ${redactSecrets(err.message)}`;
+    lastArtifactPushReason = `stage failed: ${redactSecrets(err.message)}`;
+    console.log(`[${new Date().toISOString()}] stage: FAILED - ${lastArtifactPushReason}`);
+    return { ok: false, reason: lastArtifactPushReason };
+  }
+}
+
+// The push that the gate releases. COMMIT-VERIFICATION FIX 2 is unchanged and
+// stays here: `git push` exiting 0 is not proof the commit is on GitHub, so the
+// remote's own ref is read back and compared.
+async function pushAcceptedArtifacts(branch, dir) {
+  if (!branch) {
+    lastArtifactPushReason = "no branch to push: HEAD is detached";
+    return false;
+  }
+  const pushResult = await pushBranch(branch, dir);
+  const landed = commitReachedOrigin(branch, dir);
+  if (!landed) {
+    lastArtifactPushReason = `commit not on GitHub: origin refs/heads/${branch} does not point at local HEAD after push (push output: ${String(pushResult || "").split(SPLIT_NL)[0]}) - an exit-0 push whose ref never landed is otherwise indistinguishable from a good one`;
     console.log(`[${new Date().toISOString()}] push: FAILED - ${lastArtifactPushReason}`);
     return false;
   }
+  console.log(`[${new Date().toISOString()}] push: accepted - ${String(landed).slice(0, 8)} on origin/${branch}, verified against the remote ref`);
+  return landed;
 }
+
+// Kept as the composition of the two halves, for callers that must not wait
+// (tests, and any path where a human has already accepted by construction).
+async function pushTaskArtifacts(taskText, preWorkSha, resultText) {
+  const staged = stageTaskArtifacts(taskText, preWorkSha, resultText);
+  if (!staged.ok) return false;
+  if (!staged.needsGate) return true;
+  const landed = await pushAcceptedArtifacts(staged.branch, WORKDIR);
+  return landed ? true : false;
+}
+
+// Wait for the founder's decision by polling the task's own row. `readStatus`
+// and `sleep` are parameters so the loop can be tested without a live Turso
+// row and without real time passing.
+// Read the row's current status: this is the decision channel the gate waits
+// on. 'принята' means "the founder accepted this", 'отклонена' means "rejected";
+// both arrive from outside this process (a Telegram accept button, or a manual
+// UPDATE), which is the only way an acceptance can be somebody's decision
+// rather than the executor's own optimism. A thrown read is NOT a decision - it
+// is left to the caller, which keeps waiting rather than treating an outage as
+// a rejection.
+
+
+// Roll the work tree back to where this pass started. Tracks nothing: the
+// artifacts never left the runner, so there is nothing to unpick on origin.
 
 /**
  * COMMIT-VERIFICATION FIX 2 companion: does origin's ref for this branch point
@@ -4599,6 +4767,12 @@ export {
   getLastArtifactPushReason,
   releaseStuckTaskAfterCrash,
   pushTaskArtifacts,
+  stageTaskArtifacts,
+  pushAcceptedArtifacts,
+  briefTitle,
+  artifactFileList,
+  existingFilesIn,
+  stageFilesFromManifest,
   commitReachedOrigin,
   triageSplit,
   triageCheck,

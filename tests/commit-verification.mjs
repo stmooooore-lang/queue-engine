@@ -20,6 +20,11 @@
  *      never 'готова'. That is a decision made in taskVerdictFromResult(), so
  *      it is executed here rather than eyeballed.
  *   F. No regression: a real, pushed commit still ends up 'готова'.
+ *   Manifest staging, 2026-11-10 (PUSH-AFTER-ACCEPTANCE): `git add -A` is gone
+ *   from both staging paths, so every case that writes a file now names it in a
+ *   "MANIFEST:" line (or in the agent report passed as resultText). The gate
+ *   itself - stage, wait for 'принята', then push - is asserted separately in
+ *   tests/acceptance-gate.mjs.
  *
  * Everything runs against REAL git repositories created in a temp directory -
  * no mock of git, because the fake-done report was produced by a real git
@@ -133,7 +138,7 @@ console.log("=== EXECUTOR-COMMIT-VERIFICATION: artifact guard ===\n");
     `#!/bin/sh\ncat >> "${dir}/.git-remote-hook.log" <<EOF\nhook ran\nEOF\ngit update-ref refs/heads/main ${beforeSha}\n`,
     { mode: 0o755 });
   const ex = await loadExecutor(dir);
-  const pushed = await ex.pushTaskArtifacts("[S14-20] triage notes into canon");
+  const pushed = await ex.pushTaskArtifacts("[S14-20] triage notes into canon\nMANIFEST: dropped.txt");
   const reason = ex.getLastArtifactPushReason();
   check("C4 push exits 0 but the commit is NOT on GitHub -> pushTaskArtifacts() === false",
     pushed === false, `returned ${JSON.stringify(pushed)}; reason=${reason}`);
@@ -153,7 +158,7 @@ console.log("=== EXECUTOR-COMMIT-VERIFICATION: artifact guard ===\n");
   sh("git add -A && git commit -q -m seed && git push -q -u origin main", dir);
   const ex = await loadExecutor(dir);
   fs.writeFileSync(path.join(dir, "b.md"), "two\n");
-  const pushed = await ex.pushTaskArtifacts("[S14-20] triage notes into canon");
+  const pushed = await ex.pushTaskArtifacts("[S14-20] triage notes into canon\nMANIFEST: b.md");
   check("C7 a real push with a changed tree is still accepted (true)",
     pushed === true, `${JSON.stringify(pushed)}: ${ex.getLastArtifactPushReason()}`);
   check("C8 and the commit is verifiably on origin afterwards",
@@ -204,7 +209,7 @@ console.log("=== EXECUTOR-COMMIT-VERIFICATION: artifact guard ===\n");
   sh("git add -A && git commit -q -m seed && git push -q -u origin main", dir);
   const ex = await loadExecutor(dir);
   fs.writeFileSync(path.join(dir, "c.md"), "three\n");
-  const pushed = await ex.pushTaskArtifacts("[S14-20] real work");
+  const pushed = await ex.pushTaskArtifacts("[S14-20] real work\nMANIFEST: c.md");
   const status = ex.taskVerdictFromResult({ success: pushed === true, message: "" }, {
     verdict: { fatal: false, retryable: true }, isPermanentBlock: false, retryBudgetExhausted: false,
   });
