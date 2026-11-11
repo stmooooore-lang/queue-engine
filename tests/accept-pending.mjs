@@ -335,6 +335,33 @@ check("T22 credentials are masked in anything that reaches a log",
     result.ok === false && /TEST-BRANCH-UNVERIFIED/.test(JSON.stringify(result)), JSON.stringify(result));
 }
 
+// S: selection must not hand a merge a target it cannot honour.
+// A preserved violation with a detached head has target_branch = "" (there is
+// nothing to merge into), and defaulting that to "main" would publish the
+// violation into the branch it was about - so the selection skips it.
+{
+  const lister = await import("../scripts/list-accepted-pending.mjs");
+  const fakeClient = (rows) => ({ execute: async () => ({ rows }) });
+  const row = (id, meta) => ({ id, metadata: JSON.stringify(meta) });
+  check("S1 a preserved task with a named target is selected",
+    JSON.stringify(await lister.selectAcceptedPending(fakeClient([
+      row(181, { pending_branch: "pending/task-181", target_branch: "main" }),
+    ]))) === JSON.stringify([{ id: 181, targetBranch: "main", pendingBranch: "pending/task-181" }]),
+    JSON.stringify(await lister.selectAcceptedPending(fakeClient([row(181, { pending_branch: "pending/task-181", target_branch: "main" })]))));
+  check("S2 ...and one whose target was never recorded is NOT selected",
+    (await lister.selectAcceptedPending(fakeClient([
+      row(184, { pending_branch: "pending/task-184", target_branch: "" }),
+    ]))).length === 0,
+    JSON.stringify(await lister.selectAcceptedPending(fakeClient([row(184, { pending_branch: "pending/task-184", target_branch: "" })]))));
+  check("S3 ...and a target with no pending ref is not selected either",
+    (await lister.selectAcceptedPending(fakeClient([row(183, { target_branch: "main" })]))).length === 0, "");
+  check("S4 a task/<N> target IS selected (it is retired, not merged, by R above)",
+    JSON.stringify(await lister.selectAcceptedPending(fakeClient([
+      row(185, { pending_branch: "pending/task-185", target_branch: "task/185" }),
+    ]))) === JSON.stringify([{ id: 185, targetBranch: "task/185", pendingBranch: "pending/task-185" }]),
+    "");
+}
+
 say(`=== ${passed.length} passed, ${failed.length} failed ===`);
 for (const f of failed) console.log(`  FAIL  ${f.name}\n        ${String(f.detail).split("\n").slice(0, 14).join("\n        ")}`);
 process.exit(failed.length ? 1 : 0);

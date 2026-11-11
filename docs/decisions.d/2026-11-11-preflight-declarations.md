@@ -74,3 +74,32 @@ preserved-violation verdict), `accept-pending.mjs` 42/42 (group R is every
 `task/<N>` shape: verified-and-deleted, foreign branch left alone, unverifiable
 work closed by nobody), `commit-verification.mjs` 31/31,
 `accept-and-merge.mjs` 23/23.
+
+## Two holes the first pass left (closed in the same day, SHA after `166a06b`)
+
+5. **An import must never run main.** `list-accepted-pending.mjs` called
+   `process.exit()` at module top level, so merely importing it (a test, or a
+   future caller) killed the process with exit 7 and no way to tell why. The
+   same shape `accept-and-merge.mjs` already needed: compare
+   `path.resolve(process.argv[1])` against `fileURLToPath(import.meta.url)`,
+   because this checkout's path contains spaces and `import.meta.url`
+   percent-encodes them (`my%20work`) - a string comparison there fails
+   SILENTLY, which in `accept-and-merge.mjs` had produced an exit 0 that looked
+   exactly like a successful acceptance.
+6. **A detached-head violation has no target branch.** Preserving it is right,
+   but it is recorded with `target_branch = ""`, and the selection's
+   `metadata.target_branch || "main"` turned that empty string into "main" -
+   which would publish the violation into the very branch it was about.
+   `selectAcceptedPending()` now requires a NAMED target; an unrecorded one
+   means "a human names it first", and a `task/<N>` target is still selected
+   because `accept-pending.mjs` retires it instead of merging it. Live check:
+   no row in the queue currently holds a gate state, so nothing was affected
+   retroactively.
+
+Also fixed in the same pass: `zombie-guard.mjs`'s layer-1 task carried no
+declarations, so it stopped at the pre-flight before reaching the final write
+it exists to test; its brief now names both (group N tests cover the pre-flight
+itself). `tests/cloud_queue_contract.mjs --self-test` still fails on
+`checkoutTaskBranch should parse cursor-build directive` - pre-existing (its
+fake git transport answers `currentBranch: main`), verified by re-running the
+suite with my changes stashed.

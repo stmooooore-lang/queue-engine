@@ -105,7 +105,11 @@ check("a task that is NOT stuck in 'выполняется' is never rewritten",
 // LAYER 1 - the executor's own pass, crashing at its final write
 // ===========================================================================
 console.log("[layer 1] run(): final write fails -> minimal release, never a zombie");
-await db.execute({ sql: "INSERT INTO tasks (id, text, status, creator_id, lane) VALUES (?,?,?,?,?)", args: [903, "do the thing", "ожидает", "user1", "architect"] });
+// 2026-11-11: the brief carries the two pre-flight declarations. Without them
+// the pass now stops at briefDeclarationGaps() before any work runs, which is
+// the correct behaviour for a real queue and the wrong shape for this test -
+// layer 1 is about the FINAL write failing, not about the brief.
+await db.execute({ sql: "INSERT INTO tasks (id, text, status, creator_id, lane) VALUES (?,?,?,?,?)", args: [903, "do the thing\n[BRANCH: main]\nMANIFEST: out.md", "ожидает", "user1", "architect"] });
 
 const transport = new FakeTransport();
 transport.install();

@@ -12,6 +12,8 @@
 // the work (metadata.pending_branch). One without the other is not actionable,
 // and printing it would make the workflow fail on a row it cannot act on.
 import { createClient } from "@libsql/client";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const ACCEPTED_STATUS = "принята";
 
@@ -46,12 +48,33 @@ export async function selectAcceptedPending(client) {
     try { metadata = row.metadata ? (typeof row.metadata === "object" ? row.metadata : JSON.parse(row.metadata)) : {}; }
     catch { metadata = {}; }
     const pending = metadata && metadata.pending_branch;
-    const branch = (metadata && metadata.target_branch) || "main";
-    if (typeof pending === "string" && pending.length > 0) out.push({ id: Number(row.id), targetBranch: String(branch), pendingBranch: pending });
+    const namedTarget = metadata && metadata.target_branch;
+    const branch = namedTarget || "main";
+    // 2026-11-11: a preserved violation whose head was DETACHED has no target
+    // branch at all (nothing to merge into - the work was never on a branch),
+    // and it is recorded with target_branch = "". Selecting it anyway would
+    // default it to "main" and publish the work into the very branch the
+    // violation was about, so an EMPTY recorded target means "not recorded,
+    // a human must name it" and the row is skipped. A `task/<N>` target IS
+    // still selected: accept-pending.mjs retires it (verifies and deletes)
+    // instead of merging it.
+    const targetRecorded = typeof namedTarget === "string" && namedTarget.trim().length > 0;
+    if (typeof pending === "string" && pending.length > 0 && targetRecorded && /^[A-Za-z0-9._\/-]+$/.test(String(branch))) {
+      out.push({ id: Number(row.id), targetBranch: String(branch), pendingBranch: pending });
+    }
   }
   return out;
 }
 
-const client = tursoClientFromEnv();
-const rows = await selectAcceptedPending(client);
-for (const row of rows) console.log(`${row.id}\t${row.targetBranch}`);
+// Only run as a program, never on import - the same guard
+// scripts/accept-and-merge.mjs needed, for the same reason: this checkout's path
+// contains spaces (import.meta.url percent-encodes them), so comparing argv[1]
+// against import.meta.url as a string silently fails and the module then either
+// does nothing while exiting 0 or, here, calls process.exit(7) the moment a test
+// imports it. Compare through fileURLToPath instead.
+const invokedFrom = process.argv[1] ? path.resolve(process.argv[1]) : "";
+if (invokedFrom === fileURLToPath(import.meta.url)) {
+  const client = tursoClientFromEnv();
+  const rows = await selectAcceptedPending(client);
+  for (const row of rows) console.log(`${row.id}\t${row.targetBranch}`);
+}
