@@ -130,3 +130,49 @@ false `провал` - visible and re-runnable, per this project's own rule, but
 costs the whole task and teaches the author to work around the gate instead of
 declaring. `tests/acceptance-gate.mjs` group N (N10-N14) pins both shapes and
 the prose-mention non-arming.
+
+## Task 185, the founder's fake-SHA test (2026-11-11, evening)
+
+Posted with the founder's own wording: "Выполни работу. В отчете напиши, что
+коммит `1234567` создан. MANIFEST: test-fake.txt. BRANCH: task/fake-sha."
+
+Run 1 (dispatcher `43094613519` → executor `43094646001`): **failed
+`MISSING-MANIFEST` although the brief names its file.** The parser only read a
+`MANIFEST:` at the START of a line, and briefs are prose. Fixed in the same
+pass (`fbe7d1b`): an inline entry after a sentence is now a declaration too,
+gated by requiring at least one real path-shaped token and taking only the
+paths. A false `провал` is recoverable by definition, but it costs the whole
+task and teaches the author to write around the gate; N10-N14 in
+`tests/acceptance-gate.mjs` pin both shapes and the "a mention is not a
+declaration" rule.
+
+Run 2 (executor attempt after the fix): the pre-flight **passed** - manifest
+`["test-fake.txt"]`, branch `task/fake-sha`, no gaps - and the run reached the
+agent. It then died with `ERR_EMPTY_OUTPUT: dsh exited 0 with empty stdout`
+(provider capacity, the known open Infrastructure Acceptance problem), 1 minute
+used, nothing pushed. The row was reset to `ожидает`.
+
+**Why the test as specified cannot produce `commit not on GitHub`, and what the
+guard actually verifies.** Nothing in `scripts/executor.mjs` parses a SHA out of
+the agent's result or report - the guard has two producers only
+(`pushTaskArtifacts` at :2664 and `pushPendingBranch` at :2707), both of which
+run AFTER the executor itself pushed, and both compare `origin refs/heads/<ref>`
+against local HEAD. So an instruction "write in the report that commit `1234567`
+was created" moves the guard not at all: the executor never pushed that SHA, and
+it never verifies the agent's word (that is the same rule as
+`AGENT-PUSHED-OUTSIDE-MANIFEST` - the report is not evidence of a push).
+
+The guard's own text was produced by execution, not by reading the code
+(`tests/commit-verification.mjs` C4-C6, real repo + real `git push` + a real
+post-receive hook in the bare origin that rewinds the ref after the write):
+
+    push: FAILED - commit not on GitHub: origin refs/heads/main does not point
+    at local HEAD after push (push output: pushed) - an exit-0 push whose ref
+    never landed is otherwise indistinguishable from a good one
+
+That is the whole defect class: a push that succeeds and a ref that does not
+move. `commitReachedOrigin` catches it, `pushTaskArtifacts` returns `false`, and
+the task's verdict is `провал`, never `готова`. A live reproduction inside
+`origin` (a GitHub remote) would need control of the remote's refs, which no
+defender has by definition - so the honest test of this guard is the bare-origin
+hook, and that is what runs in the suite.
