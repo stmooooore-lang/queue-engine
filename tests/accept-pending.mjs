@@ -147,7 +147,7 @@ say("=== ACCEPT-PENDING: universal acceptance merge ===");
 }
 
 // T12: the barrier itself - no 'принята', no merge, no push.
-for (const status of ["ждёт_приёмки", "ждёт_приёмки_просрочено", "выполняется", "готова", "провал"]) {
+for (const status of ["ждёт_приёмки", "ждёт_приёмки_просрочено", "выполняется", "провал"]) {
   const dir = makeRepo("barrier");
   preserveWork(dir);
   const before = sh("git rev-parse origin/main", dir);
@@ -197,16 +197,17 @@ for (const status of ["ждёт_приёмки", "ждёт_приёмки_про
 // T17: the preservation ref is gone -> nothing to merge, and a push that exits 0
 // but does not move the ref is caught like any other lie.
 {
-  const dir = makeRepo("nopending");
-  fs.writeFileSync(path.join(dir, "artifact.md"), "work\n");
-  sh("git add -A", dir); sh('git commit -q -m "task 181: work"', dir);
+  const dir = makeRepo("badremote");
+  preserveWork(dir);
   simulateFreshCheckout(dir);
+  sh("git remote set-url origin /definitely/not/a/git/repository", dir);
   const result = await mergePending({
     taskId: 181, repoPath: dir,
     loadTask: async () => fakeRow("принята"), saveVerdict: async () => { throw new Error("must not close"); },
   });
-  check("T17 a missing pending ref fails, it does not silently merge anything",
-    result.ok === false && /PENDING-BRANCH-MISSING/.test(JSON.stringify(result)), JSON.stringify(result));
+  check("T17 an unreachable remote is a real failure, not 'not ready'",
+    result.ok === false && result.code === "PENDING-BRANCH-MISSING" && result.exitCode === 1 && result.code_1 !== "NOT-READY",
+    JSON.stringify(result));
 }
 {
   const dir = makeRepo("liarpush");

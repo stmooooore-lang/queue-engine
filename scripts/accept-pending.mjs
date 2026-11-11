@@ -33,6 +33,7 @@ const EXIT_NOT_ACCEPTED = 2;    // the decision has not been made (or was revoke
 const EXIT_WORKDIR_DIRTY = 3;   // uncommitted work in the target repo
 const EXIT_CONFLICT = 4;        // MERGE-CONFLICT - nothing pushed, see the log
 const EXIT_PUSH_NOT_VERIFIED = 5;
+const EXIT_NOT_READY = 3;         // 'принята' but nothing preserved yet - retry, do not fail
 const EXIT_TASK_NOT_FOUND = 6;
 const EXIT_NO_CREDENTIALS = 7;
 
@@ -136,6 +137,13 @@ export async function mergePending({
   //    this script must never become a way to publish unaccepted work.
   const task = await loadTask(taskId).catch((err) => { throw err; });
   if (!task) return fail("TASK-NOT-FOUND", `task ${taskId}: no such row in Turso`, { exitCode: EXIT_TASK_NOT_FOUND });
+  // Already published: the executor's own wait loop saw the decision and pushed
+  // (it does not go through pending/). Nothing to merge, and nothing to close
+  // again - this is the outcome of the immediate trigger in the common case,
+  // which is why it must not read as a failure. (S15, 2026-11-11)
+  if (task.status === DONE_STATUS) {
+    return { ok: true, code: "ALREADY-DONE", exitCode: EXIT_OK, taskId, reason: `task ${taskId} is already '${DONE_STATUS}' - nothing to merge`, alreadyDone: true };
+  }
   if (task.status !== ACCEPTED_STATUS) {
     return fail("NOT-ACCEPTED", `task ${taskId} is '${task.status}', not '${ACCEPTED_STATUS}' - the founder's decision is the only thing this script acts on`, { exitCode: EXIT_NOT_ACCEPTED });
   }
@@ -155,7 +163,20 @@ export async function mergePending({
   try {
     run(`git fetch origin +refs/heads/${JSON.stringify(pendingBranch)}:refs/heads/${JSON.stringify(pendingBranch)}`);
   } catch (err) {
-    return fail("PENDING-BRANCH-MISSING", `pending branch ${pendingBranch} is not on origin (${err.message.split("\n")[0]}) - nothing to merge`, { exitCode: EXIT_FAILED });
+    // Two different failures that look alike on the surface, and must not be
+    // reported as one thing:
+    //   - the ref is simply not there yet: the executor is still publishing the
+    //     commit itself (its poll is 30s, the immediate dispatch is seconds).
+    //     The race is normal, so say NOT-READY and let the cron retry. Failing
+    //     the workflow here would be noise on every fast acceptance (S15).
+    //   - the REMOTE is unreachable/wrong: a real, actionable failure - a human
+    //     has to fix credentials or URL, and no amount of retrying will help.
+    const detail = (err.stderr ? err.stderr.toString() : err.message).split("\n")[0];
+    const missingRef = /couldn't find remote ref|remote ref does not exist|no such ref was fetched/i.test(detail);
+    if (missingRef && task.status === ACCEPTED_STATUS) {
+      return fail("NOT-READY", `task ${taskId} is '${ACCEPTED_STATUS}' but ${pendingBranch} is not on origin yet (${detail}) - the executor is most likely publishing the commit itself; nothing was touched`, { exitCode: EXIT_NOT_READY, pendingBranch, targetBranch });
+    }
+    return fail("PENDING-BRANCH-MISSING", `pending branch ${pendingBranch} could not be fetched (${detail}) - nothing to merge`, { exitCode: EXIT_FAILED });
   }
   const fetchedSha = run("git rev-parse FETCH_HEAD");
   log(`fetched ${pendingBranch} as ${fetchedSha.slice(0, 8)}`);

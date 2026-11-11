@@ -74,8 +74,9 @@ jobs:
             node scripts/accept-pending.mjs "$id" ./target "$branch"
             code=$?
             case $code in
-              0) echo "task $id: merged" ;;
-              2) echo "task $id: not 'принята' (it changed since selection) - skipping, not failing the run" ;;
+              0) echo "task $id: merged (or already merged)" ;;
+              2) echo "task $id: not 'принята' any more (it changed since selection) - skipping, not failing the run" ;;
+              3) echo "task $id: not ready yet (accepted, no preserved ref - the executor is publishing it itself) - the next cron tick retries" ;;
               4) echo "task $id: MERGE-CONFLICT - nothing pushed, the founder resolves it"; failed=1 ;;
               *) echo "task $id: FAILED with exit $code - see the log above"; failed=1 ;;
             esac

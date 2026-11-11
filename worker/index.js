@@ -3,6 +3,12 @@
  * fetch() - Telegram's Bot API, Turso's HTTP API
  * (docs.turso.tech/sdk/http/reference, /v2/pipeline), GitHub's REST API.
  *
+ * /accept <id> is implemented in scripts/accept-and-merge.mjs and shared with
+ * the Node CLI by design: one acceptance path, not two that can drift (the same
+ * reason the gate itself is one mechanism across repos). It writes 'принята'
+ * first, then kicks merge-pending.yml through GitHub's workflow_dispatch,
+ * because a GitHub cron on a free account is hours of silence (S15).
+ *
  * Telegram does NOT read the webhook's HTTP response body as a chat message -
  * that body is only an acknowledgement. Replying to the user requires calling
  * sendMessage explicitly. Neither this file's first version nor the one
@@ -15,6 +21,8 @@
  * user via sendMessage instead: silence must not be ambiguous, same rule the
  * local queue's own notifications follow.
  */
+
+import { acceptAndMergeTask } from '../scripts/accept-and-merge.mjs';
 
 export default {
   async fetch(request, env) {
@@ -65,11 +73,33 @@ export default {
         const taskId = await createTask(db, taskText, userId);
         await triggerDispatcher(GITHUB_DISPATCH_TOKEN, taskId);
         await sendMessage(TELEGRAM_BOT_TOKEN, chatId, `Задача создана с ID ${taskId}`);
+      } else if (text.startsWith('/accept ')) {
+        // Acceptance: the founder's decision, then the merge immediately
+        // (S15 - cron on a free account is not a timer). Everything after the
+        // status write is the same code path as the CLI.
+        const id = Number(text.slice(8).trim());
+        if (!Number.isInteger(id) || id <= 0) {
+          await sendMessage(TELEGRAM_BOT_TOKEN, chatId, 'Использование: /accept <id задачи>');
+          return new Response('ok', { status: 200 });
+        }
+        const result = await acceptAndMergeTask({
+          taskId: id,
+          db: { httpUrl: db.httpUrl, authToken: TURSO_AUTH_TOKEN },
+          token: GITHUB_DISPATCH_TOKEN,
+          repo: (env.GITHUB_REPOSITORY || env.ACCEPT_MERGE_REPO || 'stmooooore-lang/queue-engine'),
+          fetchImpl: fetch,
+        });
+        const prefix = result.code === 'ALREADY-DONE'
+          ? `Задача ${id} уже ${'готова'} - принимать нечего.`
+          : result.ok
+            ? `Задача ${id}: принята. ${result.dispatched ? 'Мерж-процесс запущен сразу (workflow_dispatch).' : 'Мерж отдаётся cron (*/5) - немедленный триггер не сработал, причина в логе.'}`
+            : `Принять задачу ${id} не получилось: ${result.reason}`;
+        await sendMessage(TELEGRAM_BOT_TOKEN, chatId, prefix);
       } else if (text === '/status') {
         const tasks = await getLastFiveTasks(db);
         await sendMessage(TELEGRAM_BOT_TOKEN, chatId, formatTasks(tasks));
       } else if (text === '/start') {
-        await sendMessage(TELEGRAM_BOT_TOKEN, chatId, 'Готов. /task <текст> — поставить задачу. /status — последние пять. Любой обычный текст также создаёт задачу.');
+        await sendMessage(TELEGRAM_BOT_TOKEN, chatId, 'Готов. /task <текст> — поставить задачу. /status — последние пять. /accept <id> — принять задачу и сразу запустить мерж. Любой обычный текст также создаёт задачу.');
       } else if (text.startsWith('/')) {
         // Unknown command - ignore silently but log
         console.log(`Unknown command: ${text}`);
