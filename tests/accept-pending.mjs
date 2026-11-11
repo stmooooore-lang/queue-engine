@@ -46,13 +46,13 @@ function fakeRow(status, metadata = {}) {
 
 // Simulate the executor's timeout: the work is preserved in pending/task-181 and
 // the row is parked as 'ждёт_приёмки_просрочено'.
-function preserveWork(dir, files = ["artifact.md"]) {
+function preserveWork(dir, files = ["artifact.md"], taskId = 181) {
   const pre = sh("git rev-parse HEAD", dir);
   for (const f of files) fs.writeFileSync(path.join(dir, f), `${f} by the task\n`);
   sh("git add -A", dir);
-  sh('git commit -q -m "task 181: accepted-after-overdue work"', dir);
+  sh(`git commit -q -m "task ${taskId}: accepted-after-overdue work"`, dir);
   const sha = sh("git rev-parse HEAD", dir);
-  sh("git push -q origin HEAD:refs/heads/pending/task-181", dir);
+  sh(`git push -q origin HEAD:refs/heads/pending/task-${taskId}`, dir);
   return { pre, sha };
 }
 
@@ -255,6 +255,84 @@ check("T22 credentials are masked in anything that reaches a log",
 
   // For a later `git clean`-style teardown: the work dir is temporary and the
   // bare origin is separate, so leftovers never touch the real repositories.
+}
+
+// T25 group: a task/<N> TEST branch is verified and deleted, never merged.
+// queue-engine/AGENTS.md "Branching Rules" (2026-11-11): test tasks live on
+// task/<N>, they are NOT merged into target branches, and they are removed
+// after verification. The merge script therefore must not treat a test target
+// as an ordinary one: no merge, no merge commit, no push of a branch that only
+// existed to be looked at.
+{
+  const dir = makeRepo("testbranch");
+  const work = preserveWork(dir, ["artifact.md"], 184);
+  simulateFreshCheckout(dir);
+  // A test task can also carry its own branch on origin (the executor creates
+  // it when the work is accepted in-window); its tip IS the verified work.
+  sh("git push -q origin HEAD:refs/heads/task/184", dir);
+  const verdict = {};
+  const result = await mergePending({
+    taskId: 184, repoPath: dir,
+    loadTask: async () => fakeRow("принята", { pending_branch: "pending/task-184", target_branch: "task/184" }),
+    saveVerdict: async (id, info) => { Object.assign(verdict, { id, info }); },
+  });
+  check("R1 a test branch is closed with its own code, not a merge",
+    result.ok === true && result.code === "TEST-BRANCH-VERIFIED" && result.testBranch === true, JSON.stringify(result));
+  check("R2 ...and NO merge happened in the target repo",
+    sh("git rev-parse HEAD", dir) === sh("git rev-parse origin/main", dir), `HEAD=${sh("git rev-parse HEAD", dir)} origin/main=${sh("git rev-parse origin/main", dir)}`);
+  check("R3 ...and main still does not hold the test work",
+    sh("git rev-parse origin/main", dir) === work.pre, `origin/main=${sh("git rev-parse origin/main", dir)} pre=${work.pre}`);
+  check("R4 ...and the preservation ref is deleted after being verified",
+    result.pendingDeleted === true && sh("git ls-remote origin refs/heads/pending/task-184", dir) === "", `ls-remote=${sh("git ls-remote origin refs/heads/pending/task-184", dir)}`);
+  check("R5 ...and the test branch itself is removed from origin",
+    result.testBranchDeleted === true && sh("git ls-remote origin refs/heads/task/184", dir) === "", `ls-remote=${sh("git ls-remote origin refs/heads/task/184", dir)}`);
+  check("R6 ...and the verdict names exactly what was verified",
+    verdict.id === 184 && verdict.info.testBranch === true && verdict.info.preservedSha === work.sha, JSON.stringify(verdict));
+}
+{
+  // A test branch whose remote tip is NOT this task's work is left alone:
+  // deleting it would delete somebody else's branch.
+  const dir = makeRepo("testbranchforeign");
+  const work = preserveWork(dir, ["artifact.md"], 184);
+  simulateFreshCheckout(dir);
+  // A commit that is NOT in the preserved work's ancestry: created off the
+  // pass-start sha, so the remote test branch's tip holds content this task
+  // never had. Ancestry, not equality, is the test - a branch tip equal to
+  // the verified commit is this task's own work and IS removed.
+  sh(`git checkout -q ${work.pre.slice(0, 8)}`, dir);
+  sh("git checkout -q -b other", dir);
+  fs.writeFileSync(path.join(dir, "somebody-elses-work.md"), "not this task\n");
+  sh("git add -A", dir); sh('git commit -q -m "foreign work"', dir);
+  sh("git push -q origin other:refs/heads/task/184", dir);
+  sh("git checkout -q main", dir);
+  const result = await mergePending({
+    taskId: 184, repoPath: dir,
+    loadTask: async () => fakeRow("принята", { pending_branch: "pending/task-184", target_branch: "task/184" }),
+    saveVerdict: async () => {},
+  });
+  check("R7 a test branch holding foreign work is NOT deleted",
+    result.ok === true && result.testBranchDeleted === false, JSON.stringify(result));
+  check("R8 ...and it is still on origin",
+    sh("git ls-remote origin refs/heads/task/184", dir) !== "", "the foreign branch disappeared");
+  check("R9 ...while this task's own preservation ref is still retired",
+    result.pendingDeleted === true && sh("git ls-remote origin refs/heads/pending/task-184", dir) === "", JSON.stringify(result));
+}
+{
+  // Verification first: an unverifiable preservation is closed by nobody.
+  const dir = makeRepo("testbranchunverified");
+  const work = preserveWork(dir, ["artifact.md"], 184);
+  simulateFreshCheckout(dir);
+  // The ref is fetchable but no longer points where the fetch said it did:
+  // the one shape where "verified against the remote ref" is the whole test.
+  // remoteSha is a parameter precisely so this can be forced without a race.
+  const result = await mergePending({
+    taskId: 184, repoPath: dir,
+    loadTask: async () => fakeRow("принята", { pending_branch: "pending/task-184", target_branch: "task/184" }),
+    saveVerdict: async () => { throw new Error("must not close a row whose work cannot be verified"); },
+    remoteSha: async () => "0".repeat(40),
+  });
+  check("R10 a test branch whose work cannot be verified is NOT closed",
+    result.ok === false && /TEST-BRANCH-UNVERIFIED/.test(JSON.stringify(result)), JSON.stringify(result));
 }
 
 say(`=== ${passed.length} passed, ${failed.length} failed ===`);

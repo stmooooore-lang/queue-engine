@@ -95,6 +95,18 @@ export function targetBranchFor(task, fallbackBranch) {
 }
 
 /**
+ * A test branch: `task/<identifier>`. Exists to run a mechanism check and then
+ * be removed (queue-engine/AGENTS.md, "Branching Rules", 2026-11-11). Never
+ * merged into - merging a preserved test commit into the test branch would
+ * double it, and there is nothing in a test task that belongs on a production
+ * branch. Recognised here so the merge script can act on it rather than
+ * silently treating it as a normal target.
+ */
+export function isTestBranch(name) {
+  return /^task\/[A-Za-z0-9_-]+$/.test(String(name || ""));
+}
+
+/**
  * Merge one preserved task into its target branch.
  *
  * Returns { ok, code, ... }. Steps in order, each one fail-closed:
@@ -180,6 +192,76 @@ export async function mergePending({
   }
   const fetchedSha = run("git rev-parse FETCH_HEAD");
   log(`fetched ${pendingBranch} as ${fetchedSha.slice(0, 8)}`);
+
+  // 3b. TEST BRANCH (queue-engine/AGENTS.md, "Branching Rules", 2026-11-11).
+  // A `task/<N>` branch exists to be run, checked and removed - it is never
+  // merged into anything, least of all into a production branch. So the
+  // "merge" step for it is: verify the preserved commit really is on origin,
+  // close the row, and delete the refs that held it. NO merge, NO push of a
+  // merge commit, and no branch checkout at all.
+  //
+  // Why verify before deleting: the whole point of the preservation is that a
+  // human can look at the work; deleting the ref without first confirming it
+  // is on origin would destroy the only copy the moment the runner dies.
+  if (isTestBranch(targetBranch)) {
+    let landedPending = null;
+    try { landedPending = await remoteShaFn(pendingBranch, repoPath); } catch { landedPending = null; }
+    if (!landedPending || landedPending !== fetchedSha) {
+      return fail("TEST-BRANCH-UNVERIFIED", `test branch ${targetBranch}: ${pendingBranch} is on origin at ${landedPending ? landedPending.slice(0, 8) : "nothing"}, but the fetch saw ${fetchedSha.slice(0, 8)} - the preserved work cannot be verified, so nothing is deleted and the row stays '${ACCEPTED_STATUS}'`, {
+        exitCode: EXIT_PUSH_NOT_VERIFIED, targetBranch, pendingBranch, testBranch: true,
+      });
+    }
+    log(`test branch ${targetBranch}: the preserved commit ${fetchedSha.slice(0, 8)} is verified on origin/${pendingBranch}; nothing is merged`);
+
+    try {
+      await saveVerdict(taskId, { preservedSha: fetchedSha, pendingBranch, targetBranch, testBranch: true });
+    } catch (err) {
+      return fail("VERDICT-UNWRITTEN", `test branch ${targetBranch}: the work ${fetchedSha.slice(0, 8)} is verified on origin/${pendingBranch} but the row was NOT closed (${String(err.message).split("\n")[0]}) - close it by hand before deleting anything`, {
+        exitCode: EXIT_FAILED, code_: "VERDICT-UNWRITTEN", targetBranch, pendingBranch,
+      });
+    }
+
+    // The test branch itself goes away too - but only the part that holds THIS
+    // work. A remote branch whose tip is not the verified commit (or an
+    // ancestor of it) is somebody else's work and is left exactly where it is.
+    let testBranchDeleted = false;
+    let remoteTestSha = null;
+    try { remoteTestSha = await remoteShaFn(targetBranch, repoPath); } catch { remoteTestSha = null; }
+    if (remoteTestSha) {
+      let holdsThisWork = false;
+      try {
+        run(`git merge-base --is-ancestor ${remoteTestSha} FETCH_HEAD`);
+        holdsThisWork = true;
+      } catch { holdsThisWork = false; }
+      if (holdsThisWork) {
+        try {
+          exec(`git push origin :refs/heads/${JSON.stringify(targetBranch)}`, { cwd: repoPath, stdio: "pipe" });
+          log(`test branch ${targetBranch} deleted from origin (its tip ${remoteTestSha.slice(0, 8)} is this task's verified work)`);
+          testBranchDeleted = true;
+        } catch (err) {
+          log(`WARNING: the row is closed but the test branch ${targetBranch} could not be deleted (${err.message.split("\n")[0]}) - delete it by hand: git push origin :refs/heads/${targetBranch}`);
+        }
+      } else {
+        log(`test branch ${targetBranch} exists on origin at ${remoteTestSha.slice(0, 8)}, which is not this task's work - left alone`);
+      }
+    }
+
+    let pendingDeleted = true;
+    try {
+      exec(`git push origin :refs/heads/${JSON.stringify(pendingBranch)}`, { cwd: repoPath, stdio: "pipe" });
+      exec(`git branch -D ${JSON.stringify(pendingBranch)}`, { cwd: repoPath, stdio: "pipe" });
+      log(`deleted ${pendingBranch} from origin and locally`);
+    } catch (err) {
+      pendingDeleted = false;
+      log(`WARNING: the row is closed but the pending ref could not be deleted (${err.message.split("\n")[0]}) - delete it by hand: git push origin :refs/heads/${pendingBranch}`);
+    }
+
+    return {
+      ok: true, code: "TEST-BRANCH-VERIFIED", exitCode: EXIT_OK, taskId,
+      targetBranch, pendingBranch, mergedSha: fetchedSha, preservedSha: fetchedSha,
+      testBranch: true, testBranchDeleted, pendingDeleted,
+    };
+  }
 
   // 4. onto the target branch.
   try {

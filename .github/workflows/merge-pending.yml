@@ -86,7 +86,7 @@ jobs:
             node scripts/accept-pending.mjs "$id" ./target "$branch"
             code=$?
             case $code in
-              0) echo "task $id: merged (or already merged)" ;;
+              0) echo "task $id: verified on origin and closed (a task/<N> test branch is deleted after verification, not merged - Branching Rules, 2026-11-11)" ;;
               2) echo "task $id: not 'принята' any more (it changed since selection) - skipping, not failing the run" ;;
               3) echo "task $id: not ready yet (accepted, no preserved ref - the executor is publishing it itself) - the next cron tick retries" ;;
               4) echo "task $id: MERGE-CONFLICT - nothing pushed, the founder resolves it"; failed=1 ;;

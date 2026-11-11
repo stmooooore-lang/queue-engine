@@ -1754,11 +1754,20 @@ async function run() {
   // not by the normal writer. The task does not become 'готова' either way, but
   // it burns a run and books a 'провал' with no category and no reason.
   let branchFailure = null;
-  try {
-    checkoutTaskBranch(task.text);
-  } catch (branchErr) {
-    console.log(`[${new Date().toISOString()}] branch: task named a branch that could not be checked out - recording the verdict instead of dying: ${redactSecrets(branchErr.message)}`);
-    branchFailure = branchErr;
+  if (declarationGaps) {
+    // A brief that cannot run must not touch the target repo at all: the
+    // checkout used to happen anyway, which put a `branch: none named in task
+    // text, staying on default checkout` line in the log IMMEDIATELY after a
+    // pre-flight failure that says a silent default is exactly what is not
+    // allowed. The tree is left as the runner found it.
+    console.log(`[${new Date().toISOString()}] branch: skipped - the brief failed the declaration pre-flight, so the target repo is not touched`);
+  } else {
+    try {
+      checkoutTaskBranch(task.text);
+    } catch (branchErr) {
+      console.log(`[${new Date().toISOString()}] branch: task named a branch that could not be checked out - recording the verdict instead of dying: ${redactSecrets(branchErr.message)}`);
+      branchFailure = branchErr;
+    }
   }
 
   // Execute work. A named branch that cannot be checked out is a failed task,
@@ -2881,6 +2890,25 @@ function checkoutTaskBranch(text) {
     console.log(`[${new Date().toISOString()}] branch: task named "${branch}", checked out (git reports: ${actual})`);
     return actual;
   } catch (err) {
+    // BRANCHING RULES (2026-11-11): a TEST branch is the one shape where "not
+    // on origin yet" is the expected, lawful state - a test task creates
+    // `task/<N>` for exactly one run and never existed before it. Refusing it
+    // (the old behaviour threw BRANCH-NOT-ON-ORIGIN for anything unfetchable)
+    // made every test task unmachable. The carve-out is narrow and named: a
+    // branch matching `task/<identifier>` that is not on origin is created
+    // locally BY THE NAME THE BRIEF GAVE, so the work still lands on the
+    // declared branch and not on the default one. Every other named branch
+    // keeps the strict rule.
+    if (/^task\/[A-Za-z0-9_-]+$/.test(branch)) {
+      try {
+        execSync(`git checkout -b ${JSON.stringify(branch)}`, { cwd: WORKDIR, stdio: "pipe" });
+        const created = execSync("git branch --show-current", { cwd: WORKDIR }).toString().trim();
+        console.log(`[${new Date().toISOString()}] branch: test branch "${branch}" is not on origin yet - created locally by the name the brief declared (git reports: ${created}); the executor creates the remote ref itself when the work is accepted`);
+        return created;
+      } catch (createErr) {
+        throw new Error(`BRANCH-CREATE-FAILED: brief named test branch "${branch}", it is not on origin, and it could not be created locally either (${redactSecrets(createErr.message)})`);
+      }
+    }
     // COMMIT-VERIFICATION FIX 3: a branch the brief NAMED and could not check
     // out is no longer a silent fallback to the default checkout.
     //
