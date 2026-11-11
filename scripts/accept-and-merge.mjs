@@ -25,11 +25,25 @@
 // no Node-only imports, every remote call is plain fetch - Turso over
 // /v2/pipeline, GitHub's REST API for the dispatch.
 
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 const ACCEPTED_STATUS = 'принята';
 const DONE_STATUS = 'готова';
 const DEFAULT_REPO = 'stmooooore-lang/queue-engine';
 
 /** Mask anything credential-shaped before it reaches a log, a reply or a report. */
+/**
+ * The dispatch token, under either name. GITHUB_DISPATCH_TOKEN is the
+ * Cloudflare Worker's secret; this repo's Actions secret is DISPATCH_TOKEN
+ * (`gh secret list` 2026-11-11). One script, two call sites, two secret names -
+ * so both are accepted, and neither is required to exist for the acceptance
+ * itself to stand (the cron is the fallback either way).
+ */
+export function dispatchTokenFromEnv(env = process.env) {
+  return env.GITHUB_DISPATCH_TOKEN || env.DISPATCH_TOKEN || "";
+}
+
 export function redact(text) {
   return String(text == null ? '' : text)
     .replace(/(authorization\s*[:=]\s*)\S+/gi, '$1***MASKED***')
@@ -173,8 +187,8 @@ export async function acceptAndMergeTask({
 }
 
 function usage() {
-  console.error('usage: node scripts/accept-and-merge.mjs <taskId>');
-  console.error('  env: TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, GITHUB_DISPATCH_TOKEN (optional: GITHUB_REPOSITORY / ACCEPT_MERGE_REPO)');
+  console.error("usage: node scripts/accept-and-merge.mjs <taskId>");
+  console.error("  env: TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, GITHUB_DISPATCH_TOKEN (or DISPATCH_TOKEN)");
 }
 
 async function main(argv, env = process.env) {
@@ -189,7 +203,7 @@ async function main(argv, env = process.env) {
   const repo = env.ACCEPT_MERGE_REPO || env.GITHUB_REPOSITORY || DEFAULT_REPO;
   try {
     const result = await acceptAndMergeTask({
-      taskId, db, token: env.GITHUB_DISPATCH_TOKEN, repo,
+      taskId, db, token: dispatchTokenFromEnv(env), repo,
     });
     if (result.ok) {
       console.log(`OK [${result.code}]: ${result.reason}`);
@@ -204,6 +218,17 @@ async function main(argv, env = process.env) {
 }
 
 // Only run as a program, never on import - tests and the Worker import these.
-if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+// The comparison is done through fileURLToPath, NOT by string-matching argv[1]
+// against import.meta.url: this checkout lives under a path containing spaces,
+// which import.meta.url percent-encodes ("my%20work"). The string comparison
+// failed there, and the failure was silent - the module imported, ran nothing,
+// exited 0, and looked exactly like a successful acceptance. A silent 0 is the
+// worst possible failure mode for a script whose whole job is to be explicit,
+// so the guard also says so when no CLI entry is detected.
+const invokedFrom = process.argv[1] ? path.resolve(process.argv[1]) : "";
+if (invokedFrom && (invokedFrom === fileURLToPath(import.meta.url))) {
   main(process.argv.slice(2)).then((code) => process.exit(code));
+} else if (invokedFrom && invokedFrom.endsWith(path.sep + "scripts" + path.sep + "accept-and-merge.mjs")) {
+  console.error(`this module did not recognise itself as the CLI entry: argv[1]=${invokedFrom} moduleUrl=${import.meta.url}`);
+  process.exit(64);
 }

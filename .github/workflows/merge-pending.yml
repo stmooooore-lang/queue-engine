@@ -50,11 +50,21 @@ jobs:
           token: ${{ secrets.REPO_TOKEN }}
           path: target
 
+      # LIVE LESSON 2026-11-11 (S15, run 42944122540): the repo's secrets are
+      # named TURSO_DATABASE_URL / TURSO_AUTH_TOKEN, but this file passed
+      # TURSO_URL / TURSO_TOKEN (the names the SPEC uses). Both env names were
+      # empty, so the selection step died on "NO-TURSO-CREDENTIALS" before it
+      # could look at anything - a spec's names are not a repo's secrets, and
+      # nothing in the run log said which of the two was wrong.
+      # Both names are now exported: the scripts accept either, so the spec's
+      # language and this repo's reality cannot drift apart again.
       - name: select the accepted tasks
         id: select
         env:
-          TURSO_URL: ${{ secrets.TURSO_URL }}
-          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+          TURSO_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: |
           node scripts/list-accepted-pending.mjs > accepted.tsv || exit 1
           cat accepted.tsv
@@ -64,8 +74,10 @@ jobs:
       - name: merge each accepted task
         if: steps.select.outputs.count != '0'
         env:
-          TURSO_URL: ${{ secrets.TURSO_URL }}
-          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+          TURSO_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: |
           failed=0
           while IFS=$'\t' read -r id branch; do
