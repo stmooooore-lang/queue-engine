@@ -2440,10 +2440,44 @@ function briefManifest(taskText) {
     out.push(v);
   };
   const brief = String(taskText || "");
+  // Two shapes, and both belong to the BRIEF (never to the agent's report):
+  //   1. a MANIFEST: line of its own - the canonical form, unchanged;
+  //   2. an inline "MANIFEST: a.md, b.md" that follows a sentence, which is how
+  //      briefs are actually written.
+  //
+  // Shape 2 exists because of a live false rejection (task 185, 2026-11-11): a
+  // brief the founder wrote as prose ("...создан. MANIFEST: test-fake.txt.") was
+  // refused by the pre-flight with MISSING-MANIFEST even though it named its
+  // artifact file in full view. A false 'провал' is recoverable, but it costs
+  // the whole task and reads to the author as "the gate is broken", so the
+  // declaration is read wherever in the brief it is written.
+  //
+  // The guard against prose: the inline capture is a token sequence of
+  // path-shaped characters (letters, digits, dot, slash, dash, underscore)
+  // separated by commas/whitespace, and it only counts when at least one token
+  // is a real path (an extension or a slash). "declare MANIFEST: in your
+  // report" therefore arms nothing, "MANIFEST: test-fake.txt" arms the file.
+  // Fail-closed direction preserved: a mention is not a declaration.
   const manifestRe = /^[ \t>*-]*(?:manifest|files?|artifacts?)[ \t]*:[ \t]*(.+)$/gim;
+  const inlineRe = /(?:^|[.!?;\n]\s*|\s{2,})(?:manifest|files?|artifacts?)[ \t]*:[ \t]*((?:[A-Za-z0-9._/-]+[ \t]*,?[ \t]*)+)/gi;
+  const looksLikePath = (tok) => {
+    // A trailing full stop belongs to the sentence, not to the filename:
+    // "MANIFEST: test-fake.txt. BRANCH: x" ends the entry with a period, and
+    // testing the raw token would reject the very declaration it is checking.
+    const clean = String(tok).replace(/[.,;:'"`()\[\]]+$/, "");
+    return /\.[A-Za-z0-9]{1,12}$/.test(clean) || clean.includes("/");
+  };
   let m;
   while ((m = manifestRe.exec(brief)) !== null) {
     for (const tok of m[1].split(/[\s,;]+/)) add(tok);
+  }
+  while ((m = inlineRe.exec(brief)) !== null) {
+    const tokens = m[1].split(/[\s,;]+/).map((t) => t.trim()).filter(Boolean);
+    if (!tokens.some(looksLikePath)) continue;
+    // Only the PATHS from an inline entry - the capture may legitimately run
+    // into the next sentence's words ("MANIFEST: a.txt. BRANCH: x" captures
+    // "a.txt. BRANCH"), and a marker word is not an artifact.
+    for (const tok of tokens) if (looksLikePath(tok)) add(tok);
   }
   return out;
 }

@@ -103,3 +103,30 @@ itself). `tests/cloud_queue_contract.mjs --self-test` still fails on
 `checkoutTaskBranch should parse cursor-build directive` - pre-existing (its
 fake git transport answers `currentBranch: main`), verified by re-running the
 suite with my changes stashed.
+
+## The inline MANIFEST form (live false rejection, task 185, 2026-11-11)
+
+Task 185 was posted with the founder's own prose brief: "Выполни работу. В
+отчете напиши, что коммит `1234567` создан. MANIFEST: test-fake.txt. BRANCH:
+task/fake-sha." The pre-flight refused it with `MISSING-MANIFEST` - although the
+artifact file is named in that brief, in full view.
+
+The cause was in the parser, not the guard: `briefManifest()` only recognised a
+`MANIFEST:` at the START of a line (`^[ \t>*-]*(?:manifest|files?|artifacts?)[ \t]*:`),
+and briefs are written as prose. The declaration was therefore invisible to the
+machine.
+
+The fix keeps both shapes:
+- the canonical `MANIFEST:` line, unchanged;
+- an inline entry following a sentence (`. MANIFEST: a.md, b.md.`), which now
+  counts - but only when at least one of its tokens is a real path (an
+  extension or a slash), and only its paths are taken. "укажи MANIFEST: в
+  отчёте" arms nothing, and the word `BRANCH` that follows the list never
+  becomes a file.
+
+This is the fail-CLOSED direction of the guard, not a loosening: the earlier
+posture made the gate reject a brief that declares its artifacts, which is a
+false `провал` - visible and re-runnable, per this project's own rule, but it
+costs the whole task and teaches the author to work around the gate instead of
+declaring. `tests/acceptance-gate.mjs` group N (N10-N14) pins both shapes and
+the prose-mention non-arming.

@@ -277,6 +277,29 @@ function makeRepo(name, withRemote = true) {
   check("N9 ...and the overdue status is not one the dispatcher re-picks",
     (() => { const d = fs.readFileSync(path.join(repoRoot, "scripts/dispatcher.mjs"), "utf8"); const m = /status NOT IN \(([^)]*)\)/.exec(d); return m !== null && m[1].includes("ждёт_приёмки_просрочено"); })(),
     "dispatcher exclusion list does not mention 'ждёт_приёмки_просрочено'");
+
+  // N10..N14: the inline MANIFEST form (live false rejection, task 185).
+  // The founder writes briefs as prose - "…создан. MANIFEST: test-fake.txt." -
+  // and the line-anchored parser read that as no declaration at all. The task
+  // then failed MISSING-MANIFEST with the declaration in plain sight, which is
+  // a false провал: recoverable, but it costs the task and reads to the author
+  // as a broken gate.
+  check("N10 an inline 'MANIFEST: a.txt' after a sentence IS a declaration",
+    JSON.stringify(ex.briefManifest("Выполни работу. В отчете напиши, что коммит `1234567` создан. MANIFEST: test-fake.txt. BRANCH: task/fake-sha.")) === JSON.stringify(["test-fake.txt"]),
+    JSON.stringify(ex.briefManifest("Выполни работу. В отчете напиши, что коммит `1234567` создан. MANIFEST: test-fake.txt. BRANCH: task/fake-sha.")));
+  check("N11 ...so the founder's exact prose brief passes the pre-flight",
+    ex.briefDeclarationGaps("Выполни работу. В отчете напиши, что коммит `1234567` создан. MANIFEST: test-fake.txt. BRANCH: task/fake-sha.") === null,
+    String(ex.briefDeclarationGaps("Выполни работу. В отчете напиши, что коммит `1234567` создан. MANIFEST: test-fake.txt. BRANCH: task/fake-sha.")));
+  check("N12 a MERELY MENTIONED 'MANIFEST:' in prose still arms nothing",
+    ex.briefManifest("Агент, в отчёте укажи MANIFEST: то, что сделал").length === 0
+      && ex.briefManifest("Просто упомяни MANIFEST: в отчете, это не объявление.").length === 0,
+    "a mention of the word was treated as a declaration");
+  check("N13 ...and an inline entry's trailing words are not mistaken for paths",
+    JSON.stringify(ex.briefManifest("Сделай отчёт. MANIFEST: notes/a.md, canon/b.md. Готово.")) === JSON.stringify(["notes/a.md", "canon/b.md"]),
+    "the word after the list leaked into the manifest");
+  check("N14 the canonical line form is unchanged (no regression)",
+    JSON.stringify(ex.briefManifest("Сделай отчёт\nMANIFEST: out.md\n[BRANCH: main]")) === JSON.stringify(["out.md"]),
+    JSON.stringify(ex.briefManifest("Сделай отчёт\nMANIFEST: out.md\n[BRANCH: main]")));
 }
 
 // --- L: job cap vs acceptance window (blocker 1) -----------------------------
