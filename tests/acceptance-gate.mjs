@@ -237,6 +237,48 @@ function makeRepo(name, withRemote = true) {
     sh("git rev-parse origin/main", dir) === preWorkSha, "");
 }
 
+// --- N: pre-flight declarations (2026-11-11, manifest + branch) -----------
+// A brief that cannot produce a lawful commit is refused BEFORE an agent runs,
+// not after the work is done: the failure this prevents is the one that cannot
+// be undone (task 182 pushed its own commit to origin/main, and a violation is
+// only ever named after the fact). The same pre-flight refuses a silent default
+// branch, because "no branch named" used to mean "land on main".
+{
+  const ex = await loadExecutor(makeRepo("preflight"));
+  check("N1 a brief with no MANIFEST and no [NO-ARTIFACT] cannot run",
+    /^MISSING-MANIFEST/.test(String(ex.briefDeclarationGaps("Создай файл test-gate.txt с текстом 'hello'")) || ""),
+    String(ex.briefDeclarationGaps("Создай файл test-gate.txt с текстом 'hello'")));
+  check("N2 ...and the reason is verbatim", ex.briefDeclarationGaps("[S15] no markers at all") === null ? false : /MISSING-MANIFEST: brief must declare MANIFEST or \[NO-ARTIFACT\]/.test(ex.briefDeclarationGaps("[S15] no markers at all")), ex.briefDeclarationGaps("[S15] no markers at all"));
+  check("N3 a manifest makes the brief lawful on the artifact axis",
+    ex.briefDeclarationGaps("[S15] gate test\nMANIFEST: gate-test.txt") === "BRANCH-NOT-DECLARED: brief must name [BRANCH: x] - a checkout that silently lands on the default branch is not a branch decision (that default is main, and task 182's unmanifesged push landed there the same way)",
+    String(ex.briefDeclarationGaps("[S15] gate test\nMANIFEST: gate-test.txt")));
+  // The marker must LEAD the brief (NO_ARTIFACT_MARKER_RE matches a marker
+  // block from the top), which is exactly why a marker mentioned mid-text is
+  // not a declaration - the same rule stageTaskArtifacts already applies.
+  check("N4 [NO-ARTIFACT] is the other lawful escape hatch",
+    ex.briefDeclarationGaps("[S15] [NO-ARTIFACT] infrastructure audit\n[BRANCH: main]") === null,
+    String(ex.briefDeclarationGaps("[S15] [NO-ARTIFACT] infrastructure audit\n[BRANCH: main]")));
+  check("N4a ...and a marker buried mid-brief is NOT a declaration",
+    /MISSING-MANIFEST/.test(ex.briefDeclarationGaps("[S15] audit\nConsider using [NO-ARTIFACT] here\n[BRANCH: main]")),
+    String(ex.briefDeclarationGaps("[S15] audit\nConsider using [NO-ARTIFACT] here\n[BRANCH: main]")));
+  check("N5 a brief with BOTH declarations has no gaps",
+    ex.briefDeclarationGaps("[S15] gate test\n[BRANCH: task/184]\nMANIFEST: gate-test.txt") === null,
+    String(ex.briefDeclarationGaps("[S15] gate test\n[BRANCH: task/184]\nMANIFEST: gate-test.txt")));
+  check("N6 a brief with neither names BOTH reasons, so one fix round suffices",
+    (() => { const g = ex.briefDeclarationGaps("[S15] nothing declared"); return /MISSING-MANIFEST/.test(g) && /BRANCH-NOT-DECLARED/.test(g); })(),
+    String(ex.briefDeclarationGaps("[S15] nothing declared")));
+  check("N7 mentioning a manifest is not declaring one (the marker must be a line)",
+    /MISSING-MANIFEST/.test(ex.briefDeclarationGaps("[S15] think about a manifest for later\n[BRANCH: main]")),
+    String(ex.briefDeclarationGaps("[S15] think about a manifest for later\n[BRANCH: main]")));
+  // gateVerdict: a preserved unlawful commit is overdue, not fatal-free
+  check("N8 a preserved violent becomes 'ждёт_приёмки_просрочено', not 'провал_фатальный'",
+    ex.gateVerdict({ outcome: "preserved-violation", waitedMs: 0, reason: "x" }, { success: false }) === ex.ACCEPT_OVERDUE_STATUS,
+    String(ex.gateVerdict({ outcome: "preserved-violation" }, { success: false })));
+  check("N9 ...and the overdue status is not one the dispatcher re-picks",
+    (() => { const d = fs.readFileSync(path.join(repoRoot, "scripts/dispatcher.mjs"), "utf8"); const m = /status NOT IN \(([^)]*)\)/.exec(d); return m !== null && m[1].includes("ждёт_приёмки_просрочено"); })(),
+    "dispatcher exclusion list does not mention 'ждёт_приёмки_просрочено'");
+}
+
 // --- L: job cap vs acceptance window (blocker 1) -----------------------------
 // The founder's arithmetic: the slowest single unit of work is ~120 minutes and
 // 180 - 120 = 60, so a 60-minute window survives even that. A window that can
@@ -285,9 +327,12 @@ function makeRepo(name, withRemote = true) {
     staged.ok === false && staged.violation === "AGENT-PUSHED-OUTSIDE-MANIFEST", JSON.stringify(staged));
   check("M3 ...the reason names the outside file",
     /AGENT-PUSHED-OUTSIDE-MANIFEST/.test(staged.reason || "") && /stray\.md/.test(staged.reason || ""), staged.reason);
-  check("M4 ...and the work is rolled back to the start of the pass",
-    sh("git rev-parse HEAD", dir) === preWorkSha, `HEAD=${sh("git rev-parse HEAD", dir)} expected=${preWorkSha}`);
-  check("M5 ...and nothing was pushed",
+  check("M4 ...and the work is NOT rolled back any more (the violation changed shape 2026-11-11)",
+    sh("git rev-parse HEAD", dir) !== preWorkSha, `HEAD=${sh("git rev-parse HEAD", dir)} unexpectedly equals the pass start - the commit must survive for preservation`);
+  check("M4a ...and the caller is told which commit on which branch to preserve",
+    staged.preserve === true && staged.preserveBranch === "main" && typeof staged.preserveSha === "string" && staged.preserveSha.length === 40,
+    JSON.stringify({ preserve: staged.preserve, preserveBranch: staged.preserveBranch, preserveSha: staged.preserveSha }));
+  check("M5 ...and the stage step itself still pushed nothing anywhere",
     sh("git rev-parse origin/main", dir) === preWorkSha, `origin/main=${sh("git rev-parse origin/main", dir)}`);
 }
 {

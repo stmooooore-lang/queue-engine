@@ -87,6 +87,28 @@ function sanitizeLogArg(arg) {
 }
 
 /**
+ * The one logging helper for lines that are not already inside a
+ * `[timestamp] ...` console.log call. It did not exist until 2026-11-11: the
+ * pending-preservation path called `log(...)` (undefined), which threw
+ * ReferenceError INSIDE the metadata try block, was swallowed by that block's
+ * own catch, and then reported "PENDING-BRANCH-UNRECORDED: metadata not saved
+ * ... log is not defined" - a false alarm on a write that had already
+ * succeeded. A helper that does not exist is a bug, not a style choice, and
+ * the catch that hides it makes it invisible, which is the worst combination.
+ */
+function log(...args) {
+  console.log(`[${new Date().toISOString()}]`, ...args);
+}
+
+// The branch we are standing on, or "" - never throws. Used only for messages
+// that must name a target branch even in the shapes (detached HEAD) where
+// `git branch --show-current` answers nothing.
+function currentBranchNameSafe(dir) {
+  try { return execSync("git branch --show-current", { cwd: dir, stdio: "pipe" }).toString().trim(); }
+  catch { return ""; }
+}
+
+/**
  * Installs logging hooks on console and standard output/error streams
  * to ensure sensitive credentials are never leaked to logs or terminals.
  */
@@ -1672,6 +1694,18 @@ async function run() {
   // turned into a silent zombie too, just by a different route.
   activeTaskIdForCrashGuard = taskId;
 
+  // MANIFEST-PREFLIGHT, 2026-11-11: declarations first, work second. The check
+  // sits here - AFTER the claim (so the row is ours to fail) and BEFORE triage
+  // (so a defective brief costs a verdict write, not a triage call plus a full
+  // agent run). The failure flows through the ordinary verdict path below by
+  // standing in for the work result, which keeps the zombie guard, the retry
+  // metadata and the Telegram notification exactly where every other failure
+  // already gets them.
+  const declarationGaps = briefDeclarationGaps(task.text);
+  if (declarationGaps) {
+    console.log(`[${new Date().toISOString()}] pre-flight: task ${taskId} cannot run - ${declarationGaps}`);
+  }
+
   // Triage: is this genuinely one unit of work, or several that should
   // run as independent, smaller dsh calls? (founder's own repeated
   // instruction, 2026-09-12 - see the triageCheck/triageSplit block
@@ -1741,7 +1775,9 @@ async function run() {
   const workStart = Date.now();
   const result = branchFailure
     ? { success: false, paused: false, partial: false, message: branchFailure.message, category: "infrastructure" }
-    : await doWork(task.text, task);
+    : declarationGaps
+      ? { success: false, paused: false, partial: false, message: declarationGaps, category: "task_defect" }
+      : await doWork(task.text, task);
   if (result.decomposed) {
     // TIMECEIL-CLOUD, 2026-09-14: real re-decomposition happened instead
     // of a normal pass/fail - the original oversized task is done in the
@@ -1785,7 +1821,42 @@ async function run() {
       // sentence>", which is how "Committed. Task complete." became the
       // result of tasks that committed nothing (167, 171, 173).
       result.success = false;
-      result.message = `ARTIFACT-GUARD: ${staged.reason}. Agent's own report was: ${result.message}`;
+      if (staged.preserve) {
+        // 2026-11-11 (founder's brief): an unlawful agent commit is PRESERVED,
+        // not destroyed. Task 182's run showed what the old behaviour cost:
+        // rollbackLocalWork() wiped the tree, the founder had nothing to
+        // inspect, and when the agent had already pushed, the rollback was
+        // theatre anyway - the commit was still on origin afterwards, unreachable
+        // through the repo and unnamed in the row.
+        //
+        // So the commit goes to this task's own pending ref - never to the
+        // working branch - and the row becomes 'ждёт_приёмки_просрочено':
+        // the founder can read it, verify it, and accept it through the normal
+        // machinery (set the row to 'принята' and merge-pending.yml merges
+        // metadata.pending_branch, same as the overdue-window path).
+        const pendingRef = pendingBranchName(taskId);
+        const preserved = await pushPendingBranch(taskId, WORKDIR);
+        const target = staged.preserveBranch || currentBranchNameSafe(WORKDIR);
+        result.message = `ARTIFACT-GUARD: ${staged.reason}. Работа НЕ откатывалась: ${preserved ? `коммит сохранён в origin/${pendingRef} (${String(preserved).slice(0, 8)}, проверено на origin), целевая ветка ${target} не тронута; приёмка — как у просроченного окна (статус '${ACCEPT_OVERDUE_STATUS}', см. docs/DECISIONS.md, PENDING-BRANCH-MERGE). Файлы коммита: ${(staged.manifest || []).slice(0, 10).join(", ") || "(см. лог)"}` : `СОХРАНИТЬ НЕ УДАЛОСЬ: ${lastArtifactPushReason || "pending push did not complete"} - раннер эфемерный, коммит умирает вместе с прогоном`}. Agent's own report was: ${result.message}`;
+        gateOutcome = { outcome: "preserved-violation", waitedMs: 0, reason: staged.reason };
+        console.log(`[${new Date().toISOString()}] acceptance-gate: task ${taskId} violation preserved - ${staged.reason.split(" - ")[0]}; ${preserved ? `origin/${pendingRef} (${String(preserved).slice(0, 8)}), working branch ${target} untouched` : "NOT preserved (the pending push failed)"}; row becomes '${ACCEPT_OVERDUE_STATUS}'`);
+        if (preserved) {
+          try {
+            let prevMeta = {};
+            try { prevMeta = task.metadata ? JSON.parse(task.metadata) : {}; } catch {}
+            if (!prevMeta || typeof prevMeta !== "object") prevMeta = {};
+            await client.execute({
+              sql: 'UPDATE tasks SET metadata = ? WHERE id = ?',
+              args: [JSON.stringify({ ...prevMeta, pending_branch: pendingRef, target_branch: target }), taskId],
+            });
+            log(`task ${taskId} metadata: pending_branch=${pendingRef}, target_branch=${target} (merge-pending.yml selects on these)`);
+          } catch (metaErr) {
+            log(`PENDING-BRANCH-UNRECORDED: metadata not saved for task ${taskId} (${redactSecrets(metaErr.message)}) - the work IS on origin/${pendingRef}, but the workflow cannot find it by row; merge it by hand`);
+          }
+        }
+      } else {
+        result.message = `ARTIFACT-GUARD: ${staged.reason}. Agent's own report was: ${result.message}`;
+      }
     } else if (staged.needsGate) {
       // Put the row into the waiting state BEFORE the delay starts, so a crash
       // or a manual read at any moment shows a task that is waiting for a
@@ -2157,6 +2228,44 @@ async function run() {
 const NO_ARTIFACT_MARKER_RE = /^\s*(?:\[[^\]]*\]\s*)*\[\s*no-artifact\s*\]/i;
 const NO_ARTIFACT_MENTION_RE = /\[\s*no-artifact\s*\]/i;
 function briefDeclaresNoArtifact(text) { return NO_ARTIFACT_MARKER_RE.test(String(text || "")); }
+
+// MANIFEST-PREFLIGHT (2026-11-11, live run 182 - the founder's "критический
+// фикс правил и гвардов"): the two declarations a brief must carry BEFORE an
+// agent is allowed to run, checked before a token is spent rather than after
+// the work is done.
+//
+// Why it is a pre-flight and not another stage check: the failure it prevents
+// is not recoverable by the stage checks. Task 182 ("Создай файл
+// test-gate.txt...", no manifest) was worked by an agent running under
+// DSH_PERMISSION_MODE=danger-full-access, which committed AND pushed its own
+// commit to origin/main. The stage check caught it and named it
+// (AGENT-PUSHED-OUTSIDE-MANIFEST) - but the commit was already on GitHub, and
+// rollbackLocalWork() resets the local tree only: it cannot recall a commit
+// from origin. The gate detected the hole after the work had already leaked
+// through it. Detection after the fact is not a barrier, so the declaration is
+// now required up front: an agent that has nothing lawful to commit never gets
+// the chance to commit unlawfully in the first place.
+//
+// The branch rule rides the same pre-flight (queue-engine/AGENTS.md, section
+// "Branching Rules", 2026-11-11): a brief that names no branch silently lands
+// the checkout on the default branch - which for every product repo touched so
+// far IS main - and that silent default is the same hole with a different
+// name. "main" must be a decision, not a fallback.
+//
+// Returns null when the brief is lawful, or the reason string the task must
+// fail with (verbatim codes: MISSING-MANIFEST, BRANCH-NOT-DECLARED).
+function briefDeclarationGaps(text) {
+  const raw = String(text || "");
+  const gaps = [];
+  if (!briefDeclaresNoArtifact(raw) && briefManifest(raw).length === 0) {
+    gaps.push("MISSING-MANIFEST: brief must declare MANIFEST or [NO-ARTIFACT] (live run 182: without a manifest the agent committed and pushed its own test-gate.txt to origin/main, and a violation is only ever named AFTER the commit is on GitHub)");
+  }
+  const namedBranch = BRANCH_MARKER_RE.exec(raw) || BRANCH_COLON_RE.exec(raw);
+  if (!namedBranch) {
+    gaps.push("BRANCH-NOT-DECLARED: brief must name [BRANCH: x] - a checkout that silently lands on the default branch is not a branch decision (that default is main, and task 182's unmanifesged push landed there the same way)");
+  }
+  return gaps.length > 0 ? gaps.join(" | ") : null;
+}
 function mentionsNoArtifactMarker(text) {
   const s = String(text || "");
   return NO_ARTIFACT_MENTION_RE.test(s) && !NO_ARTIFACT_MARKER_RE.test(s);
@@ -2472,9 +2581,8 @@ function stageTaskArtifacts(taskText, preWorkSha, resultText) {
         // expects (queue-engine/AGENTS.md section 5).
         if (!branchNow) {
           lastArtifactPushReason = `AGENT-PUSHED-OUTSIDE-MANIFEST: the agent's own commit ${headNow.slice(0, 8)} moved HEAD, but HEAD is detached - there is no branch to accept against, and an unmanifesged commit cannot be gated`;
-          rollbackLocalWork(preWorkSha, WORKDIR);
           console.log(`[${new Date().toISOString()}] stage: FAILED - ${lastArtifactPushReason}`);
-          return { ok: false, reason: lastArtifactPushReason, violation: "AGENT-PUSHED-OUTSIDE-MANIFEST" };
+          return { ok: false, reason: lastArtifactPushReason, violation: "AGENT-PUSHED-OUTSIDE-MANIFEST", preserve: true, preserveBranch: branchNow };
         }
         const declared = briefManifest(taskText);
         const added = filesAddedSince(preWorkSha, WORKDIR);
@@ -2482,13 +2590,22 @@ function stageTaskArtifacts(taskText, preWorkSha, resultText) {
         const outside = added.filter((f) => !declaredSet.has(f));
         if (declared.length === 0 || outside.length > 0) {
           const landedAlready = commitReachedOrigin(branchNow, WORKDIR);
-          rollbackLocalWork(preWorkSha, WORKDIR);
           const detail = declared.length === 0
             ? `the brief declares no MANIFEST:/FILES: list, so no agent-made commit is lawful (the agent stages its files and the executor commits them)`
             : `${outside.length} committed file(s) are outside the brief's manifest: ${outside.slice(0, 5).join(", ")}${outside.length > 5 ? ", ..." : ""}`;
-          lastArtifactPushReason = `AGENT-PUSHED-OUTSIDE-MANIFEST: the agent's own commit ${headNow.slice(0, 8)} moved HEAD on ${branchNow}, but ${detail}${landedAlready ? ` - and that commit ALREADY reached origin/${branchNow} (${String(landedAlready).slice(0, 8)}): rollbackLocalWork() resets the local tree only, it cannot recall a commit from GitHub` : ""}`;
-          console.log(`[${new Date().toISOString()}] stage: FAILED - ${lastArtifactPushReason}`);
-          return { ok: false, reason: lastArtifactPushReason, violation: "AGENT-PUSHED-OUTSIDE-MANIFEST" };
+          lastArtifactPushReason = `AGENT-PUSHED-OUTSIDE-MANIFEST: the agent's own commit ${headNow.slice(0, 8)} moved HEAD on ${branchNow}, but ${detail}${landedAlready ? ` - and that commit ALREADY reached origin/${branchNow} (${String(landedAlready).slice(0, 8)}), which no local reset can recall` : ""}`;
+          // 2026-11-11 (founder's brief, S15 follow-up): this violation is NO
+          // LONGER rolled back. Rolling back destroyed the evidence and the
+          // work together, which satisfied nobody - the founder could neither
+          // see the violation nor save the work. The commit is preserved into
+          // this task's own pending ref (pushPendingBranch, exactly as the
+          // overdue-window path does) and the row becomes
+          // 'ждёт_приёмки_просрочено' with metadata.pending_branch, so a human
+          // can inspect and accept it. The caller (run()) does the pushing and
+          // the row writes, because both are async and a Turso row is not
+          // stageTaskArtifacts' business.
+          console.log(`[${new Date().toISOString()}] stage: VIOLATION (preserved for review, NOT rolled back) - ${lastArtifactPushReason}`);
+          return { ok: false, reason: lastArtifactPushReason, violation: "AGENT-PUSHED-OUTSIDE-MANIFEST", preserve: true, preserveBranch: branchNow, preserveSha: headNow, manifest: added };
         }
         console.log(`[${new Date().toISOString()}] stage: the agent's own commit ${headNow.slice(0, 8)} on ${branchNow} is inside the brief's manifest (${added.length} file(s)) - staged for acceptance, not pushed`);
         return { ok: true, needsGate: true, branch: branchNow, stagedSha: headNow, source: "the agent's own commit", manifest: added };
@@ -2619,6 +2736,13 @@ function gateVerdict(gateOutcome, result) {
   if (!gateOutcome) return null;
   if (gateOutcome.outcome === ACCEPT_ACCEPTED_STATUS && result && result.success) return 'готова';
   if (gateOutcome.outcome === "timeout") return ACCEPT_OVERDUE_STATUS;
+  // 2026-11-11: an unlawful agent commit is preserved rather than rolled back,
+  // so it needs its own state too - the same one the overdue window uses,
+  // because from the founder's side the two are indistinguishable: the work
+  // exists, it is not merged, and only a human decision can move either.
+  // NOT 'провал_фатальный': that verdict freezes a task as unrecoverable, and
+  // this work is anything but.
+  if (gateOutcome.outcome === "preserved-violation") return ACCEPT_OVERDUE_STATUS;
   return 'провал_фатальный';
 }
 
@@ -5144,6 +5268,8 @@ export {
   stageTaskArtifacts,
   pushAcceptedArtifacts,
   briefManifest,
+  briefDeclaresNoArtifact,
+  briefDeclarationGaps,
   reportFileList,
   filesAddedSince,
   gateVerdict,
