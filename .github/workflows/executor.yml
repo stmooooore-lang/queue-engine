@@ -307,8 +307,21 @@ jobs:
                 # end of life 2026-09-09, absent from /models endpoint; preflight
                 # does not prune it). Only nemotron-ultra is alive and declared
                 # in both files.
+                # 2026-11-12 (Parity, founder's ban on reasoning models): the
+                # ban covers nano-omni, which this block never had. What today
+                # fixed is the OTHER half of the same divergence - the local
+                # table routes step-5 (coder, nv-glm) and minimax-m3.1-flash
+                # (nv-ds, gemini, cheap, judge), and the cloud could resolve
+                # neither. Both are back here after a live re-probe against
+                # integrate.api.nvidia.com with the same key (8.3s / 4.4s OK),
+                # in the same order in both files. The 2026-10-31 failures
+                # were about ids missing in THIS yaml, not about dead models.
                 models:
                   - id: nvidia/nemotron-3-ultra-550b-a55b
+                    contextWindow: 131072
+                  - id: stepfun-ai/step-5-preview
+                    contextWindow: 131072
+                  - id: minimaxai/minimax-m3.1-flash
                     contextWindow: 131072
               mistral:
                 apiKeyEnv: MISTRAL_API_KEY

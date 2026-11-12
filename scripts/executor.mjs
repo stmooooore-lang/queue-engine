@@ -3020,7 +3020,20 @@ const PROVIDER_CONFIG = {
   // exists) are not in the dsh registry - Plexus confirmed against pi-ai. The
   // list is exactly the two registered models, identical to the settings.yaml
   // nvidia block in executor.yml - any divergence kills rotation at NO_ADAPTER.
-  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", models: ["nvidia/nemotron-3-ultra-550b-a55b"] },
+  // 2026-11-12 (Parity fix, founder's ban on reasoning models in queues).
+  // nano-omni never lived here - the ban covers it and this file was already
+  // clean. What WAS here: one model, while the local table routes step-5 and
+  // minimax - the two live replacements the local queue got this morning. They
+  // had been REMOVED from this list on 2026-10-31 after a 410/UNKNOWN_MODEL in
+  // the cloud's own settings.yaml; that removal was correct for its cause and
+  // became exactly the Local-Cloud divergence the audit found: local lanes
+  // could resolve models the cloud cannot.
+  // Live re-verification 2026-11-12 against integrate.api.nvidia.com with the
+  // same NVIDIA_API_KEY: stepfun-ai/step-5-preview 8.3s OK,
+  // minimaxai/minimax-m3.1-flash 4.4s OK. Order matches the local table.
+  // NOTE: model ids live in BOTH files (this config and the workflow's
+  // settings.yaml); an id present here but absent there dies at NO_ADAPTER.
+  nvidia: { baseURL: "https://integrate.api.nvidia.com/v1", apiKeyEnv: "NVIDIA_API_KEY", models: ["nvidia/nemotron-3-ultra-550b-a55b", "stepfun-ai/step-5-preview", "minimaxai/minimax-m3.1-flash"] },
   // 2026-10-04: model was gemini-1.5-pro - verified dead against the real
   // endpoint (HTTP 404 "no longer available to new users"; every pro-tier
   // model carries free-tier limit 0 on the current key, 429). gemini-3.8-flash
