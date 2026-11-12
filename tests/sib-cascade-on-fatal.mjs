@@ -178,5 +178,76 @@ console.log("=== CLOUD-SIB-FATAL regression tests ===\n");
   db.close();
 }
 
+// ---------------------------------------------------------------- case 5
+// 2026-11-12, Plexus's architectural bug: the queue froze while a
+// predecessor waited for the founder's verdict. 'ждёт_приёмки' means
+// "the work is done, the human decides" - that is NOT a reason to stop
+// computing. The skip set is exactly the states where the predecessor has
+// stopped being work-in-progress: готово / принято / ждёт приёмки /
+// просрочено / отменена. 'провал_фатальный' is deliberately NOT in it -
+// it cascades instead of skipping.
+{
+  const SKIP = ["готова", "принята", "ждёт_приёмки", "ждёт_приёмки_просрочено", "отменена"];
+  const HOLD = ["ожидает", "выполняется", "провал", "част_ично", "partial", "провал_фатальный", "не существует"];
+
+  // 5a. the founder's own case: A waiting for acceptance, B must run.
+  {
+    const db = await freshDb([
+      row(200, "ждёт_приёмки", "[SIB 1/2 parent:200]", "artifact ready"),
+      row(201, "ожидает", "[SIB 2/2 parent:200]"),
+    ]);
+    const order = makeSiblingOrderOk(db);
+    check("A='ждёт_приёмки' does NOT block B (no human verdict = no queue stop)",
+      (await order(await get(db, 201))) === true);
+    db.close();
+  }
+
+  // 5b. the whole skip set, one row per status.
+  {
+    const db = await freshDb(
+      SKIP.map((st, i) => row(300 + i, st, `[SIB 1/2 parent:${300 + i}]`, "x"))
+        .flatMap((r) => [r, row(400 + (r.id - 300), "ожидает", `[SIB 2/2 parent:${r.id}]`)])
+    );
+    const order = makeSiblingOrderOk(db);
+    for (const st of SKIP) {
+      const i = SKIP.indexOf(st);
+      const ok = await order(await get(db, 400 + i));
+      check(`predecessor '${st}' is a skip state - successor runs`, ok === true, `got ${ok}`);
+    }
+    db.close();
+  }
+
+  // 5c. the hold set is still hold - fail-closed preserved (contracted).
+  {
+    const db = await freshDb(
+      HOLD.map((st, i) => row(500 + i, st, `[SIB 1/2 parent:${500 + i}]`, "x"))
+        .flatMap((r) => [r, row(600 + (r.id - 500), "ожидает", `[SIB 2/2 parent:${r.id}]`)])
+    );
+    const order = makeSiblingOrderOk(db);
+    for (const st of HOLD) {
+      const i = HOLD.indexOf(st);
+      const ok = await order(await get(db, 600 + i));
+      check(`predecessor '${st}' still blocks the successor (fail-closed)`, ok === false, `got ${ok}`);
+    }
+    db.close();
+  }
+
+  // 5d. fatal predecessor: the guard does not skip (case 1 pattern) and the
+  // cascade is what terminates the tail - prove it here, not just assert it.
+  {
+    const db = await freshDb([
+      row(700, "провал_фатальный", "[SIB 1/2 parent:700]", "ERR_AUTH_FAILURE"),
+      row(701, "ожидает", "[SIB 2/2 parent:700]"),
+    ]);
+    const order = makeSiblingOrderOk(db);
+    check("fatal predecessor is NOT a skip state", (await order(await get(db, 701))) === false);
+    const res = await blockDependentSiblings({ id: 700, status: "провал_фатальный", text: "[SIB 1/2 parent:700] do part 700", result: "ERR_AUTH_FAILURE", metadata: JSON.stringify({ retry_count: MAX, retryable: false, retry_budget_exhausted: true }) }, db);
+    check("fatal cascade cancels the waiting successor", res.resolved.length === 1 && String(res.resolved[0]) === "701", JSON.stringify(res));
+    const r701 = await get(db, 701);
+    check("cancelled successor is 'отменена' (cascade, not skip)", r701.status === "отменена", r701.status);
+    db.close();
+  }
+}
+
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);
 process.exit(fail === 0 ? 0 : 1);
